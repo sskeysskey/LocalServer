@@ -1,10 +1,11 @@
 import os
 import sqlite3
 import json
+import traceback
 from flask import Flask, jsonify, send_from_directory, request
 from flask_cors import CORS
 from werkzeug.utils import safe_join
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 CORS(app)
@@ -15,12 +16,16 @@ ALLOWED_APPS = ['ONews', 'Finance']
 # 【新增】用户数据库路径
 USER_DB_PATH = os.path.join(BASE_RESOURCES_DIR, 'user_data.db')
 
-# --- 新增：初始化用户数据库 ---
+# --- 增强版：初始化用户数据库 ---
 def init_user_db():
     print(f"检查用户数据库: {USER_DB_PATH}")
+    # 确保存储目录存在
+    os.makedirs(os.path.dirname(USER_DB_PATH), exist_ok=True)
+    
     conn = sqlite3.connect(USER_DB_PATH)
     c = conn.cursor()
-    # 创建 users 表，如果它不存在的话
+    
+    # 创建表（如果不存在）
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,10 +33,26 @@ def init_user_db():
             email TEXT,
             full_name TEXT,
             created_at TIMESTAMP NOT NULL,
-            last_login_at TIMESTAMP
+            last_login_at TIMESTAMP,
+            subscription_expires_at TIMESTAMP
         )
     ''')
-    conn.commit()
+    
+    # 【修改】更安全的迁移逻辑：检查列是否存在
+    c.execute("PRAGMA table_info(users)")
+    columns = [info[1] for info in c.fetchall()]
+    
+    if 'subscription_expires_at' not in columns:
+        print("正在添加 'subscription_expires_at' 列...")
+        try:
+            c.execute("ALTER TABLE users ADD COLUMN subscription_expires_at TIMESTAMP")
+            conn.commit()
+            print("列添加成功。")
+        except Exception as e:
+            print(f"添加列失败: {e}")
+    else:
+        print("数据库结构已是最新。")
+        
     conn.close()
     print("用户数据库已准备就绪。")
 
@@ -141,33 +162,36 @@ def download_file(app_name):
 # --- 【新增】Apple ID 认证端点 ---
 @app.route('/api/ONews/auth/apple', methods=['POST'])
 def auth_with_apple():
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "请求体为空或非 JSON 格式"}), 400
-
-    identity_token = data.get('identity_token')
-    user_id = data.get('user_id')
-
-    if not identity_token or not user_id:
-        return jsonify({"error": "缺少 identity_token 或 user_id"}), 400
-
-    print(f"收到 Apple 认证请求, User ID: {user_id}")
-
-    # --- 在生产环境中，您需要在这里添加对 identity_token 的严格验证 ---
-    # 这通常涉及：
-    # 1. 解码 JWT (identity_token)。
-    # 2. 从 Apple 的公钥端点获取公钥。
-    # 3. 使用公钥验证 JWT 签名。
-    # 4. 检查 JWT 中的 iss (issuer), aud (audience), exp (expiration time) 等字段。
-    # 为了简化，我们在这里跳过这一步，并假设 token 是有效的。
-    print("【注意】跳过 Token 验证，假设其有效。")
-
-    conn = sqlite3.connect(USER_DB_PATH)
-    c = conn.cursor()
-
     try:
-        # 检查用户是否已存在
-        c.execute("SELECT id, last_login_at FROM users WHERE apple_user_id = ?", (user_id,))
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "请求体为空或非 JSON 格式"}), 400
+
+        identity_token = data.get('identity_token')
+        user_id = data.get('user_id')
+
+        if not identity_token or not user_id:
+            return jsonify({"error": "缺少 identity_token 或 user_id"}), 400
+
+        print(f"收到 Apple 认证请求, User ID: {user_id}")
+
+        # --- 在生产环境中，您需要在这里添加对 identity_token 的严格验证 ---
+        # 这通常涉及：
+        # 1. 解码 JWT (identity_token)。
+        # 2. 从 Apple 的公钥端点获取公钥。
+        # 3. 使用公钥验证 JWT 签名。
+        # 4. 检查 JWT 中的 iss (issuer), aud (audience), exp (expiration time) 等字段。
+        # 为了简化，我们在这里跳过这一步，并假设 token 是有效的。
+        print("【注意】跳过 Token 验证，假设其有效。")
+
+        conn = sqlite3.connect(USER_DB_PATH)
+        conn.row_factory = sqlite3.Row # 允许通过列名访问
+        c = conn.cursor()
+
+        is_subscribed = False
+        expiration_date = None
+
+        c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
         user = c.fetchone()
         
         now = datetime.utcnow()
@@ -176,6 +200,25 @@ def auth_with_apple():
             # 用户已存在，更新最后登录时间
             print(f"用户 {user_id} 已存在，更新最后登录时间。")
             c.execute("UPDATE users SET last_login_at = ? WHERE apple_user_id = ?", (now, user_id))
+            
+            # 【修改】安全的字段读取和日期解析
+            # 即使数据库有这一列，值也可能是 None
+            if 'subscription_expires_at' in user.keys():
+                expires_at_str = user['subscription_expires_at']
+                if expires_at_str:
+                    try:
+                        # 处理可能存在的不同日期格式
+                        expires_at = datetime.fromisoformat(str(expires_at_str))
+                        if expires_at > now:
+                            is_subscribed = True
+                            expiration_date = expires_at_str
+                    except ValueError:
+                        print(f"日期格式解析错误: {expires_at_str}")
+                        # 解析失败视为未订阅，但不报错
+                        is_subscribed = False
+            else:
+                print("警告：数据库中缺少 subscription_expires_at 字段")
+
         else:
             # 用户不存在，创建新用户
             print(f"新用户 {user_id}，正在创建记录。")
@@ -188,20 +231,116 @@ def auth_with_apple():
             )
         
         conn.commit()
+        conn.close()
+
+        # 【修改】返回订阅状态
+        return jsonify({
+            "status": "success", 
+            "message": "认证成功",
+            "is_subscribed": is_subscribed,
+            "subscription_expires_at": expiration_date
+        }), 200
+
+    except Exception as e:
+        # 【关键】打印详细堆栈，方便你在终端看到具体哪一行报错
+        traceback.print_exc()
+        print(f"服务器内部错误: {e}")
+        return jsonify({"error": f"服务器处理失败: {str(e)}"}), 500
+
+# --- 【新增】处理订阅支付 ---
+@app.route('/api/ONews/payment/subscribe', methods=['POST'])
+def subscribe_payment():
+    data = request.get_json()
+    user_id = data.get('user_id')
+    days_to_add = data.get('days', 30) # 默认充值30天
+
+    if not user_id:
+        return jsonify({"error": "缺少 user_id"}), 400
+
+    print(f"收到支付请求: 用户 {user_id} 充值 {days_to_add} 天")
+
+    conn = sqlite3.connect(USER_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    try:
+        c.execute("SELECT subscription_expires_at FROM users WHERE apple_user_id = ?", (user_id,))
+        row = c.fetchone()
         
-    except sqlite3.IntegrityError:
-        # 这是一个并发控制的保险措施，如果两个请求同时尝试插入，会有一个失败
-        conn.rollback()
-        return jsonify({"error": "数据库操作冲突"}), 409
+        if not row:
+            return jsonify({"error": "用户不存在"}), 404
+
+        now = datetime.utcnow()
+        current_expiry_str = row['subscription_expires_at']
+        
+        # 计算新的过期时间
+        if current_expiry_str:
+            current_expiry = datetime.fromisoformat(current_expiry_str)
+            # 如果当前还没过期，就在当前基础上增加
+            if current_expiry > now:
+                new_expiry = current_expiry + timedelta(days=days_to_add)
+            else:
+                # 如果已过期，从现在开始算
+                new_expiry = now + timedelta(days=days_to_add)
+        else:
+            # 从未订阅过
+            new_expiry = now + timedelta(days=days_to_add)
+            
+        new_expiry_str = new_expiry.isoformat()
+        
+        c.execute("UPDATE users SET subscription_expires_at = ? WHERE apple_user_id = ?", (new_expiry_str, user_id))
+        conn.commit()
+        
+        print(f"充值成功，新过期时间: {new_expiry_str}")
+        
+        return jsonify({
+            "status": "success",
+            "is_subscribed": True,
+            "subscription_expires_at": new_expiry_str
+        })
+
     except Exception as e:
         conn.rollback()
-        print(f"数据库操作失败: {e}")
-        return jsonify({"error": "服务器内部错误"}), 500
+        print(f"支付处理失败: {e}")
+        return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
 
-    return jsonify({"status": "success", "message": "用户认证成功"}), 200
-
+# --- 【新增】检查用户状态 (App启动时调用) ---
+@app.route('/api/ONews/user/status', methods=['GET'])
+def check_user_status():
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return jsonify({"error": "缺少 user_id"}), 400
+        
+    conn = sqlite3.connect(USER_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    try:
+        c.execute("SELECT subscription_expires_at FROM users WHERE apple_user_id = ?", (user_id,))
+        row = c.fetchone()
+        
+        if not row:
+            return jsonify({"is_subscribed": False}), 200
+            
+        expires_at_str = row['subscription_expires_at']
+        is_subscribed = False
+        
+        if expires_at_str:
+            expires_at = datetime.fromisoformat(expires_at_str)
+            if expires_at > datetime.utcnow():
+                is_subscribed = True
+                
+        return jsonify({
+            "is_subscribed": is_subscribed,
+            "subscription_expires_at": expires_at_str
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
 
 @app.route('/api/Finance/sync', methods=['GET'])
 def sync_finance():

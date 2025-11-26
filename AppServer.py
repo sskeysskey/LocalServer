@@ -1,6 +1,5 @@
 import os
 import sqlite3
-import json
 import traceback
 from flask import Flask, jsonify, send_from_directory, request, g
 from flask_cors import CORS

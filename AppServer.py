@@ -465,6 +465,10 @@ def finance_pay(): return handle_payment()
 @app.route('/api/Finance/user/status', methods=['GET'])
 def finance_status(): return handle_status_check()
 
+# 【新增】注册 Finance 的兑换路由！！！
+@app.route('/api/Finance/user/redeem', methods=['POST'])
+def finance_redeem(): return handle_redeem_invite()
+
 # --- 服务器启动 ---
 if __name__ == '__main__':
     # 【新增】在启动时初始化数据库

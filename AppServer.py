@@ -10,10 +10,17 @@ app = Flask(__name__)
 CORS(app)
 
 # --- 配置 ---
+# 获取当前 app.py 所在的目录 (即 LocalServer)
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 获取上级目录 (即 /root 或 /Users/yanzhang/Coding)
+PARENT_DIR = os.path.dirname(CURRENT_DIR)
+
 BASE_RESOURCES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Resources')
 ALLOWED_APPS = ['ONews', 'Finance']
+
 # 【新增】用户数据库路径
-USER_DB_PATH = os.path.join(BASE_RESOURCES_DIR, 'user_data.db')
+USER_DB_PATH = os.path.join(PARENT_DIR, 'user_data.db')
 FINANCE_DB_PATH = os.path.join(BASE_RESOURCES_DIR, 'Finance', 'Finance.db')
 
 # 【新增】简单的邀请码配置 (实际生产中可以放在数据库里)

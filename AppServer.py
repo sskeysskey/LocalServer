@@ -57,41 +57,29 @@ def init_user_db():
     conn = sqlite3.connect(USER_DB_PATH)
     c = conn.cursor()
     
-    # 创建表（如果不存在）
+    # 【核心修改】新的表结构
+    # finance_expire_at: Finance 付费过期时间
+    # finance_is_permanent: Finance 永久/亲友 VIP 标记 (0或1)
+    # onews_expire_at: ONews 付费过期时间
+    # onews_is_permanent: ONews 永久/亲友 VIP 标记 (0或1)
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             apple_user_id TEXT NOT NULL UNIQUE,
-            email TEXT,
-            full_name TEXT,
             created_at TIMESTAMP NOT NULL,
             last_login_at TIMESTAMP,
-            subscription_expires_at TIMESTAMP,
-            app_source TEXT,
-            is_vip INTEGER DEFAULT 0  -- 【新增】VIP 标记 (0:否, 1:是)
+            
+            finance_expire_at TIMESTAMP,
+            finance_is_permanent INTEGER DEFAULT 0,
+            
+            onews_expire_at TIMESTAMP,
+            onews_is_permanent INTEGER DEFAULT 0
         )
     ''')
     
-    # 【修改】更安全的迁移逻辑：检查列是否存在
-    c.execute("PRAGMA table_info(users)")
-    columns = [info[1] for info in c.fetchall()]
-    if 'subscription_expires_at' not in columns:
-        print("正在添加 'subscription_expires_at' 列...")
-        try:
-            c.execute("ALTER TABLE users ADD COLUMN subscription_expires_at TIMESTAMP")
-        except Exception: pass
-    if 'app_source' not in columns:
-        try: c.execute("ALTER TABLE users ADD COLUMN app_source TEXT")
-        except Exception: pass
-    # 【新增】检查并添加 is_vip 列
-    if 'is_vip' not in columns:
-        print("正在添加 'is_vip' 列...")
-        try: c.execute("ALTER TABLE users ADD COLUMN is_vip INTEGER DEFAULT 0")
-        except Exception: pass
-        
     conn.commit()
     conn.close()
-    print("用户数据库已准备就绪。")
+    print("用户数据库（新结构）已准备就绪。")
 
 # --- API 路由 ---
 @app.route('/api/<app_name>/check_version', methods=['GET'])
@@ -285,81 +273,88 @@ def query_latest_volume():
         return jsonify({"error": str(e)}), 500
 
 # --- 用户认证与权限核心逻辑 ---
-
-def check_user_subscription_status(user_row):
+def check_user_subscription_status(user_row, app_name):
     """
-    辅助函数：检查用户是否拥有有效权限（订阅 或 VIP）
-    返回: (is_subscribed, expiration_date_string)
+    检查用户权限。
+    逻辑：
+    1. 先检查该 App 的 is_permanent (亲友/后门)。如果是 1，直接返回 2099年。
+    2. 再检查该 App 的 expire_at (付费)。如果时间还没到，返回该时间。
+    3. 否则返回 False。
     """
     is_subscribed = False
     expiration_date = None
     now = datetime.utcnow()
-
-    # 1. 【优先】检查是否是 VIP
-    # 注意：SQLite 中 boolean 往往存为 1/0
-    if user_row['is_vip'] == 1:
-        is_subscribed = True
-        # 给 VIP 一个极其遥远的过期时间
-        expiration_date = "2099-12-31T23:59:59"
-        return is_subscribed, expiration_date
-
-    # 2. 检查常规订阅
-    if user_row['subscription_expires_at']:
+    
+    # 根据传入的 app_name 决定查哪些字段
+    # 比如 app_name="Finance" -> prefix="finance"
+    prefix = app_name.lower() 
+    perm_col = f"{prefix}_is_permanent"
+    expire_col = f"{prefix}_expire_at"
+    
+    # 1. 【优先】检查永久 VIP (亲友/后门)
+    # 数据库里取出来可能是 1 或 True，做个兼容
+    if user_row[perm_col] == 1:
+        # 对于亲友，我们返回一个极远的未来时间，让前端显示“长期有效”或类似效果
+        return True, "2099-12-31T23:59:59"
+        
+    # 2. 检查付费订阅时间
+    if user_row[expire_col]:
         try:
-            expires_at = datetime.fromisoformat(str(user_row['subscription_expires_at']))
+            expires_at = datetime.fromisoformat(str(user_row[expire_col]))
             if expires_at > now:
-                is_subscribed = True
-                expiration_date = user_row['subscription_expires_at']
+                return True, user_row[expire_col]
         except:
             pass
             
-    return is_subscribed, expiration_date
+    return False, None
 
-# --- 用户认证相关 (保持不变) ---
-def handle_auth(app_source):
+# --- 用户认证相关 ---
+def handle_auth(app_name):
     try:
         data = request.get_json()
-        identity_token = data.get('identity_token')
         user_id = data.get('user_id')
-        email = data.get('email')
-        full_name = data.get('full_name')
-
+        # email 和 full_name 我们不再获取也不再存储
+        
         if not user_id: return jsonify({"error": "Missing user_id"}), 400
-
+        
         conn = sqlite3.connect(USER_DB_PATH)
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
-
+        
         c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
         user = c.fetchone()
         now = datetime.utcnow()
         
         is_subscribed = False
         expiration_date = None
-
+        
         if user:
+            # 老用户：更新登录时间
             c.execute("UPDATE users SET last_login_at = ? WHERE apple_user_id = ?", (now, user_id))
-            # 【修改】使用统一的检查逻辑
-            is_subscribed, expiration_date = check_user_subscription_status(user)
+            # 检查权限 (传入 app_name)
+            is_subscribed, expiration_date = check_user_subscription_status(user, app_name)
         else:
+            # 新用户：插入记录。注意这里不需要记录 app_source 了，因为 apple_id 唯一
             c.execute(
-                "INSERT INTO users (apple_user_id, email, full_name, created_at, last_login_at, app_source, is_vip) VALUES (?, ?, ?, ?, ?, ?, 0)",
-                (user_id, email, full_name, now, now, app_source)
+                "INSERT INTO users (apple_user_id, created_at, last_login_at) VALUES (?, ?, ?)",
+                (user_id, now, now)
             )
             # 新用户肯定没订阅且不是VIP
         
         conn.commit()
         conn.close()
+        
         return jsonify({
             "status": "success", 
             "is_subscribed": is_subscribed,
             "subscription_expires_at": expiration_date
         }), 200
+        
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-def handle_status_check():
+def handle_status_check(app_name):
     user_id = request.args.get('user_id')
     if not user_id: return jsonify({"error": "Missing user_id"}), 400
     conn = sqlite3.connect(USER_DB_PATH)
@@ -373,7 +368,7 @@ def handle_status_check():
         
         if row:
             # 【修改】使用统一的检查逻辑
-            is_subscribed, expires_at_str = check_user_subscription_status(row)
+            is_subscribed, expires_at_str = check_user_subscription_status(row, app_name)
             
         return jsonify({"is_subscribed": is_subscribed, "subscription_expires_at": expires_at_str})
     except Exception as e:
@@ -382,7 +377,7 @@ def handle_status_check():
         conn.close()
 
 # 【新增】处理邀请码兑换
-def handle_redeem_invite():
+def handle_redeem_invite(app_name):
     data = request.get_json()
     user_id = data.get('user_id')
     invite_code = data.get('invite_code')
@@ -397,13 +392,18 @@ def handle_redeem_invite():
     conn = sqlite3.connect(USER_DB_PATH)
     c = conn.cursor()
     try:
-        # 将用户设为 VIP
-        c.execute("UPDATE users SET is_vip = 1 WHERE apple_user_id = ?", (user_id,))
+        # 确定要更新哪个字段
+        perm_col = f"{app_name.lower()}_is_permanent"
+        
+        # 设置永久 VIP 标记为 1
+        query = f"UPDATE users SET {perm_col} = 1 WHERE apple_user_id = ?"
+        c.execute(query, (user_id,))
+        
         if c.rowcount == 0:
             return jsonify({"error": "用户不存在，请先登录"}), 404
             
         conn.commit()
-        print(f"用户 {user_id} 使用邀请码 {invite_code} 升级为 VIP")
+        print(f"[{app_name}] 用户 {user_id} 使用邀请码 {invite_code} 升级为永久 VIP")
         
         return jsonify({
             "status": "success",
@@ -415,34 +415,62 @@ def handle_redeem_invite():
     finally:
         conn.close()
 
-def handle_payment():
+def handle_payment(app_name):
     data = request.get_json()
     user_id = data.get('user_id')
-    days = data.get('days', 30)
+    days = data.get('days', 30) # 保持默认值用于兼容旧版本或手动充值
+    # 【新增】接收客户端传来的真实过期时间字符串 (ISO 8601 格式)
+    explicit_expiry = data.get('explicit_expiry') 
+    
     if not user_id: return jsonify({"error": "Missing user_id"}), 400
-
+    
     conn = sqlite3.connect(USER_DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
+    
     try:
-        c.execute("SELECT subscription_expires_at FROM users WHERE apple_user_id = ?", (user_id,))
+        c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
         row = c.fetchone()
         if not row: return jsonify({"error": "User not found"}), 404
-
-        now = datetime.utcnow()
-        new_expiry = now + timedelta(days=days)
         
-        if row['subscription_expires_at']:
-            try:
-                current_expiry = datetime.fromisoformat(row['subscription_expires_at'])
-                if current_expiry > now:
-                    new_expiry = current_expiry + timedelta(days=days)
-            except: pass
+        now = datetime.utcnow()
+        
+        # 确定要更新哪个字段
+        expire_col = f"{app_name.lower()}_expire_at"
+        
+        new_expiry_str = ""
+
+        # 【核心修改】逻辑分支
+        if explicit_expiry:
+            # 方案 A: 客户端传了真实的 Apple 过期时间，直接使用
+            # 这样就实现了"同步"，而不是"充值"
+            print(f"[{app_name}] 同步用户 {user_id} 订阅时间至: {explicit_expiry}")
+            new_expiry_str = explicit_expiry
+        else:
+            # 方案 B: 旧逻辑 (充值模式) - 依然保留以备不时之需
+            current_expiry_str = row[expire_col]
+            new_expiry = now + timedelta(days=days) 
             
-        new_expiry_str = new_expiry.isoformat()
-        c.execute("UPDATE users SET subscription_expires_at = ? WHERE apple_user_id = ?", (new_expiry_str, user_id))
+            if current_expiry_str:
+                try:
+                    current_expiry = datetime.fromisoformat(current_expiry_str)
+                    if current_expiry > now:
+                        new_expiry = current_expiry + timedelta(days=days)
+                except: pass
+            
+            new_expiry_str = new_expiry.isoformat()
+        
+        # 执行更新
+        query = f"UPDATE users SET {expire_col} = ? WHERE apple_user_id = ?"
+        c.execute(query, (new_expiry_str, user_id))
+        
         conn.commit()
-        return jsonify({"status": "success", "is_subscribed": True, "subscription_expires_at": new_expiry_str})
+        
+        return jsonify({
+            "status": "success", 
+            "is_subscribed": True, 
+            "subscription_expires_at": new_expiry_str
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
@@ -453,28 +481,32 @@ def handle_payment():
 def onews_auth(): return handle_auth('ONews')
 
 @app.route('/api/ONews/payment/subscribe', methods=['POST'])
-def onews_pay(): return handle_payment()
+def onews_pay(): return handle_payment('ONews')
 
+# 注意状态检查也要传 App 名，因为我们要看特定 App 的权限
 @app.route('/api/ONews/user/status', methods=['GET'])
-def onews_status(): return handle_status_check()
+def onews_status(): 
+    # 这里复用 handle_auth 里的 check 逻辑，稍微改写一下 handle_status_check
+    return handle_status_check('ONews') 
 
-# 【新增】兑换路由
+# ONews 兑换路由
 @app.route('/api/ONews/user/redeem', methods=['POST'])
-def onews_redeem(): return handle_redeem_invite()
+def onews_redeem(): return handle_redeem_invite('ONews')
 
-# --- Finance 路由 (新增) ---
+
+# --- Finance 路由 ---
 @app.route('/api/Finance/auth/apple', methods=['POST'])
 def finance_auth(): return handle_auth('Finance')
 
 @app.route('/api/Finance/payment/subscribe', methods=['POST'])
-def finance_pay(): return handle_payment()
+def finance_pay(): return handle_payment('Finance')
 
 @app.route('/api/Finance/user/status', methods=['GET'])
-def finance_status(): return handle_status_check()
+def finance_status(): return handle_status_check('Finance')
 
-# 【新增】注册 Finance 的兑换路由！！！
+# 注册 Finance 的兑换路由！！！
 @app.route('/api/Finance/user/redeem', methods=['POST'])
-def finance_redeem(): return handle_redeem_invite()
+def finance_redeem(): return handle_redeem_invite('Finance')
 
 # --- 服务器启动 ---
 if __name__ == '__main__':

@@ -271,6 +271,33 @@ def query_latest_volume():
             return jsonify({"volume": None})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+# 6. 获取期权 Call/Put 汇总数据 (新增)
+@app.route('/api/Finance/query/options_summary', methods=['GET'])
+def query_options_summary():
+    symbol = request.args.get('symbol')
+    
+    if not symbol: return jsonify({"error": "Missing parameters"}), 400
+    
+    db = get_finance_db()
+    if not db: return jsonify({"error": "Database not found"}), 500
+    
+    try:
+        # 查询 Options 表，按日期倒序取最新的一条
+        # 注意：这里假设你的表名确实是 "Options" (首字母大写与否请与数据库实际一致)
+        query = 'SELECT call, put FROM "Options" WHERE name = ? ORDER BY date DESC LIMIT 1'
+        cur = db.execute(query, (symbol,))
+        row = cur.fetchone()
+        
+        if row:
+            return jsonify({
+                "call": row["call"], # 例如 "4.74%"
+                "put": row["put"]    # 例如 "-3.26%"
+            })
+        else:
+            return jsonify({"call": None, "put": None})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # --- 用户认证与权限核心逻辑 ---
 def check_user_subscription_status(user_row, app_name):

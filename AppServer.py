@@ -298,6 +298,34 @@ def query_options_summary():
             return jsonify({"call": None, "put": None})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+# 7. 获取期权历史价格走势 (新增)
+@app.route('/api/Finance/query/options_price_history', methods=['GET'])
+def query_options_price_history():
+    symbol = request.args.get('symbol')
+    
+    if not symbol: return jsonify({"error": "Missing parameters"}), 400
+    
+    db = get_finance_db()
+    if not db: return jsonify({"error": "Database not found"}), 500
+    
+    try:
+        # 查询 Options 表，获取该 symbol 的所有历史记录，按日期升序排列
+        # 只取 date 和 price 字段
+        query = 'SELECT date, price FROM "Options" WHERE name = ? ORDER BY date ASC'
+        cur = db.execute(query, (symbol,))
+        rows = cur.fetchall()
+        
+        result = []
+        for row in rows:
+            result.append({
+                "date": row["date"],   # "2025-12-26"
+                "price": row["price"]  # float
+            })
+            
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # --- 用户认证与权限核心逻辑 ---
 def check_user_subscription_status(user_row, app_name):

@@ -36,7 +36,7 @@ def get_finance_db():
     db = getattr(g, '_finance_database', None)
     if db is None:
         if os.path.exists(FINANCE_DB_PATH):
-            db = g._finance_database = sqlite3.connect(FINANCE_DB_PATH)
+            db = g._finance_database = sqlite3.connect(FINANCE_DB_PATH, timeout=60.0)
             db.row_factory = sqlite3.Row
         else:
             return None
@@ -54,7 +54,7 @@ def init_user_db():
     # 确保存储目录存在
     os.makedirs(os.path.dirname(USER_DB_PATH), exist_ok=True)
     
-    conn = sqlite3.connect(USER_DB_PATH)
+    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
     c = conn.cursor()
     
     # 【核心修改】新的表结构
@@ -326,6 +326,68 @@ def query_options_price_history():
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+# 8. 获取期权榜单 (新增 - Options Rank)
+# 逻辑：获取最新日期的 Options 数据，筛选市值大于 limit 的股票，按 price 排序
+@app.route('/api/Finance/query/options_rank', methods=['GET'])
+def query_options_rank():
+    # 获取客户端传来的市值阀值，如果没有传则默认 500亿
+    limit = request.args.get('limit', default=50000000000, type=float)
+    
+    db = get_finance_db()
+    if not db: return jsonify({"error": "Database not found"}), 500
+    
+    try:
+        # 1. 找到 Options 表中的最新日期
+        cur = db.execute('SELECT MAX(date) as max_date FROM "Options"')
+        row = cur.fetchone()
+        if not row or not row['max_date']:
+            return jsonify({"rank_up": [], "rank_down": []})
+        
+        latest_date = row['max_date']
+        
+        # 2. 联合查询 SQL
+        # 关联 Options 表 (别名 o) 和 MNSPP 表 (别名 m)
+        # 条件1: Options 表日期必须是最新日期
+        # 条件2: Options 表的 name 等于 MNSPP 表的 symbol
+        # 条件3: MNSPP 表的 marketcap 大于 limit
+        # 排序: 按 o.price 降序排列
+        sql = '''
+            SELECT o.name, o.price 
+            FROM "Options" o
+            JOIN "MNSPP" m ON o.name = m.symbol
+            WHERE o.date = ? AND m.marketcap > ?
+            ORDER BY o.price DESC
+        '''
+        
+        cur = db.execute(sql, (latest_date, limit))
+        rows = cur.fetchall()
+        
+        all_results = []
+        for r in rows:
+            all_results.append({
+                "symbol": r["name"],
+                "price": r["price"]
+            })
+            
+        if not all_results:
+             return jsonify({"rank_up": [], "rank_down": []})
+             
+        # 3. 截取前20 (最可能涨) 和 后20 (最可能跌)
+        rank_up = all_results[:20]
+        
+        # 后20需要反转，把跌得最厉害的排在前面
+        rank_down = all_results[-20:]
+        rank_down.reverse() 
+        
+        return jsonify({
+            "rank_up": rank_up,
+            "rank_down": rank_down
+        })
+        
+    except Exception as e:
+        print(f"Error querying options rank: {e}")
+        return jsonify({"error": str(e)}), 500
 
 # --- 用户认证与权限核心逻辑 ---
 def check_user_subscription_status(user_row, app_name):
@@ -372,7 +434,7 @@ def handle_auth(app_name):
         
         if not user_id: return jsonify({"error": "Missing user_id"}), 400
         
-        conn = sqlite3.connect(USER_DB_PATH)
+        conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
         
@@ -412,7 +474,7 @@ def handle_auth(app_name):
 def handle_status_check(app_name):
     user_id = request.args.get('user_id')
     if not user_id: return jsonify({"error": "Missing user_id"}), 400
-    conn = sqlite3.connect(USER_DB_PATH)
+    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     try:
@@ -444,7 +506,7 @@ def handle_redeem_invite(app_name):
     if invite_code not in VALID_INVITE_CODES:
         return jsonify({"error": "无效的邀请码"}), 403
         
-    conn = sqlite3.connect(USER_DB_PATH)
+    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
     c = conn.cursor()
     try:
         # 确定要更新哪个字段
@@ -479,7 +541,7 @@ def handle_payment(app_name):
     
     if not user_id: return jsonify({"error": "Missing user_id"}), 400
     
-    conn = sqlite3.connect(USER_DB_PATH)
+    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     

@@ -283,19 +283,22 @@ def query_options_summary():
     if not db: return jsonify({"error": "Database not found"}), 500
     
     try:
-        # 查询 Options 表，按日期倒序取最新的一条
-        # 注意：这里假设你的表名确实是 "Options" (首字母大写与否请与数据库实际一致)
-        query = 'SELECT call, put FROM "Options" WHERE name = ? ORDER BY date DESC LIMIT 1'
+        # 【修改】SQL 增加查询 price 和 change
+        # 这样客户端可以直接获取计算所需的所有数据，无需再去拉取历史列表
+        query = 'SELECT call, put, price, change FROM "Options" WHERE name = ? ORDER BY date DESC LIMIT 1'
         cur = db.execute(query, (symbol,))
         row = cur.fetchone()
         
         if row:
             return jsonify({
-                "call": row["call"], # 例如 "4.74%"
-                "put": row["put"]    # 例如 "-3.26%"
+                "call": row["call"],
+                "put": row["put"],
+                # 【新增】返回最新价格和数据库预存的涨跌额
+                "price": row["price"],
+                "change": row["change"]
             })
         else:
-            return jsonify({"call": None, "put": None})
+            return jsonify({"call": None, "put": None, "price": None, "change": None})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     
@@ -327,8 +330,8 @@ def query_options_price_history():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     
-# 8. 获取期权榜单 (新增 - Options Rank)
-# 逻辑：获取最新日期的 Options 数据，筛选市值大于 limit 的股票，按 price 排序
+# 8. 获取期权榜单 (修改 - Options Rank)
+# 逻辑：利用数据库 change 字段，移除 Self-Join，极大提高性能
 @app.route('/api/Finance/query/options_rank', methods=['GET'])
 def query_options_rank():
     # 获取客户端传来的市值阀值，如果没有传则默认 500亿
@@ -338,51 +341,56 @@ def query_options_rank():
     if not db: return jsonify({"error": "Database not found"}), 500
     
     try:
-        # 1. 找到 Options 表中最新的两个日期
-        cur = db.execute('SELECT DISTINCT date FROM "Options" ORDER BY date DESC LIMIT 2')
-        date_rows = cur.fetchall()
+        # 1. 找到 Options 表中最新的日期
+        cur = db.execute('SELECT MAX(date) as latest_date FROM "Options"')
+        row = cur.fetchone()
+        if not row or not row['latest_date']:
+             return jsonify({"rank_up": [], "rank_down": []})
         
-        if len(date_rows) < 2:
-            return jsonify({"rank_up": [], "rank_down": []})
-            
-        latest_date = date_rows[0]['date']
-        prev_date = date_rows[1]['date']
+        latest_date = row['latest_date']
         
-        # 2. 联合查询 SQL (计算差值)
-        # o1: 最新日期数据
-        # o2: 次新日期数据
-        # 算法修改：diff = 最新 - 次新 + 最新  => (o1.price - o2.price + o1.price)
+        # 2. 直接查询 (无需 JOIN 查次新日)
+        # 算法要求：
+        # 第一项数值 (Diff) = Latest Price + Change
+        # 第四项数值 (Prev) = Latest Price - Change
         sql = '''
             SELECT 
-                o1.name as symbol, 
-                o1.price as latest_price,
-                o2.price as prev_price,
-                (o1.price - o2.price + o1.price) as diff
-            FROM "Options" o1
-            JOIN "Options" o2 ON o1.name = o2.name
-            JOIN "MNSPP" m ON o1.name = m.symbol
-            WHERE o1.date = ? 
-              AND o2.date = ? 
+                o.name as symbol, 
+                o.price as latest_price,
+                o.change as change
+            FROM "Options" o
+            JOIN "MNSPP" m ON o.name = m.symbol
+            WHERE o.date = ? 
               AND m.marketcap > ?
-            ORDER BY diff DESC
+              AND o.change IS NOT NULL
         '''
         
-        cur = db.execute(sql, (latest_date, prev_date, limit))
+        cur = db.execute(sql, (latest_date, limit))
         rows = cur.fetchall()
         
         all_results = []
         for r in rows:
+            latest = r["latest_price"]
+            change = r["change"]
+            
+            # 【核心计算】
+            diff_val = latest + change  # 你的算法要求: 第一项 = Price + Change
+            prev_val = latest - change  # 反推次新价格
+            
             all_results.append({
                 "symbol": r["symbol"],
-                "price": r["latest_price"],      # 最新价格
-                "prevPrice": r["prev_price"],    # 次新价格
-                "diff": r["diff"]                # 差值 (已更新算法)
+                "price": latest,       # 第二项: 最新价格
+                "prevPrice": prev_val, # 第四项: 次新价格
+                "diff": diff_val       # 第一项: 排序依据
             })
+            
+        # 3. Python 端排序 (按 diff 降序)
+        all_results.sort(key=lambda x: x["diff"], reverse=True)
             
         if not all_results:
              return jsonify({"rank_up": [], "rank_down": []})
              
-        # 3. 截取前20 (Diff 最大) 和 后20 (Diff 最小)
+        # 截取前20 和 后20
         rank_up = all_results[:20]
         
         # 后20需要反转，把跌得最厉害(diff 最小)的排在前面

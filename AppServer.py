@@ -338,45 +338,54 @@ def query_options_rank():
     if not db: return jsonify({"error": "Database not found"}), 500
     
     try:
-        # 1. 找到 Options 表中的最新日期
-        cur = db.execute('SELECT MAX(date) as max_date FROM "Options"')
-        row = cur.fetchone()
-        if not row or not row['max_date']:
+        # 1. 找到 Options 表中最新的两个日期
+        cur = db.execute('SELECT DISTINCT date FROM "Options" ORDER BY date DESC LIMIT 2')
+        date_rows = cur.fetchall()
+        
+        if len(date_rows) < 2:
             return jsonify({"rank_up": [], "rank_down": []})
+            
+        latest_date = date_rows[0]['date']
+        prev_date = date_rows[1]['date']
         
-        latest_date = row['max_date']
-        
-        # 2. 联合查询 SQL
-        # 关联 Options 表 (别名 o) 和 MNSPP 表 (别名 m)
-        # 条件1: Options 表日期必须是最新日期
-        # 条件2: Options 表的 name 等于 MNSPP 表的 symbol
-        # 条件3: MNSPP 表的 marketcap 大于 limit
-        # 排序: 按 o.price 降序排列
+        # 2. 联合查询 SQL (计算差值)
+        # o1: 最新日期数据
+        # o2: 次新日期数据
+        # 算法修改：diff = 最新 - 次新 + 最新  => (o1.price - o2.price + o1.price)
         sql = '''
-            SELECT o.name, o.price 
-            FROM "Options" o
-            JOIN "MNSPP" m ON o.name = m.symbol
-            WHERE o.date = ? AND m.marketcap > ?
-            ORDER BY o.price DESC
+            SELECT 
+                o1.name as symbol, 
+                o1.price as latest_price,
+                o2.price as prev_price,
+                (o1.price - o2.price + o1.price) as diff
+            FROM "Options" o1
+            JOIN "Options" o2 ON o1.name = o2.name
+            JOIN "MNSPP" m ON o1.name = m.symbol
+            WHERE o1.date = ? 
+              AND o2.date = ? 
+              AND m.marketcap > ?
+            ORDER BY diff DESC
         '''
         
-        cur = db.execute(sql, (latest_date, limit))
+        cur = db.execute(sql, (latest_date, prev_date, limit))
         rows = cur.fetchall()
         
         all_results = []
         for r in rows:
             all_results.append({
-                "symbol": r["name"],
-                "price": r["price"]
+                "symbol": r["symbol"],
+                "price": r["latest_price"],      # 最新价格
+                "prevPrice": r["prev_price"],    # 次新价格
+                "diff": r["diff"]                # 差值 (已更新算法)
             })
             
         if not all_results:
              return jsonify({"rank_up": [], "rank_down": []})
              
-        # 3. 截取前20 (最可能涨) 和 后20 (最可能跌)
+        # 3. 截取前20 (Diff 最大) 和 后20 (Diff 最小)
         rank_up = all_results[:20]
         
-        # 后20需要反转，把跌得最厉害的排在前面
+        # 后20需要反转，把跌得最厉害(diff 最小)的排在前面
         rank_down = all_results[-20:]
         rank_down.reverse() 
         

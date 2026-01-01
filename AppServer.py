@@ -283,21 +283,32 @@ def query_options_summary():
     if not db: return jsonify({"error": "Database not found"}), 500
     
     try:
-        # 【修改】SQL 增加查询 iv
-        query = 'SELECT call, put, price, change, iv FROM "Options" WHERE name = ? ORDER BY date DESC LIMIT 1'
+        # 【修改】获取最新的两条数据 (最新 和 次新)
+        query = '''
+            SELECT call, put, price, change, iv, date 
+            FROM "Options" 
+            WHERE name = ? 
+            ORDER BY date DESC 
+            LIMIT 2
+        '''
         cur = db.execute(query, (symbol,))
-        row = cur.fetchone()
+        rows = cur.fetchall()
         
-        if row:
+        if rows:
+            latest_row = rows[0]
+            # 尝试获取次新行，如果没有则为 None
+            prev_row = rows[1] if len(rows) > 1 else None
+            
             return jsonify({
-                "call": row["call"],
-                "put": row["put"],
-                "price": row["price"],
-                "change": row["change"],
-                "iv": row["iv"] # 【新增】返回 IV
+                "call": latest_row["call"],
+                "put": latest_row["put"],
+                "price": latest_row["price"],
+                "change": latest_row["change"],
+                "iv": latest_row["iv"],           # 最新 IV
+                "prev_iv": prev_row["iv"] if prev_row else None # 【新增】次新 IV
             })
         else:
-            return jsonify({"call": None, "put": None, "price": None, "change": None, "iv": None})
+            return jsonify({"call": None, "put": None, "price": None, "change": None, "iv": None, "prev_iv": None})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     
@@ -340,63 +351,74 @@ def query_options_rank():
     if not db: return jsonify({"error": "Database not found"}), 500
     
     try:
-        # 1. 找到 Options 表中最新的日期
-        cur = db.execute('SELECT MAX(date) as latest_date FROM "Options"')
-        row = cur.fetchone()
-        if not row or not row['latest_date']:
+        # 1. 找到 Options 表中最新的两个日期
+        cur = db.execute('SELECT DISTINCT date FROM "Options" ORDER BY date DESC LIMIT 2')
+        date_rows = cur.fetchall()
+        
+        if not date_rows:
              return jsonify({"rank_up": [], "rank_down": []})
         
-        latest_date = row['latest_date']
+        latest_date = date_rows[0]['date']
+        # 如果有次新日期则获取，否则为 None
+        prev_date = date_rows[1]['date'] if len(date_rows) > 1 else None
         
-        # 2. 直接查询
-        # 【修改】SQL 中增加 o.iv
+        # 2. SQL 查询：Join 自身获取 Latest 和 Prev 的 IV
+        # t1 是最新日期，t2 是次新日期
         sql = '''
             SELECT 
-                o.name as symbol, 
-                o.price as latest_price,
-                o.change as change,
-                o.iv as iv
-            FROM "Options" o
-            JOIN "MNSPP" m ON o.name = m.symbol
-            WHERE o.date = ? 
+                t1.name as symbol, 
+                t1.iv as iv_latest,
+                t2.iv as iv_prev,
+                m.marketcap
+            FROM "Options" t1
+            LEFT JOIN "Options" t2 ON t1.name = t2.name AND t2.date = ?
+            JOIN "MNSPP" m ON t1.name = m.symbol
+            WHERE t1.date = ? 
               AND m.marketcap > ?
-              AND o.change IS NOT NULL
+              AND t1.iv IS NOT NULL
         '''
         
-        cur = db.execute(sql, (latest_date, limit))
+        # 注意参数顺序：prev_date, latest_date, limit
+        cur = db.execute(sql, (prev_date, latest_date, limit))
         rows = cur.fetchall()
         
         all_results = []
         for r in rows:
-            latest = r["latest_price"]
-            change = r["change"]
+            # 解析 IV 字符串为浮点数用于排序 (去除 % 号)
+            raw_iv_latest = r["iv_latest"]
+            sort_val = 0.0
             
-            # 【核心计算】
-            diff_val = latest + change  # 第一项: 你的算法要求
-            
-            # 我们不再需要计算 prevPrice (Value 4)，但在后端保留也无妨，
-            # 关键是必须把 iv 传回去
+            if raw_iv_latest:
+                try:
+                    clean_str = raw_iv_latest.replace('%', '').strip()
+                    sort_val = float(clean_str)
+                except:
+                    sort_val = 0.0
             
             all_results.append({
                 "symbol": r["symbol"],
-                "price": latest,       # 原第二项 (前端将不再显示)
-                "diff": diff_val,      # 第一项: 排序依据 + 显示
-                "iv": r["iv"]          # 【新增】第三项: IV
+                "iv": raw_iv_latest,       # 第一项显示 (Latest IV)
+                "prev_iv": r["iv_prev"],   # 第三项显示 (Prev IV)
+                "sort_val": sort_val       # 用于后端排序
             })
             
-        # 3. Python 端排序 (按 diff 降序)
-        all_results.sort(key=lambda x: x["diff"], reverse=True)
+        # 3. 排序规则：按照 Latest IV (sort_val) 降序排列
+        all_results.sort(key=lambda x: x["sort_val"], reverse=True)
             
         if not all_results:
              return jsonify({"rank_up": [], "rank_down": []})
              
-        # 截取前20 和 后20
+        # 截取前20
         rank_up = all_results[:20]
         
-        # 后20需要反转，把跌得最厉害(diff 最小)的排在前面
+        # 截取后20 (IV 最小的)
         rank_down = all_results[-20:]
         rank_down.reverse() 
         
+        # 清理掉 sort_val 字段再返回（可选，不清理也不影响 JSON 解析）
+        for item in rank_up + rank_down:
+            item.pop("sort_val", None)
+
         return jsonify({
             "rank_up": rank_up,
             "rank_down": rank_down

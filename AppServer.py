@@ -283,9 +283,8 @@ def query_options_summary():
     if not db: return jsonify({"error": "Database not found"}), 500
     
     try:
-        # 【修改】SQL 增加查询 price 和 change
-        # 这样客户端可以直接获取计算所需的所有数据，无需再去拉取历史列表
-        query = 'SELECT call, put, price, change FROM "Options" WHERE name = ? ORDER BY date DESC LIMIT 1'
+        # 【修改】SQL 增加查询 iv
+        query = 'SELECT call, put, price, change, iv FROM "Options" WHERE name = ? ORDER BY date DESC LIMIT 1'
         cur = db.execute(query, (symbol,))
         row = cur.fetchone()
         
@@ -293,12 +292,12 @@ def query_options_summary():
             return jsonify({
                 "call": row["call"],
                 "put": row["put"],
-                # 【新增】返回最新价格和数据库预存的涨跌额
                 "price": row["price"],
-                "change": row["change"]
+                "change": row["change"],
+                "iv": row["iv"] # 【新增】返回 IV
             })
         else:
-            return jsonify({"call": None, "put": None, "price": None, "change": None})
+            return jsonify({"call": None, "put": None, "price": None, "change": None, "iv": None})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     
@@ -349,15 +348,14 @@ def query_options_rank():
         
         latest_date = row['latest_date']
         
-        # 2. 直接查询 (无需 JOIN 查次新日)
-        # 算法要求：
-        # 第一项数值 (Diff) = Latest Price + Change
-        # 第四项数值 (Prev) = Latest Price - Change
+        # 2. 直接查询
+        # 【修改】SQL 中增加 o.iv
         sql = '''
             SELECT 
                 o.name as symbol, 
                 o.price as latest_price,
-                o.change as change
+                o.change as change,
+                o.iv as iv
             FROM "Options" o
             JOIN "MNSPP" m ON o.name = m.symbol
             WHERE o.date = ? 
@@ -374,14 +372,16 @@ def query_options_rank():
             change = r["change"]
             
             # 【核心计算】
-            diff_val = latest + change  # 你的算法要求: 第一项 = Price + Change
-            prev_val = latest - change  # 反推次新价格
+            diff_val = latest + change  # 第一项: 你的算法要求
+            
+            # 我们不再需要计算 prevPrice (Value 4)，但在后端保留也无妨，
+            # 关键是必须把 iv 传回去
             
             all_results.append({
                 "symbol": r["symbol"],
-                "price": latest,       # 第二项: 最新价格
-                "prevPrice": prev_val, # 第四项: 次新价格
-                "diff": diff_val       # 第一项: 排序依据
+                "price": latest,       # 原第二项 (前端将不再显示)
+                "diff": diff_val,      # 第一项: 排序依据 + 显示
+                "iv": r["iv"]          # 【新增】第三项: IV
             })
             
         # 3. Python 端排序 (按 diff 降序)

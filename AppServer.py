@@ -305,10 +305,20 @@ def query_options_summary():
                 "price": latest_row["price"],
                 "change": latest_row["change"],
                 "iv": latest_row["iv"],           # 最新 IV
-                "prev_iv": prev_row["iv"] if prev_row else None # 【新增】次新 IV
+                "prev_iv": prev_row["iv"] if prev_row else None, # 次新 IV
+                
+                # 【新增】次新数据的 Price 和 Change
+                "prev_price": prev_row["price"] if prev_row else None,
+                "prev_change": prev_row["change"] if prev_row else None
             })
         else:
-            return jsonify({"call": None, "put": None, "price": None, "change": None, "iv": None, "prev_iv": None})
+            # 修改这里以包含新增字段的默认值
+            return jsonify({
+                "call": None, "put": None, 
+                "price": None, "change": None, 
+                "iv": None, "prev_iv": None,
+                "prev_price": None, "prev_change": None
+            })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     

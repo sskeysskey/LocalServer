@@ -305,6 +305,7 @@ def query_options_summary():
                 "price": latest_row["price"],
                 "change": latest_row["change"],
                 "iv": latest_row["iv"],           # 最新 IV
+                "date": latest_row["date"],       # 【新增】返回最新数据的日期 (YYYY-MM-DD)
                 "prev_iv": prev_row["iv"] if prev_row else None, # 次新 IV
                 
                 # 【新增】次新数据的 Price 和 Change
@@ -316,7 +317,8 @@ def query_options_summary():
             return jsonify({
                 "call": None, "put": None, 
                 "price": None, "change": None, 
-                "iv": None, "prev_iv": None,
+                "iv": None, "date": None,         # 【新增】
+                "prev_iv": None,
                 "prev_price": None, "prev_change": None
             })
     except Exception as e:

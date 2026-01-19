@@ -272,55 +272,76 @@ def query_latest_volume():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     
-# 6. 获取期权 Call/Put 汇总数据 (新增)
+# 6. 获取期权 Call/Put 汇总数据 (修改版：支持单体 symbol 或 批量 symbols)
 @app.route('/api/Finance/query/options_summary', methods=['GET'])
 def query_options_summary():
-    symbol = request.args.get('symbol')
-    
-    if not symbol: return jsonify({"error": "Missing parameters"}), 400
-    
+    # 允许传单个 'symbol' 或 逗号分隔的 'symbols'
+    symbol_param = request.args.get('symbol')
+    symbols_param = request.args.get('symbols')
+
     db = get_finance_db()
     if not db: return jsonify({"error": "Database not found"}), 500
+
+    # 统一构建待查询列表
+    target_symbols = []
+    if symbols_param:
+        target_symbols = [s.strip() for s in symbols_param.split(',') if s.strip()]
+    elif symbol_param:
+        target_symbols = [symbol_param]
     
+    if not target_symbols:
+        return jsonify({"error": "Missing parameters"}), 400
+
     try:
-        # 【修改】获取最新的两条数据 (最新 和 次新)
-        query = '''
-            SELECT call, put, price, change, iv, date 
-            FROM "Options" 
-            WHERE name = ? 
-            ORDER BY date DESC 
-            LIMIT 2
-        '''
-        cur = db.execute(query, (symbol,))
-        rows = cur.fetchall()
+        results = {}
         
-        if rows:
-            latest_row = rows[0]
-            # 尝试获取次新行，如果没有则为 None
-            prev_row = rows[1] if len(rows) > 1 else None
+        # 遍历查询 (虽然是循环，但比 HTTP 开销小得多，且本地 SQLite 很快)
+        # 如果追求极致性能可以用 SQL 的 IN 查询，但这里为了逻辑复用，循环足够了
+        for sym in target_symbols:
+            query = '''
+                SELECT call, put, price, change, iv, date 
+                FROM "Options" 
+                WHERE name = ? 
+                ORDER BY date DESC 
+                LIMIT 2
+            '''
+            cur = db.execute(query, (sym,))
+            rows = cur.fetchall()
             
-            return jsonify({
-                "call": latest_row["call"],
-                "put": latest_row["put"],
-                "price": latest_row["price"],
-                "change": latest_row["change"],
-                "iv": latest_row["iv"],           # 最新 IV
-                "date": latest_row["date"],       # 【新增】返回最新数据的日期 (YYYY-MM-DD)
-                "prev_iv": prev_row["iv"] if prev_row else None, # 次新 IV
+            if rows:
+                latest_row = rows[0]
+                prev_row = rows[1] if len(rows) > 1 else None
                 
-                # 【新增】次新数据的 Price 和 Change
-                "prev_price": prev_row["price"] if prev_row else None,
-                "prev_change": prev_row["change"] if prev_row else None
-            })
+                results[sym] = {
+                    "call": latest_row["call"],
+                    "put": latest_row["put"],
+                    "price": latest_row["price"],
+                    "change": latest_row["change"],
+                    "iv": latest_row["iv"],
+                    "date": latest_row["date"],
+                    "prev_iv": prev_row["iv"] if prev_row else None,
+                    "prev_price": prev_row["price"] if prev_row else None,
+                    "prev_change": prev_row["change"] if prev_row else None
+                }
+            else:
+                # 没数据就不放进结果，或者放个 None
+                pass
+
+        # 如果是单查，为了兼容旧逻辑，直接返回对象；如果是批量，返回字典
+        if symbols_param:
+            return jsonify(results)
         else:
-            # 修改这里以包含新增字段的默认值
-            return jsonify({
-                "call": None, "put": None, 
-                "price": None, "change": None, 
-                "iv": None, "date": None,         # 【新增】
-                "prev_iv": None,
-                "prev_price": None, "prev_change": None
-            })
+            # 保持兼容旧 API 的返回格式
+            if target_symbols[0] in results:
+                return jsonify(results[target_symbols[0]])
+            else:
+                return jsonify({
+                    "call": None, "put": None, 
+                    "price": None, "change": None, 
+                    "iv": None, "date": None,
+                    "prev_iv": None, "prev_price": None, "prev_change": None
+                })
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     
@@ -374,13 +395,17 @@ def query_options_rank():
         # 如果有次新日期则获取，否则为 None
         prev_date = date_rows[1]['date'] if len(date_rows) > 1 else None
         
-        # 2. SQL 查询：Join 自身获取 Latest 和 Prev 的 IV
-        # t1 是最新日期，t2 是次新日期
+        # 2. SQL 查询：Join 自身获取 Latest 和 Prev 的 IV 以及 价格数据
+        # 【修改点】增加了 t1.price, t1.change, t2.price, t2.change
         sql = '''
             SELECT 
                 t1.name as symbol, 
                 t1.iv as iv_latest,
+                t1.price as price_latest,
+                t1.change as change_latest,
                 t2.iv as iv_prev,
+                t2.price as price_prev,
+                t2.change as change_prev,
                 m.marketcap
             FROM "Options" t1
             LEFT JOIN "Options" t2 ON t1.name = t2.name AND t2.date = ?
@@ -410,7 +435,14 @@ def query_options_rank():
             all_results.append({
                 "symbol": r["symbol"],
                 "iv": raw_iv_latest,       # 第一项显示 (Latest IV)
-                "prev_iv": r["iv_prev"],   # 第三项显示 (Prev IV)
+                "prev_iv": r["iv_prev"],   # 第二项显示 (Prev IV)
+                
+                # 【新增】返回价格数据
+                "price": r["price_latest"],
+                "change": r["change_latest"],
+                "prev_price": r["price_prev"],
+                "prev_change": r["change_prev"],
+
                 "sort_val": sort_val       # 用于后端排序
             })
             
@@ -427,7 +459,7 @@ def query_options_rank():
         rank_down = all_results[-20:]
         rank_down.reverse() 
         
-        # 清理掉 sort_val 字段再返回（可选，不清理也不影响 JSON 解析）
+        # 清理掉 sort_val 字段再返回
         for item in rank_up + rank_down:
             item.pop("sort_val", None)
 

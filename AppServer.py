@@ -356,9 +356,8 @@ def query_options_price_history():
     if not db: return jsonify({"error": "Database not found"}), 500
     
     try:
-        # 【修改点】将 ORDER BY date ASC 改为 DESC
-        # 这样返回的数组：[最新日期, 次新日期, ..., 最旧日期]
-        query = 'SELECT date, price FROM "Options" WHERE name = ? ORDER BY date DESC'
+        # 【修改点】增加了 iv 字段的查询
+        query = 'SELECT date, price, iv FROM "Options" WHERE name = ? ORDER BY date DESC'
         cur = db.execute(query, (symbol,))
         rows = cur.fetchall()
         
@@ -366,7 +365,8 @@ def query_options_price_history():
         for row in rows:
             result.append({
                 "date": row["date"],
-                "price": row["price"]
+                "price": row["price"],
+                "iv": row["iv"] # 新增返回 IV (字符串格式, 如 "50.5%")
             })
             
         return jsonify(result)

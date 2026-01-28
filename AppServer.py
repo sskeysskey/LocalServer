@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 import traceback
 from flask import Flask, jsonify, send_from_directory, request, g
@@ -88,13 +89,21 @@ def check_version(app_name):
     if app_name not in ALLOWED_APPS:
         return jsonify({"error": "无效的应用名称"}), 404
     
-    version_file_path = os.path.join(BASE_RESOURCES_DIR, app_name, 'version.json')
-    print(f"正在尝试访问版本文件: {version_file_path}")
+    # 获取服务器当前的日期，格式与你的 json 文件一致 (yyMMdd)
+    server_now = datetime.now()
+    server_date_str = server_now.strftime('%y%m%d')
     
+    # 获取原始的 version.json 内容
+    version_file_path = os.path.join(BASE_RESOURCES_DIR, app_name, 'version.json')
     if os.path.exists(version_file_path):
-        return send_from_directory(os.path.join(BASE_RESOURCES_DIR, app_name), 'version.json')
+        with open(version_file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # 【关键】动态注入服务器当前日期
+        data['server_date'] = server_date_str
+        return jsonify(data)
     else:
-        return jsonify({"error": "版本文件未找到"}), 404
+        return jsonify({"error": "Version file not found"}), 404
 
 @app.route('/api/<app_name>/download', methods=['GET'])
 def download_file(app_name):
@@ -497,12 +506,17 @@ def check_user_subscription_status(user_row, app_name):
         # 对于亲友，我们返回一个极远的未来时间，让前端显示“长期有效”或类似效果
         return True, "2099-12-31T23:59:59"
         
-    # 2. 检查付费订阅时间
+    # 2. 检查付费订阅的过期时间
     if user_row[expire_col]:
         try:
+            # 数据库存的是字符串，转回 datetime
             expires_at = datetime.fromisoformat(str(user_row[expire_col]))
             if expires_at > now:
                 return True, user_row[expire_col]
+            else:
+                # 【优化】如果已经过期，虽然逻辑上返回 False，
+                # 但可以在这里记录一下，或者由 App 端下次登录时更新
+                return False, user_row[expire_col]
         except:
             pass
             

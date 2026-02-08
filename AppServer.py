@@ -4,11 +4,18 @@ import sqlite3
 import traceback
 from flask import Flask, jsonify, send_from_directory, request, g
 from flask_cors import CORS
+# 【新增】引入压缩库
+from flask_compress import Compress
 from werkzeug.utils import safe_join
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
 CORS(app)
+
+# 【新增】初始化 Gzip 压缩
+# 这会自动压缩 application/json, text/csv, text/plain 等响应
+# 默认压缩级别为 6，足以大幅减小文本文件体积
+Compress(app)
 
 # --- 配置 ---
 # 获取当前 app.py 所在的目录 (即 LocalServer)

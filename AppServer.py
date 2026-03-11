@@ -186,32 +186,49 @@ def query_historical():
     if not db: return jsonify({"error": "Database not found"}), 500
     
     try:
-        # 检查表是否存在以及是否有 volume 列
-        # 注意：表名不能参数化，需要验证以防注入。这里简单假设 table_name 是合法的。
-        # 生产环境应验证 table_name 是否在白名单中。
-        
-        # 检查是否有 volume 列
+        # 【修改】查询不再包含 id，改为返回所有可能的字段
+        # 先检查表结构
         cur = db.execute(f'PRAGMA table_info("{table_name}")')
         columns = [row['name'].lower() for row in cur.fetchall()]
-        has_volume = 'volume' in columns
         
-        select_clause = "id, date, price"
-        if has_volume:
-            select_clause += ", volume"
-            
-        query = f'SELECT {select_clause} FROM "{table_name}" WHERE name = ? AND date BETWEEN ? AND ? ORDER BY date ASC'
+        # 构建动态 SELECT 语句
+        select_fields = ["date", "price"]
+        if "volume" in columns:
+            select_fields.append("volume")
+        if "open" in columns:
+            select_fields.append("open")
+        if "high" in columns:
+            select_fields.append("high")
+        if "low" in columns:
+            select_fields.append("low")
+        
+        select_clause = ", ".join(select_fields)
+        
+        query = f'''
+            SELECT {select_clause} 
+            FROM "{table_name}" 
+            WHERE name = ? AND date BETWEEN ? AND ? 
+            ORDER BY date ASC
+        '''
         cur = db.execute(query, (symbol, start_date, end_date))
         rows = cur.fetchall()
         
         result = []
         for row in rows:
             item = {
-                "id": row["id"],
-                "date": row["date"], # string YYYY-MM-DD
+                "date": row["date"],
                 "price": row["price"]
             }
-            if has_volume:
+            # 动态添加存在的字段
+            if "volume" in columns and row["volume"] is not None:
                 item["volume"] = row["volume"]
+            if "open" in columns and row["open"] is not None:
+                item["open"] = row["open"]
+            if "high" in columns and row["high"] is not None:
+                item["high"] = row["high"]
+            if "low" in columns and row["low"] is not None:
+                item["low"] = row["low"]
+            
             result.append(item)
             
         return jsonify(result)

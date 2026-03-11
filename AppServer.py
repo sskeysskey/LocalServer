@@ -112,6 +112,32 @@ def check_version(app_name):
     else:
         return jsonify({"error": "Version file not found"}), 404
 
+# --- 在 AppServer.py 中添加删除账号路由 ---
+@app.route('/api/<app_name>/user/delete', methods=['POST'])
+def delete_user(app_name):
+    data = request.get_json()
+    user_id = data.get('user_id')
+    
+    if not user_id: 
+        return jsonify({"error": "Missing user_id"}), 400
+        
+    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
+    c = conn.cursor()
+    try:
+        # 从数据库中永久删除该用户
+        c.execute("DELETE FROM users WHERE apple_user_id = ?", (user_id,))
+        if c.rowcount == 0:
+            return jsonify({"error": "User not found"}), 404
+            
+        conn.commit()
+        print(f"[{app_name}] 用户 {user_id} 已成功删除账号。")
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        print(f"删除账号失败: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
 @app.route('/api/<app_name>/download', methods=['GET'])
 def download_file(app_name):
     # filename 参数现在可能是 "some.json" 或 "some_dir/some_image.jpg"

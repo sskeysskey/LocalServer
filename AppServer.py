@@ -25,7 +25,7 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(CURRENT_DIR)
 
 BASE_RESOURCES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Resources')
-ALLOWED_APPS = ['ONews', 'Finance']
+ALLOWED_APPS = ['ONews', 'Finance', 'Prediction']
 
 # 【新增】用户数据库路径
 USER_DB_PATH = os.path.join(PARENT_DIR, 'user_data.db')
@@ -81,10 +81,27 @@ def init_user_db():
             finance_is_permanent INTEGER DEFAULT 0,
             
             onews_expire_at TIMESTAMP,
-            onews_is_permanent INTEGER DEFAULT 0
+            onews_is_permanent INTEGER DEFAULT 0,
+            
+            prediction_expire_at TIMESTAMP,
+            prediction_is_permanent INTEGER DEFAULT 0
         )
     ''')
     
+    # 2. 数据库升级逻辑：针对已经有旧数据库，需要补充新字段的老环境
+    # 尝试添加 prediction_expire_at 列
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN prediction_expire_at TIMESTAMP')
+    except sqlite3.OperationalError:
+        # 如果捕获到 OperationalError，说明这列已经存在了，直接跳过即可
+        pass 
+
+    # 尝试添加 prediction_is_permanent 列
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN prediction_is_permanent INTEGER DEFAULT 0')
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
     print("用户数据库（新结构）已准备就绪。")
@@ -757,6 +774,21 @@ def onews_status():
 @app.route('/api/ONews/user/redeem', methods=['POST'])
 def onews_redeem(): return handle_redeem_invite('ONews')
 
+# --- Prediction 路由 ---
+@app.route('/api/Prediction/auth/apple', methods=['POST'])
+def prediction_auth(): return handle_auth('Prediction')
+
+@app.route('/api/Prediction/payment/subscribe', methods=['POST'])
+def prediction_pay(): return handle_payment('Prediction')
+
+@app.route('/api/Prediction/user/status', methods=['GET'])
+def prediction_status(): return handle_status_check('Prediction')
+
+@app.route('/api/Prediction/user/redeem', methods=['POST'])
+def prediction_redeem(): return handle_redeem_invite('Prediction')
+
+@app.route('/api/Prediction/user/delete', methods=['POST'])
+def prediction_delete(): return delete_user('Prediction')
 
 # --- Finance 路由 ---
 @app.route('/api/Finance/auth/apple', methods=['POST'])

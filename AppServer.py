@@ -189,6 +189,38 @@ def download_file(app_name):
         print(f"发生错误: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/<app_name>/list_files', methods=['GET'])
+def list_files(app_name):
+    dirname = request.args.get('dirname')
+    print(f"收到来自应用 '{app_name}' 的获取目录列表请求: {dirname}")
+    
+    if app_name not in ALLOWED_APPS:
+        return jsonify({"error": "无效的应用名称"}), 404
+    if not dirname:
+        return jsonify({"error": "缺少目录参数"}), 400
+        
+    try:
+        # 使用 safe_join 安全拼接路径
+        dir_path = safe_join(BASE_RESOURCES_DIR, app_name, dirname)
+    except Exception:
+        print(f"错误: 请求的目录路径不安全: {dirname}")
+        return jsonify({"error": "无效的路径"}), 400
+        
+    # 如果目录不存在，返回空列表，避免 Android 报错
+    if not os.path.isdir(dir_path):
+        return jsonify([])
+        
+    try:
+        # 遍历目录，只返回文件名称，不包含子文件夹
+        files = []
+        for filename in os.listdir(dir_path):
+            if os.path.isfile(os.path.join(dir_path, filename)):
+                files.append(filename)
+        return jsonify(files)
+    except Exception as e:
+        print(f"获取目录列表发生错误: {e}")
+        return jsonify({"error": str(e)}), 500
+
 # ==========================================
 # 新增：Finance 数据查询 API (替代本地 SQL)
 # ==========================================

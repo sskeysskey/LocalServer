@@ -4,7 +4,6 @@ import sqlite3
 import traceback
 from flask import Flask, jsonify, send_from_directory, request, g
 from flask_cors import CORS
-# 【新增】引入压缩库
 from flask_compress import Compress
 from werkzeug.utils import safe_join
 from datetime import datetime, timedelta

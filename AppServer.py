@@ -24,7 +24,7 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(CURRENT_DIR)
 
 BASE_RESOURCES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Resources')
-ALLOWED_APPS = ['ONews', 'Finance', 'Prediction']
+ALLOWED_APPS = ['ONews', 'Finance', 'Prediction', 'OVideo']
 
 # 【新增】用户数据库路径
 USER_DB_PATH = os.path.join(PARENT_DIR, 'user_data.db')
@@ -802,6 +802,113 @@ def finance_status(): return handle_status_check('Finance')
 # 注册 Finance 的兑换路由！！！
 @app.route('/api/Finance/user/redeem', methods=['POST'])
 def finance_redeem(): return handle_redeem_invite('Finance')
+
+# ==========================================
+# OVideo 视频模块 API
+# ==========================================
+OVIDEO_DIR = os.path.join(BASE_RESOURCES_DIR, 'OVideo')
+OVIDEO_COVER_DIR = os.path.join(OVIDEO_DIR, 'cover_image')
+
+# 1. 获取视频目录（保证分类顺序 Movie/Drama/Show/Anime ...）
+@app.route('/api/OVideo/videos', methods=['GET'])
+def get_ovideos():
+    video_file = os.path.join(OVIDEO_DIR, 'OVideos.json')
+    if not os.path.exists(video_file):
+        return jsonify({"error": "Video file not found"}), 404
+    try:
+        with open(video_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        # 将 dict 转为有序列表，保证分类顺序
+        categories = []
+        for key, value in data.items():
+            categories.append({"name": key, "items": value})
+        return jsonify({"categories": categories})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+# 2. 获取封面图片
+@app.route('/api/OVideo/cover/<path:filename>', methods=['GET'])
+def get_ovideo_cover(filename):
+    try:
+        safe_path = safe_join(OVIDEO_COVER_DIR, filename)
+    except Exception:
+        return jsonify({"error": "Invalid path"}), 400
+    if not safe_path or not os.path.isfile(safe_path):
+        return jsonify({"error": "Image not found"}), 404
+    directory, file = os.path.split(safe_path)
+    # 加个缓存头，减少 App 反复拉图片
+    response = send_from_directory(directory, file)
+    response.headers['Cache-Control'] = 'public, max-age=604800'  # 7天
+    return response
+
+# 3. 解析页面 URL -> 真实 m3u8（同时做黑名单拦截）
+@app.route('/api/OVideo/resolve', methods=['POST'])
+def resolve_ovideo_url():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Missing body"}), 400
+    episode_url = data.get('url')
+    if not episode_url:
+        return jsonify({"error": "Missing url"}), 400
+
+    # 黑名单
+    blacklist_file = os.path.join(OVIDEO_DIR, 'blacklist_url.json')
+    if os.path.exists(blacklist_file):
+        try:
+            with open(blacklist_file, 'r', encoding='utf-8') as f:
+                blacklist = json.load(f)
+            if episode_url in blacklist:
+                return jsonify({"error": "Blacklisted", "reason": "该视频暂不可用"}), 403
+        except Exception as e:
+            print(f"黑名单读取失败: {e}")
+
+    # 映射表
+    mapping_file = os.path.join(OVIDEO_DIR, 'url_mapping.json')
+    if not os.path.exists(mapping_file):
+        return jsonify({"error": "Mapping file not found"}), 404
+
+    try:
+        with open(mapping_file, 'r', encoding='utf-8') as f:
+            mappings = json.load(f)
+        if episode_url in mappings:
+            mapping_data = mappings[episode_url]
+            if isinstance(mapping_data, list) and len(mapping_data) > 0:
+                return jsonify({
+                    "real_url": mapping_data[0],
+                    "title": mapping_data[1] if len(mapping_data) > 1 else ""
+                })
+        return jsonify({"error": "URL not found in mapping"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# 4. 服务端搜索（可选，客户端也可以自己搜）
+@app.route('/api/OVideo/search', methods=['GET'])
+def search_ovideo():
+    keyword = request.args.get('q', '').strip().lower()
+    if not keyword:
+        return jsonify({"results": []})
+    video_file = os.path.join(OVIDEO_DIR, 'OVideos.json')
+    if not os.path.exists(video_file):
+        return jsonify({"results": []})
+    try:
+        with open(video_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        results = []
+        for category_name, items in data.items():
+            for item in items:
+                name = item.get('name', '').lower()
+                director = (item.get('导演') or '').lower()
+                cast = ' '.join(item.get('主演') or []).lower()
+                intro = (item.get('intro') or '').lower()
+                if (keyword in name or keyword in director
+                        or keyword in cast or keyword in intro):
+                    result_item = dict(item)
+                    result_item['category'] = category_name
+                    results.append(result_item)
+        return jsonify({"results": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # --- 服务器启动 ---
 if __name__ == '__main__':

@@ -810,18 +810,62 @@ OVIDEO_DIR = os.path.join(BASE_RESOURCES_DIR, 'OVideo')
 OVIDEO_COVER_DIR = os.path.join(OVIDEO_DIR, 'cover_image')
 
 # 1. 获取视频目录（保证分类顺序 Movie/Drama/Show/Anime ...）
+# 【修改】只显示在 url_mapping.json 中存在真实播放链接的剧集
 @app.route('/api/OVideo/videos', methods=['GET'])
 def get_ovideos():
     video_file = os.path.join(OVIDEO_DIR, 'OVideos.json')
+    mapping_file = os.path.join(OVIDEO_DIR, 'url_mapping.json')
+    
     if not os.path.exists(video_file):
         return jsonify({"error": "Video file not found"}), 404
+        
     try:
+        # 1. 读取原始视频数据
         with open(video_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        # 将 dict 转为有序列表，保证分类顺序
+            
+        # 2. 读取 url_mapping 数据，用于过滤
+        valid_urls = set()
+        if os.path.exists(mapping_file):
+            with open(mapping_file, 'r', encoding='utf-8') as f_map:
+                mappings = json.load(f_map)
+                # 只有 mapping 中值不为空的 URL 才是有效的
+                valid_urls = set(mappings.keys())
+
+        # 3. 将 dict 转为有序列表，并在转换过程中过滤 playlist
         categories = []
         for key, value in data.items():
-            categories.append({"name": key, "items": value})
+            filtered_items = []
+            for item in value:
+                # 深拷贝或重建 item，避免修改内存中的原始 dict 缓存
+                new_item = dict(item)
+                filtered_playlist = []
+                
+                if 'playlist' in item:
+                    for channel in item['playlist']:
+                        # 过滤 episodes 字典，只保留 url 在 valid_urls 中的键值对
+                        filtered_episodes = {
+                            ep_name: ep_url 
+                            for ep_name, ep_url in channel.get('episodes', {}).items()
+                            if ep_url in valid_urls
+                        }
+                        
+                        # 如果过滤后该播放源还有剧集，则保留该播放源
+                        if filtered_episodes:
+                            new_channel = dict(channel)
+                            new_channel['episodes'] = filtered_episodes
+                            filtered_playlist.append(new_channel)
+                
+                # 更新 item 的播放列表
+                new_item['playlist'] = filtered_playlist
+                
+                # 选项：如果你希望“没有任何可用播放源”的视频直接不显示，可以加判断：
+                # if filtered_playlist: filtered_items.append(new_item)
+                # 否则保留视频，详情页会显示“暂无可用资源”
+                filtered_items.append(new_item)
+                
+            categories.append({"name": key, "items": filtered_items})
+            
         return jsonify({"categories": categories})
     except Exception as e:
         traceback.print_exc()

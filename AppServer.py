@@ -843,11 +843,11 @@ def get_ovideos():
                 
                 if 'playlist' in item:
                     for channel in item['playlist']:
-                        # 过滤 episodes 字典，只保留 url 在 valid_urls 中的键值对
+                        # 【核心修改】：如果 url 在 mapping 中，或者 url 本身包含 .m3u8，都视作有效
                         filtered_episodes = {
                             ep_name: ep_url 
                             for ep_name, ep_url in channel.get('episodes', {}).items()
-                            if ep_url in valid_urls
+                            if ep_url in valid_urls or '.m3u8' in ep_url.lower()
                         }
                         
                         # 如果过滤后该播放源还有剧集，则保留该播放源
@@ -896,7 +896,13 @@ def resolve_ovideo_url():
     if not episode_url:
         return jsonify({"error": "Missing url"}), 400
 
-    # 黑名单
+    # 【核心修改】：如果是直接写在 json 里的 m3u8 链接，直接返回它自己，跳过 mapping 检索
+    if '.m3u8' in episode_url.lower():
+        return jsonify({
+            "real_url": episode_url,
+            "title": ""
+        })
+
     blacklist_file = os.path.join(OVIDEO_DIR, 'blacklist_url.json')
     if os.path.exists(blacklist_file):
         try:
@@ -958,7 +964,6 @@ def search_ovideo():
 if __name__ == '__main__':
     # 【新增】在启动时初始化数据库
     init_user_db()
-    
     supported_apps_str = ", ".join(ALLOWED_APPS)
     print("多应用服务器正在启动...")
     print(f"支持的应用: {supported_apps_str}")

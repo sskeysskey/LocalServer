@@ -7,6 +7,8 @@ from flask_cors import CORS
 from flask_compress import Compress
 from werkzeug.utils import safe_join
 from datetime import datetime, timedelta
+import secrets, hashlib
+from functools import wraps
 
 app = Flask(__name__)
 CORS(app)
@@ -25,10 +27,16 @@ PARENT_DIR = os.path.dirname(CURRENT_DIR)
 
 BASE_RESOURCES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Resources')
 ALLOWED_APPS = ['ONews', 'Finance', 'Prediction', 'OVideo']
+ALLOWED_EVENT_TYPES = {'play', 'download_start', 'download_complete'}
 
 # 【新增】用户数据库路径
 USER_DB_PATH = os.path.join(PARENT_DIR, 'user_data.db')
+ANALYTICS_DB_PATH = os.path.join(PARENT_DIR, 'analytics.db')
 FINANCE_DB_PATH = os.path.join(BASE_RESOURCES_DIR, 'Finance', 'Finance.db')
+
+# ⚠️ 改成你自己的密码！
+ADMIN_PASSWORD_HASH = hashlib.sha256("YourStrongPassword123!".encode()).hexdigest()
+ADMIN_TOKENS = set()  # 内存存有效 token，重启失效（简单够用）
 
 # 【新增】简单的邀请码配置 (实际生产中可以放在数据库里)
 # 格式: "邀请码": "备注"
@@ -39,6 +47,15 @@ VALID_INVITE_CODES = {
 }
 
 # --- 数据库连接辅助函数 ---
+def require_admin(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        token = request.headers.get('X-Admin-Token') or request.args.get('token')
+        if token not in ADMIN_TOKENS:
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
 def get_finance_db():
     db = getattr(g, '_finance_database', None)
     if db is None:
@@ -104,6 +121,42 @@ def init_user_db():
     conn.commit()
     conn.close()
     print("用户数据库（新结构）已准备就绪。")
+
+def init_analytics_db():
+    print(f"检查行为数据库: {ANALYTICS_DB_PATH}")
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=60.0)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS user_video_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            video_url TEXT NOT NULL,
+            video_title TEXT,
+            category TEXT,
+            event_type TEXT NOT NULL,
+            first_at TIMESTAMP NOT NULL,
+            last_at TIMESTAMP NOT NULL,
+            count INTEGER DEFAULT 1,
+            UNIQUE(user_id, video_url, event_type)
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS event_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            video_url TEXT NOT NULL,
+            video_title TEXT,
+            category TEXT,
+            event_type TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_logs_time ON event_logs(created_at)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_logs_type ON event_logs(event_type)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_events_url ON user_video_events(video_url)')
+    conn.commit()
+    conn.close()
+    print("行为数据库已就绪。")
 
 # --- API 路由 ---
 @app.route('/api/<app_name>/check_version', methods=['GET'])
@@ -959,11 +1012,426 @@ def search_ovideo():
         return jsonify({"results": results})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+@app.route('/api/OVideo/track', methods=['POST'])
+def track_event():
+    try:
+        data = request.get_json()
+        user_id     = data.get('user_id')
+        video_url   = data.get('video_url')
+        video_title = data.get('video_title', '')
+        category    = data.get('category', '')
+        event_type  = data.get('event_type')
+
+        if not user_id or not video_url or event_type not in ALLOWED_EVENT_TYPES:
+            return jsonify({"error": "Invalid params"}), 400
+
+        now = datetime.utcnow().isoformat()
+        conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+        c = conn.cursor()
+
+        # 1. 去重表：UPSERT
+        c.execute('''
+            INSERT INTO user_video_events
+                (user_id, video_url, video_title, category, event_type, first_at, last_at, count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(user_id, video_url, event_type)
+            DO UPDATE SET last_at = ?, count = count + 1
+        ''', (user_id, video_url, video_title, category, event_type, now, now, now))
+
+        # 2. 流水表：每次都插
+        c.execute('''
+            INSERT INTO event_logs
+                (user_id, video_url, video_title, category, event_type, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, video_url, video_title, category, event_type, now))
+
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    
+@app.route('/admin/login', methods=['POST'])
+def admin_login():
+    pwd = request.get_json().get('password', '')
+    if hashlib.sha256(pwd.encode()).hexdigest() == ADMIN_PASSWORD_HASH:
+        token = secrets.token_urlsafe(32)
+        ADMIN_TOKENS.add(token)
+        return jsonify({"token": token})
+    return jsonify({"error": "密码错误"}), 401
+
+
+def _query_analytics(sql, params=()):
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# 概览：今日 / 总计
+@app.route('/admin/api/overview', methods=['GET'])
+@require_admin
+def admin_overview():
+    today = datetime.utcnow().strftime('%Y-%m-%d')
+    return jsonify({
+        "total_users":          _query_analytics("SELECT COUNT(DISTINCT user_id) AS c FROM event_logs")[0]['c'],
+        "total_play_events":    _query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='play'")[0]['c'],
+        "total_download_events":_query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='download_complete'")[0]['c'],
+        "today_active_users":   _query_analytics("SELECT COUNT(DISTINCT user_id) AS c FROM event_logs WHERE date(created_at)=?", (today,))[0]['c'],
+        "today_play":           _query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='play' AND date(created_at)=?", (today,))[0]['c'],
+        "today_download":       _query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='download_complete' AND date(created_at)=?", (today,))[0]['c'],
+    })
+
+# 视频排行榜（区分唯一用户数 / 总次数）
+@app.route('/admin/api/top_videos', methods=['GET'])
+@require_admin
+def admin_top_videos():
+    event_type = request.args.get('type', 'play')   # play / download_complete
+    period = request.args.get('period', 'all')      # today / 7d / all
+    limit = int(request.args.get('limit', 20))
+
+    where_time = ""
+    params = [event_type]
+    if period == 'today':
+        where_time = "AND date(created_at) = date('now')"
+    elif period == '7d':
+        where_time = "AND created_at >= datetime('now', '-7 days')"
+
+    # 用流水表统计：唯一用户数 + 总触发次数
+    sql = f'''
+        SELECT video_url, video_title, category,
+               COUNT(DISTINCT user_id) AS unique_users,
+               COUNT(*) AS total_count
+        FROM event_logs
+        WHERE event_type = ? {where_time}
+        GROUP BY video_url
+        ORDER BY unique_users DESC, total_count DESC
+        LIMIT ?
+    '''
+    params.append(limit)
+    return jsonify(_query_analytics(sql, params))
+
+# 某个视频的观看用户列表
+@app.route('/admin/api/video_users', methods=['GET'])
+@require_admin
+def admin_video_users():
+    video_url = request.args.get('video_url')
+    event_type = request.args.get('type', 'play')
+    rows = _query_analytics('''
+        SELECT user_id, first_at, last_at, count
+        FROM user_video_events
+        WHERE video_url = ? AND event_type = ?
+        ORDER BY last_at DESC
+    ''', (video_url, event_type))
+    return jsonify(rows)
+
+# 每日趋势（最近 30 天）
+@app.route('/admin/api/daily_trend', methods=['GET'])
+@require_admin
+def admin_daily_trend():
+    rows = _query_analytics('''
+        SELECT date(created_at) AS day,
+               event_type,
+               COUNT(*) AS cnt,
+               COUNT(DISTINCT user_id) AS uu
+        FROM event_logs
+        WHERE created_at >= datetime('now', '-30 days')
+        GROUP BY day, event_type
+        ORDER BY day ASC
+    ''')
+    return jsonify(rows)
+
+# 分类占比
+@app.route('/admin/api/category_stats', methods=['GET'])
+@require_admin
+def admin_category_stats():
+    rows = _query_analytics('''
+        SELECT category, event_type,
+               COUNT(*) AS cnt,
+               COUNT(DISTINCT user_id) AS uu
+        FROM event_logs
+        WHERE category != ''
+        GROUP BY category, event_type
+    ''')
+    return jsonify(rows)
+
+# 活跃用户排行
+@app.route('/admin/api/top_users', methods=['GET'])
+@require_admin
+def admin_top_users():
+    rows = _query_analytics('''
+        SELECT user_id,
+               COUNT(DISTINCT video_url) AS unique_videos,
+               COUNT(*) AS total_actions,
+               MAX(created_at) AS last_active
+        FROM event_logs
+        GROUP BY user_id
+        ORDER BY unique_videos DESC
+        LIMIT 50
+    ''')
+    return jsonify(rows)
+
+# Dashboard 网页本体（HTML 见下一节）
+@app.route('/admin', methods=['GET'])
+def admin_page():
+    return ADMIN_HTML  # 见下方
+
+ADMIN_HTML = r'''
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OVideo 行为监控</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+  .login-box{max-width:380px;margin:120px auto;background:#1e293b;padding:40px;border-radius:16px;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+  .login-box h1{margin-bottom:24px;font-size:22px;text-align:center}
+  input,button{width:100%;padding:12px 14px;border-radius:10px;border:none;font-size:15px}
+  input{background:#0f172a;color:#e2e8f0;border:1px solid #334155;margin-bottom:14px}
+  button{background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:white;cursor:pointer;font-weight:600}
+  button:hover{opacity:.9}
+  .container{max-width:1400px;margin:0 auto;padding:24px;display:none}
+  .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
+  .header h1{font-size:22px;background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:24px}
+  .stat-card{background:#1e293b;padding:20px;border-radius:14px;border:1px solid #334155}
+  .stat-card .label{font-size:12px;color:#94a3b8;margin-bottom:8px}
+  .stat-card .value{font-size:28px;font-weight:700;background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px}
+  @media(max-width:900px){.row{grid-template-columns:1fr}}
+  .panel{background:#1e293b;padding:20px;border-radius:14px;border:1px solid #334155}
+  .panel h3{margin-bottom:16px;font-size:15px;color:#cbd5e1;display:flex;justify-content:space-between;align-items:center}
+  .tabs{display:flex;gap:6px;margin-bottom:14px}
+  .tab{padding:6px 12px;background:#0f172a;border-radius:8px;font-size:12px;cursor:pointer;border:1px solid #334155}
+  .tab.active{background:linear-gradient(135deg,#3b82f6,#8b5cf6);border-color:transparent}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #334155}
+  th{color:#94a3b8;font-weight:500;font-size:12px}
+  tr:hover td{background:#0f172a}
+  .pill{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px}
+  .pill-blue{background:rgba(59,130,246,.2);color:#93c5fd}
+  .pill-green{background:rgba(34,197,94,.2);color:#86efac}
+  .err{color:#f87171;text-align:center;margin-top:10px;font-size:13px}
+  .clickable{cursor:pointer;color:#60a5fa}
+  .clickable:hover{text-decoration:underline}
+  canvas{max-height:280px}
+</style>
+</head>
+<body>
+
+<!-- 登录界面 -->
+<div class="login-box" id="loginBox">
+  <h1>🎬 OVideo 后台</h1>
+  <input type="password" id="pwdInput" placeholder="管理员密码" />
+  <button onclick="login()">登录</button>
+  <div class="err" id="loginErr"></div>
+</div>
+
+<!-- 主面板 -->
+<div class="container" id="dashboard">
+  <div class="header">
+    <h1>📊 OVideo 用户行为监控</h1>
+    <div>
+      <span style="color:#94a3b8;font-size:13px;margin-right:12px" id="updateTime"></span>
+      <button onclick="loadAll()" style="width:auto;padding:8px 16px;font-size:13px">🔄 刷新</button>
+    </div>
+  </div>
+
+  <div class="stats" id="statsBox"></div>
+
+  <div class="row">
+    <div class="panel">
+      <h3>📈 最近 30 天趋势</h3>
+      <canvas id="trendChart"></canvas>
+    </div>
+    <div class="panel">
+      <h3>🎭 分类分布（唯一用户数）</h3>
+      <canvas id="categoryChart"></canvas>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="panel">
+      <h3>
+        🔥 视频播放榜
+        <span class="tabs">
+          <span class="tab active" onclick="switchPlayPeriod(this,'today')">今日</span>
+          <span class="tab" onclick="switchPlayPeriod(this,'7d')">7天</span>
+          <span class="tab" onclick="switchPlayPeriod(this,'all')">总计</span>
+        </span>
+      </h3>
+      <table>
+        <thead><tr><th>#</th><th>视频</th><th>分类</th><th>用户数</th><th>次数</th></tr></thead>
+        <tbody id="topPlayBody"></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h3>
+        📥 视频下载榜
+        <span class="tabs">
+          <span class="tab active" onclick="switchDlPeriod(this,'today')">今日</span>
+          <span class="tab" onclick="switchDlPeriod(this,'7d')">7天</span>
+          <span class="tab" onclick="switchDlPeriod(this,'all')">总计</span>
+        </span>
+      </h3>
+      <table>
+        <thead><tr><th>#</th><th>视频</th><th>分类</th><th>用户数</th><th>次数</th></tr></thead>
+        <tbody id="topDlBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-bottom:24px">
+    <h3>👥 活跃用户榜（按观看视频数）</h3>
+    <table>
+      <thead><tr><th>#</th><th>User ID</th><th>看过视频数</th><th>总操作数</th><th>最后活跃</th></tr></thead>
+      <tbody id="topUsersBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+let TOKEN = localStorage.getItem('admin_token') || '';
+let trendChart, categoryChart;
+let playPeriod='today', dlPeriod='today';
+
+async function login(){
+  const pwd = document.getElementById('pwdInput').value;
+  const r = await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwd})});
+  if(!r.ok){document.getElementById('loginErr').innerText='密码错误';return}
+  const d = await r.json();
+  TOKEN = d.token;
+  localStorage.setItem('admin_token', TOKEN);
+  showDashboard();
+}
+
+function showDashboard(){
+  document.getElementById('loginBox').style.display='none';
+  document.getElementById('dashboard').style.display='block';
+  loadAll();
+}
+
+async function api(path){
+  const r = await fetch(path,{headers:{'X-Admin-Token':TOKEN}});
+  if(r.status===401){
+    localStorage.removeItem('admin_token');
+    location.reload();
+    return null;
+  }
+  return r.json();
+}
+
+async function loadAll(){
+  document.getElementById('updateTime').innerText = '更新于 '+new Date().toLocaleTimeString();
+  loadOverview();
+  loadTrend();
+  loadCategory();
+  loadTopVideos('play', playPeriod);
+  loadTopVideos('download_complete', dlPeriod);
+  loadTopUsers();
+}
+
+async function loadOverview(){
+  const d = await api('/admin/api/overview');if(!d)return;
+  const items = [
+    ['总用户数', d.total_users],
+    ['今日活跃', d.today_active_users],
+    ['今日播放', d.today_play],
+    ['今日下载', d.today_download],
+    ['累计播放', d.total_play_events],
+    ['累计下载', d.total_download_events],
+  ];
+  document.getElementById('statsBox').innerHTML = items.map(([l,v])=>
+    `<div class="stat-card"><div class="label">${l}</div><div class="value">${v||0}</div></div>`).join('');
+}
+
+async function loadTrend(){
+  const data = await api('/admin/api/daily_trend');if(!data)return;
+  const days=[...new Set(data.map(r=>r.day))].sort();
+  const playData = days.map(d=>{const r=data.find(x=>x.day===d&&x.event_type==='play');return r?r.cnt:0});
+  const dlData = days.map(d=>{const r=data.find(x=>x.day===d&&x.event_type==='download_complete');return r?r.cnt:0});
+  if(trendChart) trendChart.destroy();
+  trendChart = new Chart(document.getElementById('trendChart'),{
+    type:'line',
+    data:{labels:days,datasets:[
+      {label:'播放',data:playData,borderColor:'#60a5fa',backgroundColor:'rgba(96,165,250,.15)',tension:.3,fill:true},
+      {label:'下载',data:dlData,borderColor:'#a78bfa',backgroundColor:'rgba(167,139,250,.15)',tension:.3,fill:true},
+    ]},
+    options:{responsive:true,plugins:{legend:{labels:{color:'#cbd5e1'}}},scales:{x:{ticks:{color:'#94a3b8'}},y:{ticks:{color:'#94a3b8'}}}}
+  });
+}
+
+async function loadCategory(){
+  const data = await api('/admin/api/category_stats');if(!data)return;
+  const cats = [...new Set(data.map(r=>r.category))];
+  const playUU = cats.map(c=>{const r=data.find(x=>x.category===c&&x.event_type==='play');return r?r.uu:0});
+  if(categoryChart) categoryChart.destroy();
+  categoryChart = new Chart(document.getElementById('categoryChart'),{
+    type:'doughnut',
+    data:{labels:cats,datasets:[{data:playUU,backgroundColor:['#60a5fa','#a78bfa','#f472b6','#34d399','#fbbf24','#fb923c']}]},
+    options:{responsive:true,plugins:{legend:{position:'right',labels:{color:'#cbd5e1'}}}}
+  });
+}
+
+async function loadTopVideos(type, period){
+  const data = await api(`/admin/api/top_videos?type=${type}&period=${period}&limit=15`);if(!data)return;
+  const tbody = type==='play'?'topPlayBody':'topDlBody';
+  document.getElementById(tbody).innerHTML = data.length===0
+    ? '<tr><td colspan="5" style="text-align:center;color:#64748b">暂无数据</td></tr>'
+    : data.map((r,i)=>`<tr>
+        <td>${i+1}</td>
+        <td class="clickable" onclick="showUsers('${encodeURIComponent(r.video_url)}','${type}')">${r.video_title||r.video_url}</td>
+        <td><span class="pill pill-blue">${r.category||'—'}</span></td>
+        <td><span class="pill pill-green">${r.unique_users}</span></td>
+        <td>${r.total_count}</td>
+      </tr>`).join('');
+}
+
+async function loadTopUsers(){
+  const data = await api('/admin/api/top_users');if(!data)return;
+  document.getElementById('topUsersBody').innerHTML = data.map((r,i)=>`<tr>
+    <td>${i+1}</td>
+    <td style="font-family:monospace;font-size:11px">${r.user_id.substring(0,30)}...</td>
+    <td>${r.unique_videos}</td>
+    <td>${r.total_actions}</td>
+    <td style="color:#94a3b8;font-size:12px">${r.last_active.replace('T',' ').substring(0,19)}</td>
+  </tr>`).join('');
+}
+
+async function showUsers(urlEnc, type){
+  const url = decodeURIComponent(urlEnc);
+  const data = await api(`/admin/api/video_users?video_url=${encodeURIComponent(url)}&type=${type}`);
+  if(!data)return;
+  alert(`观看此视频的用户 (${data.length} 人):\n\n` +
+    data.slice(0,30).map(u=>`• ${u.user_id.substring(0,25)}... (${u.count}次, 最后:${u.last_at.substring(0,16).replace('T',' ')})`).join('\n'));
+}
+
+function switchPlayPeriod(el,p){
+  el.parentNode.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  el.classList.add('active');playPeriod=p;loadTopVideos('play',p);
+}
+function switchDlPeriod(el,p){
+  el.parentNode.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  el.classList.add('active');dlPeriod=p;loadTopVideos('download_complete',p);
+}
+
+if(TOKEN) showDashboard();
+</script>
+</body>
+</html>
+'''
 
 # --- 服务器启动 ---
 if __name__ == '__main__':
     # 【新增】在启动时初始化数据库
     init_user_db()
+    init_analytics_db()
     supported_apps_str = ", ".join(ALLOWED_APPS)
     print("多应用服务器正在启动...")
     print(f"支持的应用: {supported_apps_str}")

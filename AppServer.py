@@ -27,7 +27,7 @@ PARENT_DIR = os.path.dirname(CURRENT_DIR)
 
 BASE_RESOURCES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Resources')
 ALLOWED_APPS = ['ONews', 'Finance', 'Prediction', 'OVideo']
-ALLOWED_EVENT_TYPES = {'play', 'download_start', 'download_complete'}
+ALLOWED_EVENT_TYPES = {'play', 'download_complete'}
 
 # 【新增】用户数据库路径
 USER_DB_PATH = os.path.join(PARENT_DIR, 'user_data.db')

@@ -28,6 +28,8 @@ PARENT_DIR = os.path.dirname(CURRENT_DIR)
 BASE_RESOURCES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Resources')
 ALLOWED_APPS = ['ONews', 'Finance', 'Prediction', 'OVideo']
 ALLOWED_EVENT_TYPES = {'play', 'download_complete'}
+# 【修改】移除了 'read'，仅保留 view, listen, lang_switch
+ALLOWED_NEWS_EVENT_TYPES = {'view', 'listen', 'lang_switch'}
 
 # 【新增】用户数据库路径
 USER_DB_PATH = os.path.join(PARENT_DIR, 'user_data.db')
@@ -77,7 +79,6 @@ def init_user_db():
     print(f"检查用户数据库: {USER_DB_PATH}")
     # 确保存储目录存在
     os.makedirs(os.path.dirname(USER_DB_PATH), exist_ok=True)
-    
     conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
     c = conn.cursor()
     
@@ -117,16 +118,14 @@ def init_user_db():
         c.execute('ALTER TABLE users ADD COLUMN prediction_is_permanent INTEGER DEFAULT 0')
     except sqlite3.OperationalError:
         pass
-
     conn.commit()
     conn.close()
-    print("用户数据库（新结构）已准备就绪。")
+    print("用户数据库已准备就绪。")
 
 def init_analytics_db():
     print(f"检查行为数据库: {ANALYTICS_DB_PATH}")
     conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=60.0)
     c = conn.cursor()
-    # 移除了 category 字段
     c.execute('''
         CREATE TABLE IF NOT EXISTS user_video_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -153,6 +152,40 @@ def init_analytics_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_logs_time ON event_logs(created_at)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_logs_type ON event_logs(event_type)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_events_url ON user_video_events(video_url)')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS user_news_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            user_type TEXT DEFAULT 'apple',   -- apple / device
+            article_key TEXT NOT NULL,        -- source_id|topic 的稳定键
+            article_topic TEXT,
+            source_id TEXT,
+            article_date TEXT,                -- 文章 yyMMdd
+            event_type TEXT NOT NULL,         -- view/read/listen/lang_switch
+            first_at TIMESTAMP NOT NULL,
+            last_at TIMESTAMP NOT NULL,
+            count INTEGER DEFAULT 1,
+            UNIQUE(user_id, article_key, event_type)
+        )
+    ''')
+    # 【新增】新闻流水表
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS news_event_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            user_type TEXT DEFAULT 'apple',
+            article_key TEXT NOT NULL,
+            article_topic TEXT,
+            source_id TEXT,
+            article_date TEXT,
+            event_type TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_news_logs_time ON news_event_logs(created_at)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_news_logs_source ON news_event_logs(source_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_news_logs_type ON news_event_logs(event_type)')
     conn.commit()
     conn.close()
     print("行为数据库已就绪。")
@@ -196,7 +229,6 @@ def delete_user(app_name):
         c.execute("DELETE FROM users WHERE apple_user_id = ?", (user_id,))
         if c.rowcount == 0:
             return jsonify({"error": "User not found"}), 404
-            
         conn.commit()
         print(f"[{app_name}] 用户 {user_id} 已成功删除账号。")
         return jsonify({"status": "success"}), 200
@@ -306,7 +338,6 @@ def query_historical():
         '''
         cur = db.execute(query, (symbol, start_date, end_date))
         rows = cur.fetchall()
-        
         result = []
         for row in rows:
             item = {
@@ -322,9 +353,7 @@ def query_historical():
                 item["high"] = row["high"]
             if "low" in columns and row["low"] is not None:
                 item["low"] = row["low"]
-            
             result.append(item)
-            
         return jsonify(result)
     except Exception as e:
         print(f"Error querying historical: {e}")
@@ -353,13 +382,10 @@ def query_closing_price():
     symbol = request.args.get('symbol')
     date = request.args.get('date')
     table_name = request.args.get('table')
-    
     if not all([symbol, date, table_name]):
         return jsonify({"error": "Missing parameters"}), 400
-        
     db = get_finance_db()
     if not db: return jsonify({"error": "Database not found"}), 500
-    
     try:
         query = f'SELECT price FROM "{table_name}" WHERE name = ? AND date = ? LIMIT 1'
         cur = db.execute(query, (symbol, date))
@@ -376,19 +402,15 @@ def query_closing_price():
 def query_latest_volume():
     symbol = request.args.get('symbol')
     table_name = request.args.get('table')
-    
     if not all([symbol, table_name]): return jsonify({"error": "Missing parameters"}), 400
-    
     db = get_finance_db()
     if not db: return jsonify({"error": "Database not found"}), 500
-    
     try:
         # 先检查是否有 volume 列，避免报错
         cur = db.execute(f'PRAGMA table_info("{table_name}")')
         columns = [row['name'].lower() for row in cur.fetchall()]
         if 'volume' not in columns:
              return jsonify({"volume": None})
-
         query = f'SELECT volume FROM "{table_name}" WHERE name = ? ORDER BY date DESC LIMIT 1'
         cur = db.execute(query, (symbol,))
         row = cur.fetchone()
@@ -405,7 +427,6 @@ def query_options_summary():
     # 允许传单个 'symbol' 或 逗号分隔的 'symbols'
     symbol_param = request.args.get('symbol')
     symbols_param = request.args.get('symbols')
-
     db = get_finance_db()
     if not db: return jsonify({"error": "Database not found"}), 500
 
@@ -415,10 +436,8 @@ def query_options_summary():
         target_symbols = [s.strip() for s in symbols_param.split(',') if s.strip()]
     elif symbol_param:
         target_symbols = [symbol_param]
-    
     if not target_symbols:
         return jsonify({"error": "Missing parameters"}), 400
-
     try:
         results = {}
         
@@ -434,11 +453,9 @@ def query_options_summary():
             '''
             cur = db.execute(query, (sym,))
             rows = cur.fetchall()
-            
             if rows:
                 latest_row = rows[0]
                 prev_row = rows[1] if len(rows) > 1 else None
-                
                 results[sym] = {
                     "call": latest_row["call"],
                     "put": latest_row["put"],
@@ -642,18 +659,14 @@ def handle_auth(app_name):
         # email 和 full_name 我们不再获取也不再存储
         
         if not user_id: return jsonify({"error": "Missing user_id"}), 400
-        
         conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
-        
         c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
         user = c.fetchone()
         now = datetime.utcnow()
-        
         is_subscribed = False
         expiration_date = None
-        
         if user:
             # 老用户：更新登录时间
             c.execute("UPDATE users SET last_login_at = ? WHERE apple_user_id = ?", (now, user_id))
@@ -703,14 +716,12 @@ def handle_redeem_invite(app_name):
     data = request.get_json()
     user_id = data.get('user_id')
     invite_code = data.get('invite_code')
-    
     if not user_id or not invite_code:
         return jsonify({"error": "缺少参数"}), 400
         
     # 验证邀请码
     if invite_code not in VALID_INVITE_CODES:
         return jsonify({"error": "无效的邀请码"}), 403
-        
     conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
     c = conn.cursor()
     try:
@@ -722,7 +733,6 @@ def handle_redeem_invite(app_name):
         c.execute(query, (user_id,))
         if c.rowcount == 0:
             return jsonify({"error": "用户不存在，请先登录"}), 404
-            
         conn.commit()
         print(f"[{app_name}] 用户 {user_id} 使用邀请码 {invite_code} 升级为永久 VIP")
         
@@ -742,18 +752,14 @@ def handle_payment(app_name):
     days = data.get('days', 30) # 保持默认值用于兼容旧版本或手动充值
     # 【新增】接收客户端传来的真实过期时间字符串 (ISO 8601 格式)
     explicit_expiry = data.get('explicit_expiry') 
-    
     if not user_id: return jsonify({"error": "Missing user_id"}), 400
-    
     conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    
     try:
         c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
         row = c.fetchone()
         if not row: return jsonify({"error": "User not found"}), 404
-        
         now = datetime.utcnow()
         
         # 确定要更新哪个字段
@@ -878,7 +884,6 @@ def get_ovideos():
                 # 深拷贝或重建 item，避免修改内存中的原始 dict 缓存
                 new_item = dict(item)
                 filtered_playlist = []
-                
                 if 'playlist' in item:
                     for channel in item['playlist']:
                         # 【核心修改】：如果 url 在 mapping 中，或者 url 本身包含 .m3u8，都视作有效
@@ -901,9 +906,7 @@ def get_ovideos():
                 # if filtered_playlist: filtered_items.append(new_item)
                 # 否则保留视频，详情页会显示“暂无可用资源”
                 filtered_items.append(new_item)
-                
             categories.append({"name": key, "items": filtered_items})
-            
         return jsonify({"categories": categories})
     except Exception as e:
         traceback.print_exc()
@@ -955,7 +958,6 @@ def resolve_ovideo_url():
     mapping_file = os.path.join(OVIDEO_DIR, 'url_mapping.json')
     if not os.path.exists(mapping_file):
         return jsonify({"error": "Mapping file not found"}), 404
-
     try:
         with open(mapping_file, 'r', encoding='utf-8') as f:
             mappings = json.load(f)
@@ -1005,16 +1007,12 @@ def track_event():
         user_id     = data.get('user_id')
         video_url   = data.get('video_url')
         video_title = data.get('video_title', '')
-        event_type  = data.get('event_type')  # 移除了 category
-
+        event_type  = data.get('event_type')
         if not user_id or not video_url or event_type not in ALLOWED_EVENT_TYPES:
             return jsonify({"error": "Invalid params"}), 400
-
         now = datetime.utcnow().isoformat()
         conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
         c = conn.cursor()
-
-        # 移除了 category 字段的插入
         c.execute('''
             INSERT INTO user_video_events
                 (user_id, video_url, video_title, event_type, first_at, last_at, count)
@@ -1037,6 +1035,45 @@ def track_event():
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
     
+@app.route('/api/ONews/track', methods=['POST'])
+def track_news_event():
+    try:
+        data = request.get_json()
+        user_id       = data.get('user_id')
+        user_type     = data.get('user_type', 'apple')
+        article_key   = data.get('article_key')
+        article_topic = data.get('article_topic', '')
+        source_id     = data.get('source_id', '')
+        article_date  = data.get('article_date', '')
+        event_type    = data.get('event_type')
+        if not user_id or not article_key or event_type not in ALLOWED_NEWS_EVENT_TYPES:
+            return jsonify({"error": "Invalid params"}), 400
+        now = datetime.utcnow().isoformat()
+        conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO user_news_events
+                (user_id, user_type, article_key, article_topic, source_id,
+                 article_date, event_type, first_at, last_at, count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(user_id, article_key, event_type)
+            DO UPDATE SET last_at = ?, count = count + 1
+        ''', (user_id, user_type, article_key, article_topic, source_id,
+              article_date, event_type, now, now, now))
+        c.execute('''
+            INSERT INTO news_event_logs
+                (user_id, user_type, article_key, article_topic, source_id,
+                 article_date, event_type, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, user_type, article_key, article_topic, source_id,
+              article_date, event_type, now))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    
 @app.route('/admin/login', methods=['POST'])
 def admin_login():
     pwd = request.get_json().get('password', '')
@@ -1046,7 +1083,6 @@ def admin_login():
         return jsonify({"token": token})
     return jsonify({"error": "密码错误"}), 401
 
-
 def _query_analytics(sql, params=()):
     conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
@@ -1054,6 +1090,114 @@ def _query_analytics(sql, params=()):
     conn.close()
     return [dict(r) for r in rows]
 
+
+# 今日 / 总览
+@app.route('/admin/api/news/overview', methods=['GET'])
+@require_admin
+def admin_news_overview():
+    today = datetime.utcnow().strftime('%Y-%m-%d')
+    return jsonify({
+        "total_users":     _query_analytics("SELECT COUNT(DISTINCT user_id) c FROM news_event_logs")[0]['c'],
+        "total_view":      _query_analytics("SELECT COUNT(*) c FROM news_event_logs WHERE event_type='view'")[0]['c'],
+        "total_listen":    _query_analytics("SELECT COUNT(*) c FROM news_event_logs WHERE event_type='listen'")[0]['c'],
+        "today_active":    _query_analytics("SELECT COUNT(DISTINCT user_id) c FROM news_event_logs WHERE date(created_at)=?", (today,))[0]['c'],
+        "today_listen":    _query_analytics("SELECT COUNT(*) c FROM news_event_logs WHERE event_type='listen' AND date(created_at)=?", (today,))[0]['c'],
+        "today_view":      _query_analytics("SELECT COUNT(*) c FROM news_event_logs WHERE event_type='view' AND date(created_at)=?", (today,))[0]['c'],
+    })
+
+# 热门新闻源
+@app.route('/admin/api/news/top_sources', methods=['GET'])
+@require_admin
+def admin_top_sources():
+    period = request.args.get('period', '7d')
+    where = ""
+    if period == 'today':
+        where = "AND date(created_at) = date('now')"
+    elif period == '7d':
+        where = "AND created_at >= datetime('now', '-7 days')"
+    
+    sql = f'''
+        SELECT source_id,
+               COUNT(DISTINCT user_id) AS unique_users,
+               COUNT(DISTINCT article_key) AS unique_articles,
+               COUNT(*) AS total_reads
+        FROM news_event_logs
+        WHERE event_type IN ('listen', 'view') {where}
+        GROUP BY source_id
+        ORDER BY total_reads DESC
+    '''
+    return jsonify(_query_analytics(sql))
+
+# 热门文章
+@app.route('/admin/api/news/top_articles', methods=['GET'])
+@require_admin
+def admin_top_articles():
+    event_type = request.args.get('type', 'listen') # 默认改为 listen
+    period = request.args.get('period', '7d')
+    where = ""
+    if period == 'today':
+        where = "AND date(created_at) = date('now')"
+    elif period == '7d':
+        where = "AND created_at >= datetime('now', '-7 days')"
+    sql = f'''
+        SELECT article_key, article_topic, source_id,
+               COUNT(DISTINCT user_id) AS unique_users,
+               COUNT(*) AS total_count
+        FROM news_event_logs
+        WHERE event_type = ? {where}
+        GROUP BY article_key
+        ORDER BY unique_users DESC
+        LIMIT 30
+    '''
+    return jsonify(_query_analytics(sql, (event_type,)))
+
+# 新闻 - 每日趋势（最近30天）
+@app.route('/admin/api/news/daily_trend', methods=['GET'])
+@require_admin
+def admin_news_daily_trend():
+    rows = _query_analytics('''
+        SELECT date(created_at) AS day,
+               event_type,
+               COUNT(*) AS cnt,
+               COUNT(DISTINCT user_id) AS uu
+        FROM news_event_logs
+        WHERE created_at >= datetime('now', '-30 days')
+        GROUP BY day, event_type
+        ORDER BY day ASC
+    ''')
+    return jsonify(rows)
+
+# 新闻 - 活跃用户榜
+@app.route('/admin/api/news/top_users', methods=['GET'])
+@require_admin
+def admin_news_top_users():
+    rows = _query_analytics('''
+        SELECT user_id,
+               user_type,
+               COUNT(DISTINCT article_key) AS unique_articles,
+               SUM(CASE WHEN event_type='listen' THEN 1 ELSE 0 END) AS listen_count,
+               SUM(CASE WHEN event_type='view' THEN 1 ELSE 0 END) AS view_count,
+               MAX(created_at) AS last_active
+        FROM news_event_logs
+        GROUP BY user_id
+        ORDER BY unique_articles DESC
+        LIMIT 50
+    ''')
+    return jsonify(rows)
+
+# 新闻 - 某篇文章的读者列表
+@app.route('/admin/api/news/article_users', methods=['GET'])
+@require_admin
+def admin_news_article_users():
+    article_key = request.args.get('article_key')
+    event_type = request.args.get('type', 'listen')
+    rows = _query_analytics('''
+        SELECT user_id, user_type, first_at, last_at, count
+        FROM user_news_events
+        WHERE article_key = ? AND event_type = ?
+        ORDER BY last_at DESC
+    ''', (article_key, event_type))
+    return jsonify(rows)
 
 # 概览：今日 / 总计
 @app.route('/admin/api/overview', methods=['GET'])
@@ -1076,7 +1220,6 @@ def admin_top_videos():
     event_type = request.args.get('type', 'play')   # play / download_complete
     period = request.args.get('period', 'all')      # today / 7d / all
     limit = int(request.args.get('limit', 20))
-
     where_time = ""
     params = [event_type]
     if period == 'today':
@@ -1153,7 +1296,6 @@ def admin_clear_db():
     
     if clear_type not in ['analytics', 'users', 'all']:
         return jsonify({"error": "无效的清除类型"}), 400
-        
     try:
         # 1. 清除行为统计数据
         if clear_type in ['analytics', 'all']:
@@ -1161,6 +1303,8 @@ def admin_clear_db():
             c = conn.cursor()
             c.execute("DELETE FROM user_video_events")
             c.execute("DELETE FROM event_logs")
+            c.execute("DELETE FROM user_news_events")
+            c.execute("DELETE FROM news_event_logs")
             conn.commit()
             conn.close()
             
@@ -1171,7 +1315,6 @@ def admin_clear_db():
             c.execute("DELETE FROM users")
             conn.commit()
             conn.close()
-            
         return jsonify({"status": "success", "message": f"成功清空了 {clear_type} 相关的数据。"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1187,7 +1330,7 @@ ADMIN_HTML = r'''
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OVideo 行为监控</title>
+<title>ONews 行为监控</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
@@ -1199,8 +1342,13 @@ ADMIN_HTML = r'''
   button{background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:white;cursor:pointer;font-weight:600}
   button:hover{opacity:.9}
   .container{max-width:1400px;margin:0 auto;padding:24px;display:none}
-  .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
+  .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;flex-wrap:wrap;gap:12px}
   .header h1{font-size:22px;background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+  
+  .module-switch{display:flex;gap:8px;background:#1e293b;padding:6px;border-radius:12px;border:1px solid #334155}
+  .module-tab{padding:8px 18px;border-radius:8px;font-size:13px;cursor:pointer;font-weight:600;color:#94a3b8;transition:all .2s}
+  .module-tab.active{background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:white}
+  
   .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:24px}
   .stat-card{background:#1e293b;padding:20px;border-radius:14px;border:1px solid #334155}
   .stat-card .label{font-size:12px;color:#94a3b8;margin-bottom:8px}
@@ -1209,8 +1357,8 @@ ADMIN_HTML = r'''
   .row-full{display:grid;grid-template-columns:1fr;gap:16px;margin-bottom:24px}
   @media(max-width:900px){.row{grid-template-columns:1fr}}
   .panel{background:#1e293b;padding:20px;border-radius:14px;border:1px solid #334155}
-  .panel h3{margin-bottom:16px;font-size:15px;color:#cbd5e1;display:flex;justify-content:space-between;align-items:center}
-  .tabs{display:flex;gap:6px;margin-bottom:14px}
+  .panel h3{margin-bottom:16px;font-size:15px;color:#cbd5e1;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
+  .tabs{display:flex;gap:6px}
   .tab{padding:6px 12px;background:#0f172a;border-radius:8px;font-size:12px;cursor:pointer;border:1px solid #334155}
   .tab.active{background:linear-gradient(135deg,#3b82f6,#8b5cf6);border-color:transparent}
   table{width:100%;border-collapse:collapse;font-size:13px}
@@ -1219,177 +1367,175 @@ ADMIN_HTML = r'''
   tr:hover td{background:#0f172a}
   .pill{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px}
   .pill-green{background:rgba(34,197,94,.2);color:#86efac}
+  .pill-blue{background:rgba(59,130,246,.2);color:#93c5fd}
+  .pill-purple{background:rgba(167,139,250,.2);color:#c4b5fd}
+  .pill-orange{background:rgba(251,146,60,.2);color:#fdba74}
   .err{color:#f87171;text-align:center;margin-top:10px;font-size:13px}
   .clickable{cursor:pointer;color:#60a5fa}
   .clickable:hover{text-decoration:underline}
   canvas{max-height:280px}
+  .module-section{display:none}
+  .module-section.active{display:block}
   
-  /* 数据库管理样式 */
-  .danger-zone {
-    border: 1px solid #ef4444;
-    background: rgba(239, 68, 68, 0.05);
-  }
-  .danger-zone h3 {
-    color: #f87171 !important;
-  }
-  .btn-group {
-    display: flex;
-    gap: 12px;
-    flex-wrap: wrap;
-    margin-top: 10px;
-  }
-  .btn-danger {
-    background: #dc2626;
-    width: auto;
-    padding: 10px 20px;
-    font-size: 13px;
-    border-radius: 8px;
-  }
-  .btn-danger:hover {
-    background: #b91c1c;
-  }
+  .danger-zone{border:1px solid #ef4444;background:rgba(239,68,68,.05)}
+  .danger-zone h3{color:#f87171 !important}
+  .btn-group{display:flex;gap:12px;flex-wrap:wrap;margin-top:10px}
+  .btn-danger{background:#dc2626;width:auto;padding:10px 20px;font-size:13px;border-radius:8px}
+  .btn-danger:hover{background:#b91c1c}
   
-  /* 自定义双重确认弹窗 */
-  .modal-overlay {
-    position: fixed;
-    top: 0; left: 0; right: 0; bottom: 0;
-    background: rgba(0,0,0,0.7);
-    display: none;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
-  }
-  .modal {
-    background: #1e293b;
-    border: 1px solid #ef4444;
-    border-radius: 14px;
-    padding: 24px;
-    max-width: 450px;
-    width: 90%;
-    box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5);
-  }
-  .modal h4 {
-    color: #f87171;
-    font-size: 18px;
-    margin-bottom: 12px;
-  }
-  .modal p {
-    font-size: 14px;
-    color: #cbd5e1;
-    line-height: 1.6;
-    margin-bottom: 20px;
-  }
-  .modal-btns {
-    display: flex;
-    justify-content: flex-end;
-    gap: 12px;
-  }
-  .modal-btn {
-    padding: 8px 16px;
-    border-radius: 6px;
-    font-size: 13px;
-    cursor: pointer;
-    border: none;
-    font-weight: 600;
-  }
-  .btn-cancel {
-    background: #475569;
-    color: #e2e8f0;
-  }
-  .btn-confirm-final {
-    background: #dc2626;
-    color: white;
-  }
+  .modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:1000}
+  .modal{background:#1e293b;border:1px solid #ef4444;border-radius:14px;padding:24px;max-width:500px;width:90%;max-height:80vh;overflow-y:auto}
+  .modal h4{color:#f87171;font-size:18px;margin-bottom:12px}
+  .modal p{font-size:14px;color:#cbd5e1;line-height:1.6;margin-bottom:20px}
+  .modal-btns{display:flex;justify-content:flex-end;gap:12px}
+  .modal-btn{padding:8px 16px;border-radius:6px;font-size:13px;cursor:pointer;border:none;font-weight:600}
+  .btn-cancel{background:#475569;color:#e2e8f0}
+  .btn-confirm-final{background:#dc2626;color:white}
 </style>
 </head>
 <body>
 
-<!-- 登录界面 -->
 <div class="login-box" id="loginBox">
-  <h1>🎬 OVideo 后台</h1>
+  <h1>🎬 ONews 后台</h1>
   <input type="password" id="pwdInput" placeholder="管理员密码" />
   <button onclick="login()">登录</button>
   <div class="err" id="loginErr"></div>
 </div>
 
-<!-- 主面板 -->
 <div class="container" id="dashboard">
   <div class="header">
-    <h1>📊 OVideo 用户行为监控</h1>
+    <h1>📊 ONews 用户行为监控</h1>
+    <div class="module-switch">
+      <div class="module-tab active" id="tabVideo" onclick="switchModule('video')">🎬 视频模块</div>
+      <div class="module-tab" id="tabNews" onclick="switchModule('news')">📰 新闻模块</div>
+    </div>
     <div>
       <span style="color:#94a3b8;font-size:13px;margin-right:12px" id="updateTime"></span>
-      <button onclick="loadAll()" style="width:auto;padding:8px 16px;font-size:13px">🔄 刷新</button>
+      <button onclick="loadCurrentModule()" style="width:auto;padding:8px 16px;font-size:13px">🔄 刷新</button>
     </div>
   </div>
 
-  <div class="stats" id="statsBox"></div>
-
-  <!-- 最近30天趋势独占一行 -->
-  <div class="row-full">
-    <div class="panel">
-      <h3>📈 最近 30 天趋势</h3>
-      <canvas id="trendChart"></canvas>
+  <!-- ============ 视频模块 ============ -->
+  <div class="module-section active" id="moduleVideo">
+    <div class="stats" id="statsBox"></div>
+    <div class="row-full">
+      <div class="panel">
+        <h3>📈 视频 - 最近 30 天趋势</h3>
+        <canvas id="trendChart"></canvas>
+      </div>
     </div>
-  </div>
-
-  <div class="row">
-    <div class="panel">
-      <h3>
-        🔥 视频播放榜
-        <span class="tabs">
-          <span class="tab active" onclick="switchPlayPeriod(this,'today')">今日</span>
-          <span class="tab" onclick="switchPlayPeriod(this,'7d')">7天</span>
-          <span class="tab" onclick="switchPlayPeriod(this,'all')">总计</span>
-        </span>
-      </h3>
+    <div class="row">
+      <div class="panel">
+        <h3>
+          🔥 视频播放榜
+          <span class="tabs">
+            <span class="tab active" onclick="switchPlayPeriod(this,'today')">今日</span>
+            <span class="tab" onclick="switchPlayPeriod(this,'7d')">7天</span>
+            <span class="tab" onclick="switchPlayPeriod(this,'all')">总计</span>
+          </span>
+        </h3>
+        <table>
+          <thead><tr><th>#</th><th>视频</th><th>用户数</th><th>次数</th></tr></thead>
+          <tbody id="topPlayBody"></tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <h3>
+          📥 视频下载榜
+          <span class="tabs">
+            <span class="tab active" onclick="switchDlPeriod(this,'today')">今日</span>
+            <span class="tab" onclick="switchDlPeriod(this,'7d')">7天</span>
+            <span class="tab" onclick="switchDlPeriod(this,'all')">总计</span>
+          </span>
+        </h3>
+        <table>
+          <thead><tr><th>#</th><th>视频</th><th>用户数</th><th>次数</th></tr></thead>
+          <tbody id="topDlBody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel" style="margin-bottom:24px">
+      <h3>👥 视频 - 活跃用户榜</h3>
       <table>
-        <!-- 移除了分类列 -->
-        <thead><tr><th>#</th><th>视频</th><th>用户数</th><th>次数</th></tr></thead>
-        <tbody id="topPlayBody"></tbody>
+        <thead><tr><th>#</th><th>User ID</th><th>看过视频数</th><th>总操作数</th><th>最后活跃</th></tr></thead>
+        <tbody id="topUsersBody"></tbody>
       </table>
     </div>
-    <div class="panel">
-      <h3>
-        📥 视频下载榜
-        <span class="tabs">
-          <span class="tab active" onclick="switchDlPeriod(this,'today')">今日</span>
-          <span class="tab" onclick="switchDlPeriod(this,'7d')">7天</span>
-          <span class="tab" onclick="switchDlPeriod(this,'all')">总计</span>
-        </span>
-      </h3>
+  </div>
+
+  <!-- ============ 新闻模块 ============ -->
+  <div class="module-section" id="moduleNews">
+    <div class="stats" id="newsStatsBox"></div>
+    <div class="row-full">
+      <div class="panel">
+        <h3>📈 新闻 - 最近 30 天趋势</h3>
+        <canvas id="newsTrendChart"></canvas>
+      </div>
+    </div>
+    <div class="row">
+      <div class="panel">
+        <h3>
+          📰 新闻源热度榜
+          <span class="tabs">
+            <span class="tab" onclick="switchSourcePeriod(this,'today')">今日</span>
+            <span class="tab active" onclick="switchSourcePeriod(this,'7d')">7天</span>
+            <span class="tab" onclick="switchSourcePeriod(this,'all')">总计</span>
+          </span>
+        </h3>
+        <table>
+          <thead><tr><th>#</th><th>新闻源</th><th>用户数</th><th>文章数</th><th>阅读次数</th></tr></thead>
+          <tbody id="topSourcesBody"></tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <h3>
+          🔥 热门文章榜
+          <span class="tabs">
+            <span class="tab" onclick="switchArticleType(this,'listen')">朗读</span>
+            <span class="tab active" onclick="switchArticleType(this,'view')">曝光</span>
+          </span>
+          <span class="tabs">
+            <span class="tab" onclick="switchArticlePeriod(this,'today')">今日</span>
+            <span class="tab active" onclick="switchArticlePeriod(this,'7d')">7天</span>
+            <span class="tab" onclick="switchArticlePeriod(this,'all')">总计</span>
+          </span>
+        </h3>
+        <table>
+          <thead><tr><th>#</th><th>文章</th><th>来源</th><th>用户</th><th>次数</th></tr></thead>
+          <tbody id="topArticlesBody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel" style="margin-bottom:24px">
+      <h3>👥 新闻 - 活跃读者榜</h3>
       <table>
-        <!-- 移除了分类列 -->
-        <thead><tr><th>#</th><th>视频</th><th>用户数</th><th>次数</th></tr></thead>
-        <tbody id="topDlBody"></tbody>
+        <thead>
+          <tr>
+            <th>#</th><th>User ID</th><th>类型</th>
+            <th>听过文章</th><th>朗读</th><th>曝光</th><th>最后活跃</th>
+          </tr>
+        </thead>
+        <tbody id="topNewsUsersBody"></tbody>
       </table>
     </div>
   </div>
 
-  <div class="panel" style="margin-bottom:24px">
-    <h3>👥 活跃用户榜（按观看视频数）</h3>
-    <table>
-      <thead><tr><th>#</th><th>User ID</th><th>看过视频数</th><th>总操作数</th><th>最后活跃</th></tr></thead>
-      <tbody id="topUsersBody"></tbody>
-    </table>
-  </div>
-
-  <!-- 数据库管理面板 -->
+  <!-- 危险区 -->
   <div class="panel danger-zone" style="margin-bottom:24px">
     <h3>⚠️ 数据库维护与管理 (危险区)</h3>
-    <p style="font-size: 13px; color: #94a3b8; margin-bottom: 15px;">此区域包含破坏性操作，清空数据后不可恢复，请务必谨慎操作。</p>
+    <p style="font-size:13px;color:#94a3b8;margin-bottom:15px;">破坏性操作不可恢复，请慎用。</p>
     <div class="btn-group">
-      <button class="btn-danger" onclick="triggerClear('analytics')">🧹 仅清空行为统计数据</button>
-      <button class="btn-danger" onclick="triggerClear('users')">👤 仅清空用户及订阅数据</button>
+      <button class="btn-danger" onclick="triggerClear('analytics')">🧹 清空所有行为统计</button>
+      <button class="btn-danger" onclick="triggerClear('users')">👤 清空用户及订阅数据</button>
       <button class="btn-danger" onclick="triggerClear('all')">🔥 彻底清空所有数据</button>
     </div>
   </div>
 </div>
 
-<!-- 自定义双重确认模态框 -->
 <div class="modal-overlay" id="confirmModal">
   <div class="modal">
     <h4 id="modalTitle">⚠️ 危险操作确认</h4>
-    <p id="modalMsg">您确定要执行此操作吗？此操作将永久删除数据且无法恢复。</p>
+    <p id="modalMsg"></p>
     <div class="modal-btns">
       <button class="modal-btn btn-cancel" onclick="closeModal()">取消</button>
       <button class="modal-btn btn-confirm-final" id="modalConfirmBtn">确认执行</button>
@@ -1399,10 +1545,12 @@ ADMIN_HTML = r'''
 
 <script>
 let TOKEN = localStorage.getItem('admin_token') || '';
-let trendChart;
+let currentModule = 'video';
+let trendChart, newsTrendChart;
 let playPeriod='today', dlPeriod='today';
+let sourcePeriod='7d';
+let articleType='view', articlePeriod='7d';
 let pendingClearType = '';
-let currentStep = 1; // 1: 第一次确认, 2: 第二次确认
 
 async function login(){
   const pwd = document.getElementById('pwdInput').value;
@@ -1417,16 +1565,15 @@ async function login(){
 function showDashboard(){
   document.getElementById('loginBox').style.display='none';
   document.getElementById('dashboard').style.display='block';
-  loadAll();
+  loadCurrentModule();
 }
 
-async function api(path, method = 'GET', body = null){
+async function api(path, method='GET', body=null){
   const headers = {'X-Admin-Token':TOKEN};
   if(body) headers['Content-Type'] = 'application/json';
-  const options = { method, headers };
-  if(body) options.body = JSON.stringify(body);
-  
-  const r = await fetch(path, options);
+  const opts = { method, headers };
+  if(body) opts.body = JSON.stringify(body);
+  const r = await fetch(path, opts);
   if(r.status===401){
     localStorage.removeItem('admin_token');
     location.reload();
@@ -1435,16 +1582,31 @@ async function api(path, method = 'GET', body = null){
   return r.json();
 }
 
-async function loadAll(){
+function switchModule(name){
+  currentModule = name;
+  document.getElementById('tabVideo').classList.toggle('active', name==='video');
+  document.getElementById('tabNews').classList.toggle('active', name==='news');
+  document.getElementById('moduleVideo').classList.toggle('active', name==='video');
+  document.getElementById('moduleNews').classList.toggle('active', name==='news');
+  loadCurrentModule();
+}
+
+function loadCurrentModule(){
   document.getElementById('updateTime').innerText = '更新于 '+new Date().toLocaleTimeString();
-  loadOverview();
-  loadTrend();
+  if(currentModule==='video') loadVideoModule();
+  else loadNewsModule();
+}
+
+// ============ 视频模块 ============
+async function loadVideoModule(){
+  loadVideoOverview();
+  loadVideoTrend();
   loadTopVideos('play', playPeriod);
   loadTopVideos('download_complete', dlPeriod);
   loadTopUsers();
 }
 
-async function loadOverview(){
+async function loadVideoOverview(){
   const d = await api('/admin/api/overview');if(!d)return;
   const items = [
     ['总用户数', d.total_users],
@@ -1458,7 +1620,7 @@ async function loadOverview(){
     `<div class="stat-card"><div class="label">${l}</div><div class="value">${v||0}</div></div>`).join('');
 }
 
-async function loadTrend(){
+async function loadVideoTrend(){
   const data = await api('/admin/api/daily_trend');if(!data)return;
   const days=[...new Set(data.map(r=>r.day))].sort();
   const playData = days.map(d=>{const r=data.find(x=>x.day===d&&x.event_type==='play');return r?r.cnt:0});
@@ -1481,7 +1643,7 @@ async function loadTopVideos(type, period){
     ? '<tr><td colspan="4" style="text-align:center;color:#64748b">暂无数据</td></tr>'
     : data.map((r,i)=>`<tr>
         <td>${i+1}</td>
-        <td class="clickable" onclick="showUsers('${encodeURIComponent(r.video_url)}','${type}')">${r.video_title||r.video_url}</td>
+        <td class="clickable" onclick="showVideoUsers('${encodeURIComponent(r.video_url)}','${type}')">${r.video_title||r.video_url}</td>
         <td><span class="pill pill-green">${r.unique_users}</span></td>
         <td>${r.total_count}</td>
       </tr>`).join('');
@@ -1489,28 +1651,23 @@ async function loadTopVideos(type, period){
 
 async function loadTopUsers(){
   const data = await api('/admin/api/top_users');if(!data)return;
-  document.getElementById('topUsersBody').innerHTML = data.map((r,i)=>`<tr>
-    <td>${i+1}</td>
-    <td style="font-family:monospace;font-size:11px">${r.user_id.substring(0,30)}...</td>
-    <td>${r.unique_videos}</td>
-    <td>${r.total_actions}</td>
-    <td style="color:#94a3b8;font-size:12px">${r.last_active.replace('T',' ').substring(0,19)}</td>
-  </tr>`).join('');
+  document.getElementById('topUsersBody').innerHTML = data.length===0
+    ? '<tr><td colspan="5" style="text-align:center;color:#64748b">暂无数据</td></tr>'
+    : data.map((r,i)=>`<tr>
+        <td>${i+1}</td>
+        <td style="font-family:monospace;font-size:11px">${r.user_id.substring(0,30)}...</td>
+        <td>${r.unique_videos}</td>
+        <td>${r.total_actions}</td>
+        <td style="color:#94a3b8;font-size:12px">${r.last_active.replace('T',' ').substring(0,19)}</td>
+      </tr>`).join('');
 }
 
-async function showUsers(urlEnc, type){
+async function showVideoUsers(urlEnc, type){
   const url = decodeURIComponent(urlEnc);
   const data = await api(`/admin/api/video_users?video_url=${encodeURIComponent(url)}&type=${type}`);
   if(!data)return;
-  
-  // 使用自定义弹窗展示，避免原生 alert 阻塞
-  const userListStr = data.slice(0,30).map(u=>`• ${u.user_id.substring(0,25)}... (${u.count}次, 最后:${u.last_at.substring(0,16).replace('T',' ')})`).join('<br>');
-  document.getElementById('modalTitle').innerText = `👥 观看此视频的用户 (${data.length} 人)`;
-  document.getElementById('modalMsg').innerHTML = userListStr || '暂无用户记录';
-  const confirmBtn = document.getElementById('modalConfirmBtn');
-  confirmBtn.innerText = "关闭";
-  confirmBtn.onclick = closeModal;
-  document.getElementById('confirmModal').style.display = 'flex';
+  const html = data.slice(0,50).map(u=>`• ${u.user_id.substring(0,25)}... (${u.count}次, 最后:${u.last_at.substring(0,16).replace('T',' ')})`).join('<br>');
+  showInfoModal(`👥 观看此视频的用户 (${data.length} 人)`, html || '暂无');
 }
 
 function switchPlayPeriod(el,p){
@@ -1522,57 +1679,157 @@ function switchDlPeriod(el,p){
   el.classList.add('active');dlPeriod=p;loadTopVideos('download_complete',p);
 }
 
-// --- 数据库一键清除与双重确认逻辑 ---
+// ============ 新闻模块 ============
+async function loadNewsModule(){
+  loadNewsOverview();
+  loadNewsTrend();
+  loadTopSources(sourcePeriod);
+  loadTopArticles(articleType, articlePeriod);
+  loadTopNewsUsers();
+}
+
+async function loadNewsOverview(){
+  const d = await api('/admin/api/news/overview');if(!d)return;
+  const items = [
+    ['总读者数', d.total_users],
+    ['今日活跃', d.today_active],
+    ['今日朗读', d.today_listen],
+    ['今日曝光', d.today_view],
+    ['累计朗读', d.total_listen],
+    ['累计曝光', d.total_view],
+  ];
+  document.getElementById('newsStatsBox').innerHTML = items.map(([l,v])=>
+    `<div class="stat-card"><div class="label">${l}</div><div class="value">${v||0}</div></div>`).join('');
+}
+
+async function loadNewsTrend(){
+  const data = await api('/admin/api/news/daily_trend');if(!data)return;
+  const days = [...new Set(data.map(r=>r.day))].sort();
+  const listenData = days.map(d=>{const r=data.find(x=>x.day===d&&x.event_type==='listen');return r?r.cnt:0});
+  const viewData = days.map(d=>{const r=data.find(x=>x.day===d&&x.event_type==='view');return r?r.cnt:0});
+  if(newsTrendChart) newsTrendChart.destroy();
+  newsTrendChart = new Chart(document.getElementById('newsTrendChart'),{
+    type:'line',
+    data:{labels:days,datasets:[
+      {label:'朗读',data:listenData,borderColor:'#a78bfa',backgroundColor:'rgba(167,139,250,.15)',tension:.3,fill:true},
+      {label:'曝光',data:viewData,borderColor:'#fb923c',backgroundColor:'rgba(251,146,60,.10)',tension:.3,fill:true},
+    ]},
+    options:{responsive:true,plugins:{legend:{labels:{color:'#cbd5e1'}}},scales:{x:{ticks:{color:'#94a3b8'}},y:{ticks:{color:'#94a3b8'}}}}
+  });
+}
+
+async function loadTopSources(period){
+  const data = await api(`/admin/api/news/top_sources?period=${period}`);if(!data)return;
+  document.getElementById('topSourcesBody').innerHTML = data.length===0
+    ? '<tr><td colspan="5" style="text-align:center;color:#64748b">暂无数据</td></tr>'
+    : data.map((r,i)=>`<tr>
+        <td>${i+1}</td>
+        <td><strong>${r.source_id||'(未知)'}</strong></td>
+        <td><span class="pill pill-green">${r.unique_users}</span></td>
+        <td><span class="pill pill-blue">${r.unique_articles}</span></td>
+        <td>${r.total_reads}</td>
+      </tr>`).join('');
+}
+
+async function loadTopArticles(type, period){
+  const data = await api(`/admin/api/news/top_articles?type=${type}&period=${period}`);if(!data)return;
+  document.getElementById('topArticlesBody').innerHTML = data.length===0
+    ? '<tr><td colspan="5" style="text-align:center;color:#64748b">暂无数据</td></tr>'
+    : data.map((r,i)=>{
+        const title = r.article_topic || r.article_key;
+        const shortTitle = title.length > 40 ? title.substring(0,40)+'...' : title;
+        return `<tr>
+          <td>${i+1}</td>
+          <td class="clickable" onclick="showArticleUsers('${encodeURIComponent(r.article_key)}','${type}')" title="${title}">${shortTitle}</td>
+          <td><span class="pill pill-orange">${r.source_id||'(未知)'}</span></td>
+          <td><span class="pill pill-green">${r.unique_users}</span></td>
+          <td>${r.total_count}</td>
+        </tr>`;
+      }).join('');
+}
+
+async function loadTopNewsUsers(){
+  const data = await api('/admin/api/news/top_users');if(!data)return;
+  document.getElementById('topNewsUsersBody').innerHTML = data.length===0
+    ? '<tr><td colspan="7" style="text-align:center;color:#64748b">暂无数据</td></tr>'
+    : data.map((r,i)=>`<tr>
+        <td>${i+1}</td>
+        <td style="font-family:monospace;font-size:11px">${r.user_id.substring(0,28)}...</td>
+        <td><span class="pill ${r.user_type==='apple'?'pill-blue':'pill-purple'}">${r.user_type||'-'}</span></td>
+        <td><strong>${r.unique_articles}</strong></td>
+        <td>${r.listen_count||0}</td>
+        <td>${r.view_count||0}</td>
+        <td style="color:#94a3b8;font-size:12px">${(r.last_active||'').replace('T',' ').substring(0,19)}</td>
+      </tr>`).join('');
+}
+
+async function showArticleUsers(keyEnc, type){
+  const key = decodeURIComponent(keyEnc);
+  const data = await api(`/admin/api/news/article_users?article_key=${encodeURIComponent(key)}&type=${type}`);
+  if(!data)return;
+  const html = data.slice(0,50).map(u=>{
+    const uid = u.user_id.substring(0,25);
+    const cnt = u.count;
+    const last = (u.last_at||'').substring(0,16).replace('T',' ');
+    return `• [${u.user_type||'-'}] ${uid}... (${cnt}次, 最后:${last})`;
+  }).join('<br>');
+  showInfoModal(`👥 ${type==='listen'?'朗读':'曝光'}此文章的用户 (${data.length} 人)`, html || '暂无');
+}
+
+function switchSourcePeriod(el,p){
+  el.parentNode.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  el.classList.add('active');sourcePeriod=p;loadTopSources(p);
+}
+function switchArticleType(el,t){
+  el.parentNode.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  el.classList.add('active');articleType=t;loadTopArticles(t,articlePeriod);
+}
+function switchArticlePeriod(el,p){
+  el.parentNode.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  el.classList.add('active');articlePeriod=p;loadTopArticles(articleType,p);
+}
+
+// ============ 通用弹窗 ============
+function showInfoModal(title, htmlBody){
+  document.getElementById('modalTitle').innerText = title;
+  document.getElementById('modalMsg').innerHTML = htmlBody;
+  const btn = document.getElementById('modalConfirmBtn');
+  btn.innerText = "关闭";
+  btn.onclick = closeModal;
+  document.getElementById('confirmModal').style.display = 'flex';
+}
+
+// ============ 危险操作 ============
 function triggerClear(type) {
   pendingClearType = type;
-  currentStep = 1;
-  
   let targetName = "";
-  if(type === 'analytics') targetName = "【所有视频播放与下载统计数据】";
+  if(type === 'analytics') targetName = "【全部行为统计数据（视频+新闻）】";
   if(type === 'users') targetName = "【所有注册用户账号及订阅权限数据】";
-  if(type === 'all') targetName = "【全部数据（包括用户、订阅、行为统计）】";
-  
+  if(type === 'all') targetName = "【全部数据】";
   document.getElementById('modalTitle').innerText = "⚠️ 第一次安全确认";
-  document.getElementById('modalMsg').innerText = `您正在尝试清空 ${targetName}。此操作是毁灭性的，数据一旦清除将永远无法恢复！\n\n您确定要继续吗？`;
-  
-  const confirmBtn = document.getElementById('modalConfirmBtn');
-  confirmBtn.innerText = "继续下一步";
-  confirmBtn.onclick = secondConfirm;
-  
+  document.getElementById('modalMsg').innerText = `您正在尝试清空 ${targetName}。此操作不可恢复！`;
+  const btn = document.getElementById('modalConfirmBtn');
+  btn.innerText = "继续下一步";
+  btn.onclick = secondConfirm;
   document.getElementById('confirmModal').style.display = 'flex';
 }
 
 function secondConfirm() {
-  currentStep = 2;
   document.getElementById('modalTitle').innerText = "🚨 终极核对确认";
-  document.getElementById('modalMsg').innerText = `请再次确认！此操作将彻底抹除数据。如果您十分确定要清空，请点击下方的“彻底清空并执行”按钮。`;
-  
-  const confirmBtn = document.getElementById('modalConfirmBtn');
-  confirmBtn.innerText = "彻底清空并执行";
-  confirmBtn.onclick = executeClear;
+  document.getElementById('modalMsg').innerText = `请再次确认！如果您十分确定，请点击下方按钮。`;
+  const btn = document.getElementById('modalConfirmBtn');
+  btn.innerText = "彻底清空并执行";
+  btn.onclick = executeClear;
 }
 
 async function executeClear() {
   const result = await api('/admin/api/clear_db', 'POST', { type: pendingClearType });
   closeModal();
   if (result && result.status === 'success') {
-    // 成功后刷新界面
-    loadAll();
-    setTimeout(() => {
-      document.getElementById('modalTitle').innerText = "✅ 操作成功";
-      document.getElementById('modalMsg').innerText = result.message;
-      document.getElementById('modalConfirmBtn').innerText = "好";
-      document.getElementById('modalConfirmBtn').onclick = closeModal;
-      document.getElementById('confirmModal').style.display = 'flex';
-    }, 300);
+    loadCurrentModule();
+    setTimeout(()=>showInfoModal("✅ 操作成功", result.message), 300);
   } else {
-    setTimeout(() => {
-      document.getElementById('modalTitle').innerText = "❌ 操作失败";
-      document.getElementById('modalMsg').innerText = (result && result.error) ? result.error : "未知错误";
-      document.getElementById('modalConfirmBtn').innerText = "好";
-      document.getElementById('modalConfirmBtn').onclick = closeModal;
-      document.getElementById('confirmModal').style.display = 'flex';
-    }, 300);
+    setTimeout(()=>showInfoModal("❌ 操作失败", (result && result.error) ? result.error : "未知错误"), 300);
   }
 }
 

@@ -28,8 +28,8 @@ PARENT_DIR = os.path.dirname(CURRENT_DIR)
 BASE_RESOURCES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Resources')
 ALLOWED_APPS = ['ONews', 'Finance', 'Prediction', 'OVideo']
 ALLOWED_EVENT_TYPES = {'play', 'download_complete'}
-# 【修改】移除了 'read'，仅保留 view, listen, lang_switch
-ALLOWED_NEWS_EVENT_TYPES = {'view', 'listen', 'lang_switch'}
+# 【修改】移除了 'read'，仅保留 view, listen
+ALLOWED_NEWS_EVENT_TYPES = {'view', 'listen'}
 
 # 【新增】用户数据库路径
 USER_DB_PATH = os.path.join(PARENT_DIR, 'user_data.db')
@@ -162,7 +162,7 @@ def init_analytics_db():
             article_topic TEXT,
             source_id TEXT,
             article_date TEXT,                -- 文章 yyMMdd
-            event_type TEXT NOT NULL,         -- view/read/listen/lang_switch
+            event_type TEXT NOT NULL,         -- view/listen
             first_at TIMESTAMP NOT NULL,
             last_at TIMESTAMP NOT NULL,
             count INTEGER DEFAULT 1,
@@ -859,16 +859,56 @@ OVIDEO_COVER_DIR = os.path.join(OVIDEO_DIR, 'cover_image')
 def get_ovideos():
     video_file = os.path.join(OVIDEO_DIR, 'OVideos.json')
     mapping_file = os.path.join(OVIDEO_DIR, 'url_mapping.json')
-    
+
     if not os.path.exists(video_file):
         return jsonify({"error": "Video file not found"}), 404
-        
+
     try:
+        # 0. 读取地区屏蔽 + 类型屏蔽配置（来自 ONews/version.json）
+        region_filter_enabled = False
+        region_keywords = []
+        type_filter_enabled = False
+        type_keywords = []
+        version_file_path = os.path.join(BASE_RESOURCES_DIR, 'ONews', 'version.json')
+        if os.path.exists(version_file_path):
+            try:
+                with open(version_file_path, 'r', encoding='utf-8') as vf:
+                    vdata = json.load(vf)
+                    # 地区屏蔽
+                    rf = vdata.get('video_region_filter', {}) or {}
+                    region_filter_enabled = bool(rf.get('enabled', False))
+                    region_keywords = [k for k in rf.get('keywords', []) if k]
+                    # 【新增】类型屏蔽
+                    tf = vdata.get('video_type_filter', {}) or {}
+                    type_filter_enabled = bool(tf.get('enabled', False))
+                    type_keywords = [k for k in tf.get('keywords', []) if k]
+            except Exception as e:
+                print(f"读取屏蔽配置失败: {e}")
+
+        def is_region_blocked(item):
+            if not region_filter_enabled or not region_keywords:
+                return False
+            region = item.get('地区') or ''
+            return any(kw in region for kw in region_keywords)
+
+        # 【新增】类型屏蔽：类型是数组，需要遍历每个元素
+        def is_type_blocked(item):
+            if not type_filter_enabled or not type_keywords:
+                return False
+            types = item.get('类型') or []
+            # 兼容万一类型被写成字符串的情况
+            if isinstance(types, str):
+                types = [types]
+            for t in types:
+                if any(kw in t for kw in type_keywords):
+                    return True
+            return False
+
         # 1. 读取原始视频数据
         with open(video_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            
-        # 2. 读取 url_mapping 数据，用于过滤
+
+        # 2. 读取 url_mapping 数据，用于过滤无效播放源
         valid_urls = set()
         if os.path.exists(mapping_file):
             with open(mapping_file, 'r', encoding='utf-8') as f_map:
@@ -876,19 +916,25 @@ def get_ovideos():
                 # 只有 mapping 中值不为空的 URL 才是有效的
                 valid_urls = set(mappings.keys())
 
-        # 3. 将 dict 转为有序列表，并在转换过程中过滤 playlist
+        # 3. 转为有序列表，同时过滤 playlist、被屏蔽地区、被屏蔽类型
         categories = []
         for key, value in data.items():
             filtered_items = []
             for item in value:
-                # 深拷贝或重建 item，避免修改内存中的原始 dict 缓存
+                # 地区屏蔽
+                if is_region_blocked(item):
+                    continue
+                # 【新增】类型屏蔽
+                if is_type_blocked(item):
+                    continue
+
                 new_item = dict(item)
                 filtered_playlist = []
                 if 'playlist' in item:
                     for channel in item['playlist']:
                         # 【核心修改】：如果 url 在 mapping 中，或者 url 本身包含 .m3u8，都视作有效
                         filtered_episodes = {
-                            ep_name: ep_url 
+                            ep_name: ep_url
                             for ep_name, ep_url in channel.get('episodes', {}).items()
                             if ep_url in valid_urls or '.m3u8' in ep_url.lower()
                         }
@@ -898,15 +944,12 @@ def get_ovideos():
                             new_channel = dict(channel)
                             new_channel['episodes'] = filtered_episodes
                             filtered_playlist.append(new_channel)
-                
-                # 更新 item 的播放列表
+
                 new_item['playlist'] = filtered_playlist
-                
-                # 选项：如果你希望“没有任何可用播放源”的视频直接不显示，可以加判断：
-                # if filtered_playlist: filtered_items.append(new_item)
-                # 否则保留视频，详情页会显示“暂无可用资源”
                 filtered_items.append(new_item)
+
             categories.append({"name": key, "items": filtered_items})
+
         return jsonify({"categories": categories})
     except Exception as e:
         traceback.print_exc()

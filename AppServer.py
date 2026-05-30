@@ -1590,7 +1590,7 @@ ADMIN_HTML = r'''
       </h3>
       <table>
         <thead><tr>
-          <th>#</th><th>视频 / 播放页URL</th><th>播放源·集数</th><th>问题</th>
+          <th>#</th><th>视频 / 播放页URL</th><th>播放源 (线路)</th><th>集数</th><th>问题</th>
           <th>举报人</th><th>次数</th><th>m3u8</th><th>操作</th>
         </tr></thead>
         <tbody id="reportBody"></tbody>
@@ -1733,10 +1733,12 @@ async function loadVideoReports(){
   const data = await api(`/admin/api/video_reports?status=${reportStatus}`);
   if(!data) return;
   document.getElementById('reportBody').innerHTML = data.length===0
-    ? '<tr><td colspan="8" style="text-align:center;color:#64748b">暂无举报</td></tr>'
+    ? '<tr><td colspan="9" style="text-align:center;color:#64748b">暂无举报</td></tr>'
     : data.map((r,i)=>{
         const typeName = REPORT_TYPE_MAP[r.report_type] || r.report_type;
-        const ep = `${r.channel_name||''} · ${r.episode_name||''}`;
+        // 1. 提取播放源线路和集数
+        const channel = r.channel_name ? `<span class="pill pill-blue">${r.channel_name}</span>` : '<span style="color:#64748b">-</span>';
+        const episode = r.episode_name ? `<span class="pill pill-purple">${r.episode_name}</span>` : '<span style="color:#64748b">-</span>';
         const realLink = r.real_url
           ? `<a href="${r.real_url}" target="_blank" style="color:#60a5fa">打开</a>` : '-';
         const noteTip = r.notes ? ` title="${(r.notes||'').replace(/"/g,'')}"` : '';
@@ -1744,7 +1746,8 @@ async function loadVideoReports(){
           <td>${i+1}</td>
           <td${noteTip}><strong>${r.video_title||'(未知)'}</strong><br>
               <span style="font-size:11px;color:#64748b">${(r.episode_url||'').substring(0,48)}</span></td>
-          <td>${ep}</td>
+          <td>${channel}</td>
+          <td>${episode}</td>
           <td><span class="pill pill-orange">${typeName}</span></td>
           <td><span class="pill pill-green">${r.unique_users}</span></td>
           <td>${r.total_count}</td>

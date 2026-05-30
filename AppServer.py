@@ -30,6 +30,8 @@ ALLOWED_APPS = ['ONews', 'Finance', 'Prediction', 'OVideo']
 ALLOWED_EVENT_TYPES = {'play', 'download_complete'}
 # 【修改】移除了 'read'，仅保留 view, listen
 ALLOWED_NEWS_EVENT_TYPES = {'view', 'listen'}
+ALLOWED_REPORT_TYPES = {'playback_failed', 'download_failed', 'media_error', 'content_mismatch', 'other'}
+report_last_time = {}  # 内存软限流: user_id -> 最近提交时间戳
 
 # 【新增】用户数据库路径
 USER_DB_PATH = os.path.join(PARENT_DIR, 'user_data.db')
@@ -186,6 +188,30 @@ def init_analytics_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_news_logs_time ON news_event_logs(created_at)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_news_logs_source ON news_event_logs(source_id)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_news_logs_type ON news_event_logs(event_type)')
+    
+    #【新增】错误链接举报表
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS video_link_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            video_title TEXT,
+            source_url TEXT,
+            episode_url TEXT,
+            channel_name TEXT,
+            episode_name TEXT,
+            real_url TEXT,
+            report_type TEXT,
+            note TEXT,
+            app_version TEXT,
+            first_at TIMESTAMP NOT NULL,
+            last_at TIMESTAMP NOT NULL,
+            count INTEGER DEFAULT 1,
+            status TEXT DEFAULT 'pending',
+            UNIQUE(user_id, episode_url, report_type)
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_reports_status ON video_link_reports(status)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_reports_ep ON video_link_reports(episode_url)')
     conn.commit()
     conn.close()
     print("行为数据库已就绪。")
@@ -1043,6 +1069,55 @@ def search_ovideo():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     
+@app.route('/api/OVideo/report', methods=['POST'])
+def report_video_link():
+    try:
+        import time
+        data = request.get_json() or {}
+        user_id     = data.get('user_id')
+        source_url  = data.get('source_url')
+        episode_url = data.get('episode_url')
+        if not user_id or not (source_url or episode_url):
+            return jsonify({"error": "Invalid params"}), 400
+
+        report_type = data.get('report_type', 'other')
+        if report_type not in ALLOWED_REPORT_TYPES:
+            report_type = 'other'
+
+        # 服务端软限流:同一用户 10 秒内不可重复提交
+        now_ts = time.time()
+        if now_ts - report_last_time.get(user_id, 0) < 10:
+            return jsonify({"error": "Too frequent"}), 429
+        report_last_time[user_id] = now_ts
+
+        video_title  = data.get('video_title', '')
+        channel_name = data.get('channel_name', '')
+        episode_name = data.get('episode_name', '')
+        real_url     = data.get('real_url', '')
+        note         = (data.get('note', '') or '')[:500]
+        app_version  = data.get('app_version', '')
+        now = datetime.utcnow().isoformat()
+
+        conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO video_link_reports
+                (user_id, video_title, source_url, episode_url, channel_name,
+                 episode_name, real_url, report_type, note, app_version,
+                 first_at, last_at, count, status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,'pending')
+            ON CONFLICT(user_id, episode_url, report_type)
+            DO UPDATE SET last_at=?, count=count+1, note=excluded.note, status='pending'
+        ''', (user_id, video_title, source_url, episode_url, channel_name,
+              episode_name, real_url, report_type, note, app_version,
+              now, now, now))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    
 @app.route('/api/OVideo/track', methods=['POST'])
 def track_event():
     try:
@@ -1254,6 +1329,7 @@ def admin_overview():
         "today_active_users":   _query_analytics("SELECT COUNT(DISTINCT user_id) AS c FROM event_logs WHERE date(created_at)=?", (today,))[0]['c'],
         "today_play":           _query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='play' AND date(created_at)=?", (today,))[0]['c'],
         "today_download":       _query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='download_complete' AND date(created_at)=?", (today,))[0]['c'],
+        "pending_reports":      _query_analytics("SELECT COUNT(DISTINCT episode_url) AS c FROM video_link_reports WHERE status='pending'")[0]['c'],
     })
 
 # 视频排行榜（区分唯一用户数 / 总次数）
@@ -1314,6 +1390,43 @@ def admin_daily_trend():
     ''')
     return jsonify(rows)
 
+# 错误链接举报列表(按 集数+类型 聚合)
+@app.route('/admin/api/video_reports', methods=['GET'])
+@require_admin
+def admin_video_reports():
+    status = request.args.get('status', 'pending')   # pending / all
+    where = "WHERE status='pending'" if status == 'pending' else ""
+    sql = f'''
+        SELECT video_title, source_url, episode_url, channel_name, episode_name,
+               report_type,
+               MAX(real_url) AS real_url,
+               COUNT(DISTINCT user_id) AS unique_users,
+               SUM(count) AS total_count,
+               MAX(last_at) AS last_at,
+               GROUP_CONCAT(DISTINCT NULLIF(note,'')) AS notes
+        FROM video_link_reports
+        {where}
+        GROUP BY episode_url, report_type
+        ORDER BY unique_users DESC, total_count DESC
+        LIMIT 200
+    '''
+    return jsonify(_query_analytics(sql))
+
+# 标记某条举报为已处理
+@app.route('/admin/api/resolve_report', methods=['POST'])
+@require_admin
+def admin_resolve_report():
+    data = request.get_json() or {}
+    episode_url = data.get('episode_url')
+    if not episode_url:
+        return jsonify({"error": "Missing episode_url"}), 400
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    c = conn.cursor()
+    c.execute("UPDATE video_link_reports SET status='resolved' WHERE episode_url=?", (episode_url,))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "success"})
+
 # 活跃用户排行
 @app.route('/admin/api/top_users', methods=['GET'])
 @require_admin
@@ -1348,6 +1461,7 @@ def admin_clear_db():
             c.execute("DELETE FROM event_logs")
             c.execute("DELETE FROM user_news_events")
             c.execute("DELETE FROM news_event_logs")
+            c.execute("DELETE FROM video_link_reports")
             conn.commit()
             conn.close()
             
@@ -1466,6 +1580,21 @@ ADMIN_HTML = r'''
         <h3>📈 视频 - 最近 30 天趋势</h3>
         <canvas id="trendChart"></canvas>
       </div>
+    </div>
+    <div class="panel danger-zone" style="margin-bottom:24px">
+      <h3>🚨 错误链接举报
+        <span class="tabs">
+          <span class="tab active" onclick="switchReportStatus(this,'pending')">待处理</span>
+          <span class="tab" onclick="switchReportStatus(this,'all')">全部</span>
+        </span>
+      </h3>
+      <table>
+        <thead><tr>
+          <th>#</th><th>视频 / 播放页URL</th><th>播放源·集数</th><th>问题</th>
+          <th>举报人</th><th>次数</th><th>m3u8</th><th>操作</th>
+        </tr></thead>
+        <tbody id="reportBody"></tbody>
+      </table>
     </div>
     <div class="row">
       <div class="panel">
@@ -1594,6 +1723,47 @@ let playPeriod='today', dlPeriod='today';
 let sourcePeriod='7d';
 let articleType='view', articlePeriod='7d';
 let pendingClearType = '';
+let reportStatus = 'pending';
+const REPORT_TYPE_MAP = {
+  playback_failed:'无法播放', download_failed:'无法缓存',
+  media_error:'音画异常', content_mismatch:'内容不符', other:'其他'
+};
+
+async function loadVideoReports(){
+  const data = await api(`/admin/api/video_reports?status=${reportStatus}`);
+  if(!data) return;
+  document.getElementById('reportBody').innerHTML = data.length===0
+    ? '<tr><td colspan="8" style="text-align:center;color:#64748b">暂无举报</td></tr>'
+    : data.map((r,i)=>{
+        const typeName = REPORT_TYPE_MAP[r.report_type] || r.report_type;
+        const ep = `${r.channel_name||''} · ${r.episode_name||''}`;
+        const realLink = r.real_url
+          ? `<a href="${r.real_url}" target="_blank" style="color:#60a5fa">打开</a>` : '-';
+        const noteTip = r.notes ? ` title="${(r.notes||'').replace(/"/g,'')}"` : '';
+        return `<tr>
+          <td>${i+1}</td>
+          <td${noteTip}><strong>${r.video_title||'(未知)'}</strong><br>
+              <span style="font-size:11px;color:#64748b">${(r.episode_url||'').substring(0,48)}</span></td>
+          <td>${ep}</td>
+          <td><span class="pill pill-orange">${typeName}</span></td>
+          <td><span class="pill pill-green">${r.unique_users}</span></td>
+          <td>${r.total_count}</td>
+          <td>${realLink}</td>
+          <td><span class="clickable" onclick="resolveReport('${encodeURIComponent(r.episode_url)}')">✓ 处理</span></td>
+        </tr>`;
+      }).join('');
+}
+
+function switchReportStatus(el,s){
+  el.parentNode.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  el.classList.add('active'); reportStatus=s; loadVideoReports();
+}
+
+async function resolveReport(epEnc){
+  const ep = decodeURIComponent(epEnc);
+  const r = await api('/admin/api/resolve_report','POST',{episode_url:ep});
+  if(r && r.status==='success') loadVideoReports();
+}
 
 async function login(){
   const pwd = document.getElementById('pwdInput').value;
@@ -1647,6 +1817,7 @@ async function loadVideoModule(){
   loadTopVideos('play', playPeriod);
   loadTopVideos('download_complete', dlPeriod);
   loadTopUsers();
+  loadVideoReports();
 }
 
 async function loadVideoOverview(){
@@ -1658,6 +1829,7 @@ async function loadVideoOverview(){
     ['今日下载', d.today_download],
     ['累计播放', d.total_play_events],
     ['累计下载', d.total_download_events],
+    ['待处理举报', d.pending_reports],
   ];
   document.getElementById('statsBox').innerHTML = items.map(([l,v])=>
     `<div class="stat-card"><div class="label">${l}</div><div class="value">${v||0}</div></div>`).join('');

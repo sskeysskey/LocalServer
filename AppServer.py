@@ -84,7 +84,7 @@ def init_user_db():
     conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
     c = conn.cursor()
     
-    # 【核心修改】新的表结构
+    # 【核心修改】新的表结构, ，添加了 device_id
     # finance_expire_at: Finance 付费过期时间
     # finance_is_permanent: Finance 永久/亲友 VIP 标记 (0或1)
     # onews_expire_at: ONews 付费过期时间
@@ -93,6 +93,7 @@ def init_user_db():
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             apple_user_id TEXT NOT NULL UNIQUE,
+            device_id TEXT,
             created_at TIMESTAMP NOT NULL,
             last_login_at TIMESTAMP,
             
@@ -108,6 +109,12 @@ def init_user_db():
     ''')
     
     # 2. 数据库升级逻辑：针对已经有旧数据库，需要补充新字段的老环境
+    # 尝试添加 device_id 列
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN device_id TEXT')
+    except sqlite3.OperationalError:
+        pass 
+
     # 尝试添加 prediction_expire_at 列
     try:
         c.execute('ALTER TABLE users ADD COLUMN prediction_expire_at TIMESTAMP')
@@ -212,6 +219,17 @@ def init_analytics_db():
     ''')
     c.execute('CREATE INDEX IF NOT EXISTS idx_reports_status ON video_link_reports(status)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_reports_ep ON video_link_reports(episode_url)')
+
+    # 【新增】给视频统计表补充 user_type 字段（兼容老库）
+    try:
+        c.execute("ALTER TABLE event_logs ADD COLUMN user_type TEXT DEFAULT 'apple'")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE user_video_events ADD COLUMN user_type TEXT DEFAULT 'apple'")
+    except sqlite3.OperationalError:
+        pass
+    
     conn.commit()
     conn.close()
     print("行为数据库已就绪。")
@@ -682,7 +700,7 @@ def handle_auth(app_name):
     try:
         data = request.get_json()
         user_id = data.get('user_id')
-        # email 和 full_name 我们不再获取也不再存储
+        device_id = data.get('device_id') # 【新增】接收客户端传来的设备ID
         
         if not user_id: return jsonify({"error": "Missing user_id"}), 400
         conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
@@ -694,15 +712,18 @@ def handle_auth(app_name):
         is_subscribed = False
         expiration_date = None
         if user:
-            # 老用户：更新登录时间
-            c.execute("UPDATE users SET last_login_at = ? WHERE apple_user_id = ?", (now, user_id))
+            # 老用户：更新登录时间，同时关联/更新最新的 device_id
+            c.execute(
+                "UPDATE users SET last_login_at = ?, device_id = ? WHERE apple_user_id = ?", 
+                (now, device_id, user_id)
+            )
             # 检查权限 (传入 app_name)
             is_subscribed, expiration_date = check_user_subscription_status(user, app_name)
         else:
-            # 新用户：插入记录。注意这里不需要记录 app_source 了，因为 apple_id 唯一
+            # 新用户：插入记录，同时写入 device_id
             c.execute(
-                "INSERT INTO users (apple_user_id, created_at, last_login_at) VALUES (?, ?, ?)",
-                (user_id, now, now)
+                "INSERT INTO users (apple_user_id, device_id, created_at, last_login_at) VALUES (?, ?, ?, ?)",
+                (user_id, device_id, now, now)
             )
             # 新用户肯定没订阅且不是VIP
         
@@ -1123,6 +1144,7 @@ def track_event():
     try:
         data = request.get_json()
         user_id     = data.get('user_id')
+        user_type   = data.get('user_type', 'apple')   # 【新增】
         video_url   = data.get('video_url')
         video_title = data.get('video_title', '')
         event_type  = data.get('event_type')
@@ -1133,18 +1155,18 @@ def track_event():
         c = conn.cursor()
         c.execute('''
             INSERT INTO user_video_events
-                (user_id, video_url, video_title, event_type, first_at, last_at, count)
-            VALUES (?, ?, ?, ?, ?, ?, 1)
+                (user_id, user_type, video_url, video_title, event_type, first_at, last_at, count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
             ON CONFLICT(user_id, video_url, event_type)
             DO UPDATE SET last_at = ?, count = count + 1
-        ''', (user_id, video_url, video_title, event_type, now, now, now))
+        ''', (user_id, user_type, video_url, video_title, event_type, now, now, now))
 
-        # 2. 流水表：每次都插
+        # 流水表：每次都插
         c.execute('''
             INSERT INTO event_logs
-                (user_id, video_url, video_title, event_type, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (user_id, video_url, video_title, event_type, now))
+                (user_id, user_type, video_url, video_title, event_type, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, user_type, video_url, video_title, event_type, now))
 
         conn.commit()
         conn.close()
@@ -1337,6 +1359,26 @@ def admin_news_user_details():
     rows = _query_analytics(sql, (user_id, event_type))
     return jsonify(rows)
 
+# 视频 - 某个用户的详细观看/下载历史
+@app.route('/admin/api/video/user_details', methods=['GET'])
+@require_admin
+def admin_video_user_details():
+    user_id = request.args.get('user_id')
+    event_type = request.args.get('type')   # play / download_complete
+    if not user_id or not event_type:
+        return jsonify({"error": "Missing parameters"}), 400
+    sql = '''
+        SELECT video_url, video_title,
+               MAX(created_at) AS last_time,
+               COUNT(*) AS click_count
+        FROM event_logs
+        WHERE user_id = ? AND event_type = ?
+        GROUP BY video_url
+        ORDER BY last_time DESC
+    '''
+    rows = _query_analytics(sql, (user_id, event_type))
+    return jsonify(rows)
+
 # 概览：今日 / 总计
 @app.route('/admin/api/overview', methods=['GET'])
 @require_admin
@@ -1453,12 +1495,14 @@ def admin_resolve_report():
 def admin_top_users():
     rows = _query_analytics('''
         SELECT user_id,
-               COUNT(DISTINCT video_url) AS unique_videos,
+               MAX(user_type) AS user_type,
+               COUNT(DISTINCT CASE WHEN event_type='play' THEN video_url END) AS play_videos,
+               COUNT(DISTINCT CASE WHEN event_type='download_complete' THEN video_url END) AS download_videos,
                COUNT(*) AS total_actions,
                MAX(created_at) AS last_active
         FROM event_logs
         GROUP BY user_id
-        ORDER BY unique_videos DESC
+        ORDER BY total_actions DESC
         LIMIT 50
     ''')
     return jsonify(rows)
@@ -1599,6 +1643,26 @@ ADMIN_HTML = r'''
   <!-- ============ 视频模块 ============ -->
   <div class="module-section active" id="moduleVideo">
     <div class="stats" id="statsBox"></div>
+
+    <!-- 【上移 + 改造】视频 - 活跃用户榜 -->
+    <div class="panel" style="margin-bottom:24px">
+      <h3>👥 视频 - 活跃用户榜 <span style="font-size:12px;color:#94a3b8;font-weight:normal;">(点击"看过/下载视频数"查看明细；点击"总操作数"或"最后活跃"可切换排序)</span></h3>
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>user id_apple</th>
+            <th>user id_device</th>
+            <th>看过视频数</th>
+            <th>下载视频数</th>
+            <th class="sortable" onclick="sortVideoUsers('total_actions')">总操作数 <span id="vsort_total_actions">▼</span></th>
+            <th class="sortable" onclick="sortVideoUsers('last_active')">最后活跃 <span id="vsort_last_active"></span></th>
+          </tr>
+        </thead>
+        <tbody id="topUsersBody"></tbody>
+      </table>
+    </div>
+
     <div class="row-full">
       <div class="panel">
         <h3>📈 视频 - 最近 30 天趋势</h3>
@@ -1770,6 +1834,11 @@ let cachedNewsUsers = [];
 let newsUserSortField = 'unique_articles'; // 默认按文章数排序
 let newsUserSortOrder = 'desc';            // 默认降序
 
+// 视频活跃用户榜：缓存 + 排序状态
+let cachedVideoUsers = [];
+let videoUserSortField = 'total_actions';  // 默认按总操作数
+let videoUserSortOrder = 'desc';
+
 async function loadVideoReports(){
   const data = await api(`/admin/api/video_reports?status=${reportStatus}`);
   if(!data) return;
@@ -1909,16 +1978,92 @@ async function loadTopVideos(type, period){
 }
 
 async function loadTopUsers(){
-  const data = await api('/admin/api/top_users');if(!data)return;
-  document.getElementById('topUsersBody').innerHTML = data.length===0
-    ? '<tr><td colspan="5" style="text-align:center;color:#64748b">暂无数据</td></tr>'
-    : data.map((r,i)=>`<tr>
-        <td>${i+1}</td>
-        <td style="font-family:monospace;font-size:11px">${r.user_id.substring(0,30)}...</td>
-        <td>${r.unique_videos}</td>
-        <td>${r.total_actions}</td>
-        <td style="color:#94a3b8;font-size:12px">${r.last_active.replace('T',' ').substring(0,19)}</td>
-      </tr>`).join('');
+  const data = await api('/admin/api/top_users');
+  if(!data) return;
+  cachedVideoUsers = data;
+  renderVideoUsers();
+}
+
+function renderVideoUsers(){
+  // 1. 更新排序箭头
+  document.getElementById('vsort_total_actions').innerText =
+    videoUserSortField === 'total_actions' ? (videoUserSortOrder === 'desc' ? '▼' : '▲') : '';
+  document.getElementById('vsort_last_active').innerText =
+    videoUserSortField === 'last_active' ? (videoUserSortOrder === 'desc' ? '▼' : '▲') : '';
+
+  // 2. 排序
+  const sorted = [...cachedVideoUsers].sort((a, b) => {
+    let valA = a[videoUserSortField];
+    let valB = b[videoUserSortField];
+    if (videoUserSortField === 'last_active') {
+      valA = valA || ''; valB = valB || '';
+    } else {
+      valA = Number(valA) || 0; valB = Number(valB) || 0;
+    }
+    if (valA < valB) return videoUserSortOrder === 'desc' ? 1 : -1;
+    if (valA > valB) return videoUserSortOrder === 'desc' ? -1 : 1;
+    return 0;
+  });
+
+  // 3. 渲染（用 user_id 是否以 dev_ 开头区分 apple / device，老数据也兼容）
+  document.getElementById('topUsersBody').innerHTML = sorted.length === 0
+    ? '<tr><td colspan="7" style="text-align:center;color:#64748b">暂无数据</td></tr>'
+    : sorted.map((r, i) => {
+        const isDevice = (r.user_id || '').startsWith('dev_');
+        const appleCell = !isDevice
+          ? `<span style="font-family:monospace;font-size:11px">${r.user_id.substring(0,24)}...</span>`
+          : '<span style="color:#475569">-</span>';
+        const deviceCell = isDevice
+          ? `<span style="font-family:monospace;font-size:11px">${r.user_id.substring(0,24)}...</span>`
+          : '<span style="color:#475569">-</span>';
+        return `<tr>
+          <td>${i+1}</td>
+          <td>${appleCell}</td>
+          <td>${deviceCell}</td>
+          <td><span class="clickable" style="font-weight:bold;" onclick="showUserVideoDetails('${encodeURIComponent(r.user_id)}','play')">${r.play_videos||0}</span></td>
+          <td><span class="clickable" style="font-weight:bold;" onclick="showUserVideoDetails('${encodeURIComponent(r.user_id)}','download_complete')">${r.download_videos||0}</span></td>
+          <td><strong>${r.total_actions||0}</strong></td>
+          <td style="color:#94a3b8;font-size:12px">${(r.last_active||'').replace('T',' ').substring(0,19)}</td>
+        </tr>`;
+      }).join('');
+}
+
+function sortVideoUsers(field){
+  if (videoUserSortField === field) {
+    videoUserSortOrder = videoUserSortOrder === 'desc' ? 'asc' : 'desc';
+  } else {
+    videoUserSortField = field;
+    videoUserSortOrder = 'desc';
+  }
+  renderVideoUsers();
+}
+
+// 点击观看数/下载数 → 弹出该用户的视频历史
+async function showUserVideoDetails(userIdEnc, type){
+  const userId = decodeURIComponent(userIdEnc);
+  const typeText = type === 'play' ? '观看' : '下载';
+  const data = await api(`/admin/api/video/user_details?user_id=${encodeURIComponent(userId)}&type=${type}`);
+  if(!data) return;
+  if(data.length === 0){
+    showInfoModal(`👤 用户${typeText}明细`, '暂无记录');
+    return;
+  }
+
+  let html = `<div style="text-align:left;max-height:60vh;overflow-y:auto;font-size:13px;color:#cbd5e1;">`;
+  html += `<ul style="list-style-type:none;padding-left:4px;">`;
+  data.forEach(item => {
+    const countBadge = item.click_count > 1
+      ? `<span class="pill pill-blue" style="margin-left:6px;font-size:10px;padding:1px 4px;">${item.click_count}次</span>` : '';
+    const timeStr = (item.last_time || '').replace('T',' ').substring(0,16);
+    html += `<li style="margin-bottom:10px;line-height:1.4;border-bottom:1px solid #334155;padding-bottom:6px;">`;
+    html += `  <strong>${item.video_title || '无标题'}</strong>${countBadge}<br>`;
+    html += `  <span style="font-size:11px;color:#64748b;word-break:break-all;">${item.video_url || ''}</span><br>`;
+    html += `  <span style="font-size:11px;color:#94a3b8;">🕐 ${timeStr}</span>`;
+    html += `</li>`;
+  });
+  html += `</ul></div>`;
+
+  showInfoModal(`👤 用户 [${userId.substring(0,10)}...] 的${typeText}历史 (${data.length} 个视频)`, html);
 }
 
 async function showVideoUsers(urlEnc, type){

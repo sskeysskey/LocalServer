@@ -1568,6 +1568,10 @@ ADMIN_HTML = r'''
   .modal-btn{padding:8px 16px;border-radius:6px;font-size:13px;cursor:pointer;border:none;font-weight:600}
   .btn-cancel{background:#475569;color:#e2e8f0}
   .btn-confirm-final{background:#dc2626;color:white}
+  
+  /* 排序指示样式 */
+  .sortable { cursor: pointer; user-select: none; }
+  .sortable:hover { color: #60a5fa; }
 </style>
 </head>
 <body>
@@ -1657,13 +1661,37 @@ ADMIN_HTML = r'''
 
   <!-- ============ 新闻模块 ============ -->
   <div class="module-section" id="moduleNews">
+    <!-- 1. 统计卡片 -->
     <div class="stats" id="newsStatsBox"></div>
+    
+    <!-- 2. 【位置上移】新闻 - 活跃读者榜 -->
+    <div class="panel" style="margin-bottom:24px">
+      <h3>👥 新闻 - 活跃读者榜 <span style="font-size:12px; color:#94a3b8; font-weight:normal;">(点击“所有文章”或“最后活跃”可切换排序)</span></h3>
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>user id_apple</th>
+            <th>user id_device</th>
+            <th class="sortable" onclick="sortNewsUsers('unique_articles')">所有文章 <span id="sort_unique_articles">▼</span></th>
+            <th>朗读</th>
+            <th>曝光</th>
+            <th class="sortable" onclick="sortNewsUsers('last_active')">最后活跃 <span id="sort_last_active"></span></th>
+          </tr>
+        </thead>
+        <tbody id="topNewsUsersBody"></tbody>
+      </table>
+    </div>
+
+    <!-- 3. 趋势图表 -->
     <div class="row-full">
       <div class="panel">
         <h3>📈 新闻 - 最近 30 天趋势</h3>
         <canvas id="newsTrendChart"></canvas>
       </div>
     </div>
+    
+    <!-- 4. 新闻源热度榜与热门文章榜 -->
     <div class="row">
       <div class="panel">
         <h3>
@@ -1697,18 +1725,6 @@ ADMIN_HTML = r'''
           <tbody id="topArticlesBody"></tbody>
         </table>
       </div>
-    </div>
-    <div class="panel" style="margin-bottom:24px">
-      <h3>👥 新闻 - 活跃读者榜</h3>
-      <table>
-        <thead>
-          <tr>
-            <th>#</th><th>User ID</th><th>类型</th>
-            <th>听过文章</th><th>朗读</th><th>曝光</th><th>最后活跃</th>
-          </tr>
-        </thead>
-        <tbody id="topNewsUsersBody"></tbody>
-      </table>
     </div>
   </div>
 
@@ -1748,6 +1764,11 @@ const REPORT_TYPE_MAP = {
   playback_failed:'无法播放', download_failed:'无法缓存',
   media_error:'音画异常', content_mismatch:'内容不符', other:'其他'
 };
+
+// 缓存新闻用户数据，用于前端快速排序
+let cachedNewsUsers = [];
+let newsUserSortField = 'unique_articles'; // 默认按文章数排序
+let newsUserSortOrder = 'desc';            // 默认降序
 
 async function loadVideoReports(){
   const data = await api(`/admin/api/video_reports?status=${reportStatus}`);
@@ -1923,7 +1944,7 @@ async function loadNewsModule(){
   loadNewsTrend();
   loadTopSources(sourcePeriod);
   loadTopArticles(articleType, articlePeriod);
-  loadTopNewsUsers();
+  await loadTopNewsUsers(); // 等待拉取并渲染活跃用户
 }
 
 async function loadNewsOverview(){
@@ -1986,20 +2007,70 @@ async function loadTopArticles(type, period){
       }).join('');
 }
 
+// 获取活跃读者数据并缓存
 async function loadTopNewsUsers(){
   const data = await api('/admin/api/news/top_users');if(!data)return;
-  document.getElementById('topNewsUsersBody').innerHTML = data.length===0
+  cachedNewsUsers = data;
+  renderNewsUsers();
+}
+
+// 渲染活跃读者表格
+function renderNewsUsers(){
+  // 1. 更新表头排序箭头显示
+  document.getElementById('sort_unique_articles').innerText = newsUserSortField === 'unique_articles' ? (newsUserSortOrder === 'desc' ? '▼' : '▲') : '';
+  document.getElementById('sort_last_active').innerText = newsUserSortField === 'last_active' ? (newsUserSortOrder === 'desc' ? '▼' : '▲') : '';
+
+  // 2. 排序缓存数据
+  const sortedData = [...cachedNewsUsers].sort((a, b) => {
+    let valA = a[newsUserSortField];
+    let valB = b[newsUserSortField];
+    
+    // 如果是日期字符串，直接进行字符串对比
+    if (newsUserSortField === 'last_active') {
+      valA = valA || '';
+      valB = valB || '';
+    } else {
+      valA = Number(valA) || 0;
+      valB = Number(valB) || 0;
+    }
+
+    if (valA < valB) return newsUserSortOrder === 'desc' ? 1 : -1;
+    if (valA > valB) return newsUserSortOrder === 'desc' ? -1 : 1;
+    return 0;
+  });
+
+  // 3. 渲染 HTML
+  document.getElementById('topNewsUsersBody').innerHTML = sortedData.length===0
     ? '<tr><td colspan="7" style="text-align:center;color:#64748b">暂无数据</td></tr>'
-    : data.map((r,i)=>`<tr>
-        <td>${i+1}</td>
-        <td style="font-family:monospace;font-size:11px">${r.user_id.substring(0,28)}...</td>
-        <td><span class="pill ${r.user_type==='apple'?'pill-blue':'pill-purple'}">${r.user_type||'-'}</span></td>
-        <td><strong>${r.unique_articles}</strong></td>
-        <!-- 【修改】使朗读和曝光数字可点击 -->
-        <td><span class="clickable" style="font-weight:bold;" onclick="showUserNewsDetails('${encodeURIComponent(r.user_id)}', 'listen')">${r.listen_count||0}</span></td>
-        <td><span class="clickable" style="font-weight:bold;" onclick="showUserNewsDetails('${encodeURIComponent(r.user_id)}', 'view')">${r.view_count||0}</span></td>
-        <td style="color:#94a3b8;font-size:12px">${(r.last_active||'').replace('T',' ').substring(0,19)}</td>
-      </tr>`).join('');
+    : sortedData.map((r,i)=>{
+        const isApple = r.user_type === 'apple';
+        const isDevice = r.user_type === 'device';
+        const displayAppleId = isApple ? `<span style="font-family:monospace;font-size:11px">${r.user_id.substring(0,24)}...</span>` : '<span style="color:#475569">-</span>';
+        const displayDeviceId = isDevice ? `<span style="font-family:monospace;font-size:11px">${r.user_id.substring(0,24)}...</span>` : '<span style="color:#475569">-</span>';
+        
+        return `<tr>
+          <td>${i+1}</td>
+          <td>${displayAppleId}</td>
+          <td>${displayDeviceId}</td>
+          <td><strong>${r.unique_articles}</strong></td>
+          <td><span class="clickable" style="font-weight:bold;" onclick="showUserNewsDetails('${encodeURIComponent(r.user_id)}', 'listen')">${r.listen_count||0}</span></td>
+          <td><span class="clickable" style="font-weight:bold;" onclick="showUserNewsDetails('${encodeURIComponent(r.user_id)}', 'view')">${r.view_count||0}</span></td>
+          <td style="color:#94a3b8;font-size:12px">${(r.last_active||'').replace('T',' ').substring(0,19)}</td>
+        </tr>`;
+      }).join('');
+}
+
+// 切换排序字段
+function sortNewsUsers(field) {
+  if (newsUserSortField === field) {
+    // 如果点击的是当前排序字段，则切换升序/降序
+    newsUserSortOrder = newsUserSortOrder === 'desc' ? 'asc' : 'desc';
+  } else {
+    // 切换新字段，默认降序
+    newsUserSortField = field;
+    newsUserSortOrder = 'desc';
+  }
+  renderNewsUsers();
 }
 
 async function showArticleUsers(keyEnc, type){

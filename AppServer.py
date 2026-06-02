@@ -1317,6 +1317,26 @@ def admin_news_article_users():
     ''', (article_key, event_type))
     return jsonify(rows)
 
+# 新闻 - 某个用户的详细阅读历史（按日期分组）
+@app.route('/admin/api/news/user_details', methods=['GET'])
+@require_admin
+def admin_news_user_details():
+    user_id = request.args.get('user_id')
+    event_type = request.args.get('type') # listen 或 view
+    if not user_id or not event_type:
+        return jsonify({"error": "Missing parameters"}), 400
+        
+    # 查询该用户该事件的所有流水，按日期和文章去重，按流水时间降序
+    sql = '''
+        SELECT article_date, article_topic, source_id, MAX(created_at) as last_time, COUNT(*) as click_count
+        FROM news_event_logs
+        WHERE user_id = ? AND event_type = ?
+        GROUP BY article_date, article_key
+        ORDER BY article_date DESC, last_time DESC
+    '''
+    rows = _query_analytics(sql, (user_id, event_type))
+    return jsonify(rows)
+
 # 概览：今日 / 总计
 @app.route('/admin/api/overview', methods=['GET'])
 @require_admin
@@ -1975,8 +1995,9 @@ async function loadTopNewsUsers(){
         <td style="font-family:monospace;font-size:11px">${r.user_id.substring(0,28)}...</td>
         <td><span class="pill ${r.user_type==='apple'?'pill-blue':'pill-purple'}">${r.user_type||'-'}</span></td>
         <td><strong>${r.unique_articles}</strong></td>
-        <td>${r.listen_count||0}</td>
-        <td>${r.view_count||0}</td>
+        <!-- 【修改】使朗读和曝光数字可点击 -->
+        <td><span class="clickable" style="font-weight:bold;" onclick="showUserNewsDetails('${encodeURIComponent(r.user_id)}', 'listen')">${r.listen_count||0}</span></td>
+        <td><span class="clickable" style="font-weight:bold;" onclick="showUserNewsDetails('${encodeURIComponent(r.user_id)}', 'view')">${r.view_count||0}</span></td>
         <td style="color:#94a3b8;font-size:12px">${(r.last_active||'').replace('T',' ').substring(0,19)}</td>
       </tr>`).join('');
 }
@@ -1992,6 +2013,59 @@ async function showArticleUsers(keyEnc, type){
     return `• [${u.user_type||'-'}] ${uid}... (${cnt}次, 最后:${last})`;
   }).join('<br>');
   showInfoModal(`👥 ${type==='listen'?'朗读':'曝光'}此文章的用户 (${data.length} 人)`, html || '暂无');
+}
+
+async function showUserNewsDetails(userIdEnc, type){
+  const userId = decodeURIComponent(userIdEnc);
+  const typeText = type === 'listen' ? '朗读' : '曝光';
+  const data = await api(`/admin/api/news/user_details?user_id=${encodeURIComponent(userId)}&type=${type}`);
+  if(!data) return;
+  
+  if(data.length === 0) {
+    showInfoModal(`👥 用户 ${typeText} 明细`, '暂无记录');
+    return;
+  }
+  
+  // 1. 按新闻日期 (article_date, 格式如 yyMMdd) 进行前端分组
+  const groups = {};
+  data.forEach(item => {
+    // 格式化日期显示，如 "26-05-31" 或保持 "260531"
+    let dateStr = item.article_date || '未知日期';
+    if (dateStr.length === 6) {
+      dateStr = `20${dateStr.substring(0,2)}-${dateStr.substring(2,4)}-${dateStr.substring(4,6)}`;
+    }
+    if (!groups[dateStr]) {
+      groups[dateStr] = [];
+    }
+    groups[dateStr].push(item);
+  });
+  
+  // 2. 拼接 HTML 结构
+  let html = `<div style="text-align:left; max-height:60vh; overflow-y:auto; font-size:13px; color:#cbd5e1;">`;
+  
+  // 降序遍历日期组
+  const sortedDates = Object.keys(groups).sort((a,b) => b.localeCompare(a));
+  
+  sortedDates.forEach(date => {
+    html += `<div style="margin-bottom: 16px; border-bottom: 1px solid #334155; padding-bottom: 8px;">`;
+    html += `  <div style="font-weight: bold; color: #60a5fa; font-size: 14px; margin-bottom: 6px;">📅 ${date}</div>`;
+    html += `  <ul style="list-style-type: none; padding-left: 4px;">`;
+    
+    groups[date].forEach(art => {
+      const sourceBadge = art.source_id ? `<span class="pill pill-orange" style="margin-right:6px; font-size:10px; padding:1px 4px;">${art.source_id}</span>` : '';
+      const countBadge = art.click_count > 1 ? `<span class="pill pill-blue" style="margin-left:6px; font-size:10px; padding:1px 4px;">${art.click_count}次</span>` : '';
+      html += `    <li style="margin-bottom: 6px; line-height: 1.4;">`;
+      html += `      ${sourceBadge}<strong>${art.article_topic || '无标题'}</strong>${countBadge}`;
+      html += `    </li>`;
+    });
+    
+    html += `  </ul>`;
+    html += `</div>`;
+  });
+  
+  html += `</div>`;
+  
+  showInfoModal(`👥 用户 [${userId.substring(0,10)}...] 的${typeText}历史`, html);
 }
 
 function switchSourcePeriod(el,p){

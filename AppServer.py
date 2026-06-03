@@ -1714,13 +1714,6 @@ ADMIN_HTML = r'''
         </table>
       </div>
     </div>
-    <div class="panel" style="margin-bottom:24px">
-      <h3>👥 视频 - 活跃用户榜</h3>
-      <table>
-        <thead><tr><th>#</th><th>User ID</th><th>看过视频数</th><th>总操作数</th><th>最后活跃</th></tr></thead>
-        <tbody id="topUsersBody"></tbody>
-      </table>
-    </div>
   </div>
 
   <!-- ============ 新闻模块 ============ -->

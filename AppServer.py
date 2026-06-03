@@ -2346,6 +2346,12 @@ function closeModal() {
 }
 
 if(TOKEN) showDashboard();
+// ============ 新增：ESC 键关闭弹窗 ============
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') {
+    closeModal();
+  }
+});
 </script>
 </body>
 </html>

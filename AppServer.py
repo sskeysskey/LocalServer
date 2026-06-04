@@ -1364,15 +1364,19 @@ def admin_news_user_details():
 @require_admin
 def admin_video_user_details():
     user_id = request.args.get('user_id')
-    event_type = request.args.get('type')   # play / download_complete
+    event_type = request.args.get('type')
+    suffix = request.args.get('suffix', '')  # 新增
+    
     if not user_id or not event_type:
         return jsonify({"error": "Missing parameters"}), 400
-    sql = '''
+        
+    sql = f'''
         SELECT video_url, video_title,
                MAX(created_at) AS last_time,
                COUNT(*) AS click_count
         FROM event_logs
         WHERE user_id = ? AND event_type = ?
+        {suffix}  -- 在线/离线过滤
         GROUP BY video_url
         ORDER BY last_time DESC
     '''
@@ -1498,6 +1502,8 @@ def admin_top_users():
                MAX(user_type) AS user_type,
                COUNT(DISTINCT CASE WHEN event_type='play' THEN video_url END) AS play_videos,
                COUNT(DISTINCT CASE WHEN event_type='download_complete' THEN video_url END) AS download_videos,
+               COUNT(DISTINCT CASE WHEN event_type='play' AND video_url NOT LIKE '%.m3u8' THEN video_url END) AS online_play,
+               COUNT(DISTINCT CASE WHEN event_type='play' AND video_url LIKE '%.m3u8' THEN video_url END) AS offline_play,
                COUNT(*) AS total_actions,
                MAX(created_at) AS last_active
         FROM event_logs
@@ -1653,7 +1659,8 @@ ADMIN_HTML = r'''
             <th>#</th>
             <th>user id_apple</th>
             <th>user id_device</th>
-            <th>看过视频数</th>
+            <th>在线播放</th>
+            <th>离线播放</th>
             <th>下载视频数</th>
             <th class="sortable" onclick="sortVideoUsers('total_actions')">总操作数 <span id="vsort_total_actions">▼</span></th>
             <th class="sortable" onclick="sortVideoUsers('last_active')">最后活跃 <span id="vsort_last_active"></span></th>
@@ -2013,7 +2020,8 @@ function renderVideoUsers(){
           <td>${i+1}</td>
           <td>${appleCell}</td>
           <td>${deviceCell}</td>
-          <td><span class="clickable" style="font-weight:bold;" onclick="showUserVideoDetails('${encodeURIComponent(r.user_id)}','play')">${r.play_videos||0}</span></td>
+          <td><span class="clickable" style="font-weight:bold;" onclick="showUserVideoDetails('${encodeURIComponent(r.user_id)}','online')">${r.online_play||0}</span></td>
+          <td><span class="clickable" style="font-weight:bold;" onclick="showUserVideoDetails('${encodeURIComponent(r.user_id)}','offline')">${r.offline_play||0}</span></td>
           <td><span class="clickable" style="font-weight:bold;" onclick="showUserVideoDetails('${encodeURIComponent(r.user_id)}','download_complete')">${r.download_videos||0}</span></td>
           <td><strong>${r.total_actions||0}</strong></td>
           <td style="color:#94a3b8;font-size:12px">${(r.last_active||'').replace('T',' ').substring(0,19)}</td>
@@ -2034,8 +2042,22 @@ function sortVideoUsers(field){
 // 点击观看数/下载数 → 弹出该用户的视频历史
 async function showUserVideoDetails(userIdEnc, type){
   const userId = decodeURIComponent(userIdEnc);
-  const typeText = type === 'play' ? '观看' : '下载';
-  const data = await api(`/admin/api/video/user_details?user_id=${encodeURIComponent(userId)}&type=${type}`);
+  let typeText = '';
+  let sqlType = 'play';
+  let suffixFilter = '';
+
+  if (type === 'online') {
+    typeText = '在线播放';
+    suffixFilter = "AND video_url NOT LIKE '%.m3u8'";
+  } else if (type === 'offline') {
+    typeText = '离线播放';
+    suffixFilter = "AND video_url LIKE '%.m3u8'";
+  } else {
+    typeText = type === 'play' ? '播放' : '下载';
+    sqlType = type;
+  }
+
+  const data = await api(`/admin/api/video/user_details?user_id=${encodeURIComponent(userId)}&type=${sqlType}&suffix=${encodeURIComponent(suffixFilter)}`);
   if(!data) return;
   if(data.length === 0){
     showInfoModal(`👤 用户${typeText}明细`, '暂无记录');

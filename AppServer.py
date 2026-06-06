@@ -925,12 +925,37 @@ def get_ovideos():
                     rf = vdata.get('video_region_filter', {}) or {}
                     region_filter_enabled = bool(rf.get('enabled', False))
                     region_keywords = [k for k in rf.get('keywords', []) if k]
-                    # 【新增】类型屏蔽
+                    # 类型屏蔽
                     tf = vdata.get('video_type_filter', {}) or {}
                     type_filter_enabled = bool(tf.get('enabled', False))
                     type_keywords = [k for k in tf.get('keywords', []) if k]
             except Exception as e:
                 print(f"读取屏蔽配置失败: {e}")
+
+        # 针对 redeem_invite 永久 VIP 用户：强制关闭过滤
+        user_id = request.args.get('user_id')
+        if user_id:
+            try:
+                conn = sqlite3.connect(USER_DB_PATH, timeout=10.0)
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                # 检查该用户是否在任意应用中拥有永久 VIP（is_permanent == 1）
+                c.execute("""
+                    SELECT onews_is_permanent, finance_is_permanent, prediction_is_permanent 
+                    FROM users WHERE apple_user_id = ?
+                """, (user_id,))
+                row = c.fetchone()
+                if row and any([
+                    row['onews_is_permanent'] == 1,
+                    row['finance_is_permanent'] == 1,
+                    row['prediction_is_permanent'] == 1
+                ]):
+                    print(f"[OVideo] 用户 {user_id} 是永久 VIP(redeem)，跳过地区/类型过滤")
+                    region_filter_enabled = False
+                    type_filter_enabled = False
+                conn.close()
+            except Exception as e:
+                print(f"[OVideo] 查询用户VIP状态失败: {e}")
 
         def is_region_blocked(item):
             if not region_filter_enabled or not region_keywords:

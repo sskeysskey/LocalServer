@@ -936,7 +936,9 @@ def get_ovideos():
             if not region_filter_enabled or not region_keywords:
                 return False
             region = item.get('地区') or ''
-            return any(kw in region for kw in region_keywords)
+            # return any(kw in region for kw in region_keywords)
+            # 精确匹配：只有当"地区"字段完全等于 keywords 中的某一项时才屏蔽
+            return region in region_keywords
 
         # 【新增】类型屏蔽：类型是数组，需要遍历每个元素
         def is_type_blocked(item):

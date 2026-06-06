@@ -49,6 +49,10 @@ VALID_INVITE_CODES = {
     "VIP_FRIEND_888": "Friend Access",
     "DEV_TEST_KEY": "Developer Key"
 }
+# 视频模块黑名单：这些用户即使是永久 VIP 也看不到视频模块
+VIDEO_MODULE_BLOCKED_USERS = {
+    "001356.cdec6d350edb4646b0130f9363b6d37e.2149",
+}
 
 # --- 数据库连接辅助函数 ---
 def require_admin(f):
@@ -732,7 +736,8 @@ def handle_auth(app_name):
         return jsonify({
             "status": "success", 
             "is_subscribed": is_subscribed,
-            "subscription_expires_at": expiration_date
+            "subscription_expires_at": expiration_date,
+            "video_module_blocked": user_id in VIDEO_MODULE_BLOCKED_USERS   # 【新增】
         }), 200
     except Exception as e:
         traceback.print_exc()
@@ -750,9 +755,12 @@ def handle_status_check(app_name):
         is_subscribed = False
         expires_at_str = None
         if row:
-            # 【修改】使用统一的检查逻辑
             is_subscribed, expires_at_str = check_user_subscription_status(row, app_name)
-        return jsonify({"is_subscribed": is_subscribed, "subscription_expires_at": expires_at_str})
+        return jsonify({
+            "is_subscribed": is_subscribed, 
+            "subscription_expires_at": expires_at_str,
+            "video_module_blocked": user_id in VIDEO_MODULE_BLOCKED_USERS   # 【新增】
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
@@ -934,6 +942,10 @@ def get_ovideos():
 
         # 针对 redeem_invite 永久 VIP 用户：强制关闭过滤
         user_id = request.args.get('user_id')
+        # 【新增】黑名单用户直接返回空,数据层兜底
+        if user_id and user_id in VIDEO_MODULE_BLOCKED_USERS:
+            print(f"[OVideo] 用户 {user_id} 在视频黑名单中,返回空列表")
+            return jsonify({"categories": []})
         if user_id:
             try:
                 conn = sqlite3.connect(USER_DB_PATH, timeout=10.0)

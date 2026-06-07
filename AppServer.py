@@ -320,9 +320,716 @@ def download_file(app_name):
         print(f"发生错误: {e}")
         return jsonify({"error": str(e)}), 500
 
+# --- 用户认证与权限核心逻辑 ---
+def check_user_subscription_status(user_row, app_name):
+    """
+    检查用户权限。
+    逻辑：
+    1. 先检查该 App 的 is_permanent (亲友/后门)。如果是 1，直接返回 2099年。
+    2. 再检查该 App 的 expire_at (付费)。如果时间还没到，返回该时间。
+    3. 否则返回 False。
+    """
+    now = datetime.utcnow()
+    
+    # 根据传入的 app_name 决定查哪些字段
+    # 比如 app_name="Finance" -> prefix="finance"
+    prefix = app_name.lower() 
+    perm_col = f"{prefix}_is_permanent"
+    expire_col = f"{prefix}_expire_at"
+    
+    # 1. 【优先】检查永久 VIP (亲友/后门)
+    # 数据库里取出来可能是 1 或 True，做个兼容
+    if user_row[perm_col] == 1:
+        # 对于亲友，我们返回一个极远的未来时间，让前端显示“长期有效”或类似效果
+        return True, "2099-12-31T23:59:59"
+        
+    # 2. 检查付费订阅的过期时间
+    if user_row[expire_col]:
+        try:
+            # 数据库存的是字符串，转回 datetime
+            expires_at = datetime.fromisoformat(str(user_row[expire_col]))
+            if expires_at > now:
+                return True, user_row[expire_col]
+            else:
+                # 【优化】如果已经过期，虽然逻辑上返回 False，
+                # 但可以在这里记录一下，或者由 App 端下次登录时更新
+                return False, user_row[expire_col]
+        except:
+            pass
+            
+    return False, None
+
+# --- 用户认证相关 ---
+def handle_auth(app_name):
+    try:
+        data = request.get_json()
+        user_id = data.get('user_id')
+        device_id = data.get('device_id') # 【新增】接收客户端传来的设备ID
+        
+        if not user_id: return jsonify({"error": "Missing user_id"}), 400
+        conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
+        user = c.fetchone()
+        now = datetime.utcnow()
+        is_subscribed = False
+        expiration_date = None
+        if user:
+            # 老用户：更新登录时间，同时关联/更新最新的 device_id
+            c.execute(
+                "UPDATE users SET last_login_at = ?, device_id = ? WHERE apple_user_id = ?", 
+                (now, device_id, user_id)
+            )
+            # 检查权限 (传入 app_name)
+            is_subscribed, expiration_date = check_user_subscription_status(user, app_name)
+        else:
+            # 新用户：插入记录，同时写入 device_id
+            c.execute(
+                "INSERT INTO users (apple_user_id, device_id, created_at, last_login_at) VALUES (?, ?, ?, ?)",
+                (user_id, device_id, now, now)
+            )
+            # 新用户肯定没订阅且不是VIP
+        
+        conn.commit()
+        conn.close()
+        return jsonify({
+            "status": "success", 
+            "is_subscribed": is_subscribed,
+            "subscription_expires_at": expiration_date,
+            "video_module_blocked": user_id in VIDEO_MODULE_BLOCKED_USERS   # 【新增】
+        }), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+def handle_status_check(app_name):
+    user_id = request.args.get('user_id')
+    if not user_id: return jsonify({"error": "Missing user_id"}), 400
+    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
+        row = c.fetchone()
+        is_subscribed = False
+        expires_at_str = None
+        if row:
+            is_subscribed, expires_at_str = check_user_subscription_status(row, app_name)
+        return jsonify({
+            "is_subscribed": is_subscribed, 
+            "subscription_expires_at": expires_at_str,
+            "video_module_blocked": user_id in VIDEO_MODULE_BLOCKED_USERS   # 【新增】
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+# 【新增】处理邀请码兑换
+def handle_redeem_invite(app_name):
+    data = request.get_json()
+    user_id = data.get('user_id')
+    invite_code = data.get('invite_code')
+    if not user_id or not invite_code:
+        return jsonify({"error": "缺少参数"}), 400
+        
+    # 验证邀请码
+    if invite_code not in VALID_INVITE_CODES:
+        return jsonify({"error": "无效的邀请码"}), 403
+    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
+    c = conn.cursor()
+    try:
+        # 确定要更新哪个字段
+        perm_col = f"{app_name.lower()}_is_permanent"
+        
+        # 设置永久 VIP 标记为 1
+        query = f"UPDATE users SET {perm_col} = 1 WHERE apple_user_id = ?"
+        c.execute(query, (user_id,))
+        if c.rowcount == 0:
+            return jsonify({"error": "用户不存在，请先登录"}), 404
+        conn.commit()
+        print(f"[{app_name}] 用户 {user_id} 使用邀请码 {invite_code} 升级为永久 VIP")
+        
+        return jsonify({
+            "status": "success",
+            "is_subscribed": True,
+            "subscription_expires_at": "2099-12-31T23:59:59"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+def handle_payment(app_name):
+    data = request.get_json()
+    user_id = data.get('user_id')
+    days = data.get('days', 30) # 保持默认值用于兼容旧版本或手动充值
+    # 【新增】接收客户端传来的真实过期时间字符串 (ISO 8601 格式)
+    explicit_expiry = data.get('explicit_expiry') 
+    if not user_id: return jsonify({"error": "Missing user_id"}), 400
+    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
+        row = c.fetchone()
+        if not row: return jsonify({"error": "User not found"}), 404
+        now = datetime.utcnow()
+        
+        # 确定要更新哪个字段
+        expire_col = f"{app_name.lower()}_expire_at"
+        new_expiry_str = ""
+
+        # 【核心修改】逻辑分支
+        if explicit_expiry:
+            # 方案 A: 客户端传了真实的 Apple 过期时间，直接使用
+            # 这样就实现了"同步"，而不是"充值"
+            print(f"[{app_name}] 同步用户 {user_id} 订阅时间至: {explicit_expiry}")
+            new_expiry_str = explicit_expiry
+        else:
+            # 方案 B: 旧逻辑 (充值模式) - 依然保留以备不时之需
+            current_expiry_str = row[expire_col]
+            new_expiry = now + timedelta(days=days) 
+            
+            if current_expiry_str:
+                try:
+                    current_expiry = datetime.fromisoformat(current_expiry_str)
+                    if current_expiry > now:
+                        new_expiry = current_expiry + timedelta(days=days)
+                except: pass
+            new_expiry_str = new_expiry.isoformat()
+        
+        # 执行更新
+        query = f"UPDATE users SET {expire_col} = ? WHERE apple_user_id = ?"
+        c.execute(query, (new_expiry_str, user_id))
+        conn.commit()
+        return jsonify({
+            "status": "success", 
+            "is_subscribed": True, 
+            "subscription_expires_at": new_expiry_str
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+# --- ONews 路由 (保持兼容) ---
+@app.route('/api/ONews/auth/apple', methods=['POST'])
+def onews_auth(): return handle_auth('ONews')
+
+@app.route('/api/ONews/payment/subscribe', methods=['POST'])
+def onews_pay(): return handle_payment('ONews')
+
+# 注意状态检查也要传 App 名，因为我们要看特定 App 的权限
+@app.route('/api/ONews/user/status', methods=['GET'])
+def onews_status(): 
+    # 这里复用 handle_auth 里的 check 逻辑，稍微改写一下 handle_status_check
+    return handle_status_check('ONews') 
+
+# ONews 兑换路由
+@app.route('/api/ONews/user/redeem', methods=['POST'])
+def onews_redeem(): return handle_redeem_invite('ONews')
+
+# --- Prediction 路由 ---
+@app.route('/api/Prediction/auth/apple', methods=['POST'])
+def prediction_auth(): return handle_auth('Prediction')
+
+@app.route('/api/Prediction/payment/subscribe', methods=['POST'])
+def prediction_pay(): return handle_payment('Prediction')
+
+@app.route('/api/Prediction/user/status', methods=['GET'])
+def prediction_status(): return handle_status_check('Prediction')
+
+@app.route('/api/Prediction/user/redeem', methods=['POST'])
+def prediction_redeem(): return handle_redeem_invite('Prediction')
+
+@app.route('/api/Prediction/user/delete', methods=['POST'])
+def prediction_delete(): return delete_user('Prediction')
+
+# --- Finance 路由 ---
+@app.route('/api/Finance/auth/apple', methods=['POST'])
+def finance_auth(): return handle_auth('Finance')
+
+@app.route('/api/Finance/payment/subscribe', methods=['POST'])
+def finance_pay(): return handle_payment('Finance')
+
+@app.route('/api/Finance/user/status', methods=['GET'])
+def finance_status(): return handle_status_check('Finance')
+
+# 注册 Finance 的兑换路由！！！
+@app.route('/api/Finance/user/redeem', methods=['POST'])
+def finance_redeem(): return handle_redeem_invite('Finance')
+
+
+# OVideo 视频模块 API
+OVIDEO_DIR = os.path.join(BASE_RESOURCES_DIR, 'OVideo')
+OVIDEO_COVER_DIR = os.path.join(OVIDEO_DIR, 'cover_image')
+
+# 1. 获取视频目录（保证分类顺序 Movie/Drama/Show/Anime ...）
+# 【修改】只显示在 url_mapping.json 中存在真实播放链接的剧集
+@app.route('/api/OVideo/videos', methods=['GET'])
+def get_ovideos():
+    video_file = os.path.join(OVIDEO_DIR, 'OVideos.json')
+    mapping_file = os.path.join(OVIDEO_DIR, 'url_mapping.json')
+
+    if not os.path.exists(video_file):
+        return jsonify({"error": "Video file not found"}), 404
+
+    try:
+        # 0. 读取地区屏蔽 + 类型屏蔽配置（来自 ONews/version.json）
+        region_filter_enabled = False
+        region_keywords = []
+        type_filter_enabled = False
+        type_keywords = []
+        version_file_path = os.path.join(BASE_RESOURCES_DIR, 'ONews', 'version.json')
+        if os.path.exists(version_file_path):
+            try:
+                with open(version_file_path, 'r', encoding='utf-8') as vf:
+                    vdata = json.load(vf)
+                    # 地区屏蔽
+                    rf = vdata.get('video_region_filter', {}) or {}
+                    region_filter_enabled = bool(rf.get('enabled', False))
+                    region_keywords = [k for k in rf.get('keywords', []) if k]
+                    # 类型屏蔽
+                    tf = vdata.get('video_type_filter', {}) or {}
+                    type_filter_enabled = bool(tf.get('enabled', False))
+                    type_keywords = [k for k in tf.get('keywords', []) if k]
+            except Exception as e:
+                print(f"读取屏蔽配置失败: {e}")
+
+        # 针对 redeem_invite 永久 VIP 用户：强制关闭过滤
+        user_id = request.args.get('user_id')
+        # 【新增】黑名单用户直接返回空,数据层兜底
+        if user_id and user_id in VIDEO_MODULE_BLOCKED_USERS:
+            print(f"[OVideo] 用户 {user_id} 在视频黑名单中,返回空列表")
+            return jsonify({"categories": []})
+        if user_id:
+            try:
+                conn = sqlite3.connect(USER_DB_PATH, timeout=10.0)
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                # 检查该用户是否在任意应用中拥有永久 VIP（is_permanent == 1）
+                c.execute("""
+                    SELECT onews_is_permanent, finance_is_permanent, prediction_is_permanent 
+                    FROM users WHERE apple_user_id = ?
+                """, (user_id,))
+                row = c.fetchone()
+                if row and any([
+                    row['onews_is_permanent'] == 1,
+                    row['finance_is_permanent'] == 1,
+                    row['prediction_is_permanent'] == 1
+                ]):
+                    print(f"[OVideo] 用户 {user_id} 是永久 VIP(redeem)，跳过地区/类型过滤")
+                    region_filter_enabled = False
+                    type_filter_enabled = False
+                conn.close()
+            except Exception as e:
+                print(f"[OVideo] 查询用户VIP状态失败: {e}")
+
+        def is_region_blocked(item):
+            if not region_filter_enabled or not region_keywords:
+                return False
+            region = item.get('地区') or ''
+            # return any(kw in region for kw in region_keywords)
+            # 精确匹配：只有当"地区"字段完全等于 keywords 中的某一项时才屏蔽
+            return region in region_keywords
+
+        # 【新增】类型屏蔽：类型是数组，需要遍历每个元素
+        def is_type_blocked(item):
+            if not type_filter_enabled or not type_keywords:
+                return False
+            types = item.get('类型') or []
+            # 兼容万一类型被写成字符串的情况
+            if isinstance(types, str):
+                types = [types]
+            for t in types:
+                if any(kw in t for kw in type_keywords):
+                    return True
+            return False
+
+        # 1. 读取原始视频数据
+        with open(video_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        # 2. 读取 url_mapping 数据，用于过滤无效播放源
+        valid_urls = set()
+        if os.path.exists(mapping_file):
+            with open(mapping_file, 'r', encoding='utf-8') as f_map:
+                mappings = json.load(f_map)
+                # 只有 mapping 中值不为空的 URL 才是有效的
+                valid_urls = set(mappings.keys())
+
+        # 3. 转为有序列表，同时过滤 playlist、被屏蔽地区、被屏蔽类型
+        categories = []
+        for key, value in data.items():
+            filtered_items = []
+            for item in value:
+                # 地区屏蔽
+                if is_region_blocked(item):
+                    continue
+                # 【新增】类型屏蔽
+                if is_type_blocked(item):
+                    continue
+
+                new_item = dict(item)
+                filtered_playlist = []
+                if 'playlist' in item:
+                    for channel in item['playlist']:
+                        # 【核心修改】：如果 url 在 mapping 中，或者 url 本身包含 .m3u8，都视作有效
+                        filtered_episodes = {
+                            ep_name: ep_url
+                            for ep_name, ep_url in channel.get('episodes', {}).items()
+                            if ep_url in valid_urls or '.m3u8' in ep_url.lower()
+                        }
+                        
+                        # 如果过滤后该播放源还有剧集，则保留该播放源
+                        if filtered_episodes:
+                            new_channel = dict(channel)
+                            new_channel['episodes'] = filtered_episodes
+                            filtered_playlist.append(new_channel)
+
+                new_item['playlist'] = filtered_playlist
+                filtered_items.append(new_item)
+
+            categories.append({"name": key, "items": filtered_items})
+
+        return jsonify({"categories": categories})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+# 2. 获取封面图片
+@app.route('/api/OVideo/cover/<path:filename>', methods=['GET'])
+def get_ovideo_cover(filename):
+    try:
+        safe_path = safe_join(OVIDEO_COVER_DIR, filename)
+    except Exception:
+        return jsonify({"error": "Invalid path"}), 400
+    if not safe_path or not os.path.isfile(safe_path):
+        return jsonify({"error": "Image not found"}), 404
+    directory, file = os.path.split(safe_path)
+    # 加个缓存头，减少 App 反复拉图片
+    response = send_from_directory(directory, file)
+    response.headers['Cache-Control'] = 'public, max-age=604800'  # 7天
+    return response
+
+# 3. 解析页面 URL -> 真实 m3u8（同时做黑名单拦截）
+@app.route('/api/OVideo/resolve', methods=['POST'])
+def resolve_ovideo_url():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Missing body"}), 400
+    episode_url = data.get('url')
+    if not episode_url:
+        return jsonify({"error": "Missing url"}), 400
+
+    # 【核心修改】：如果是直接写在 json 里的 m3u8 链接，直接返回它自己，跳过 mapping 检索
+    if '.m3u8' in episode_url.lower():
+        return jsonify({
+            "real_url": episode_url,
+            "title": ""
+        })
+
+    blacklist_file = os.path.join(OVIDEO_DIR, 'blacklist_url.json')
+    if os.path.exists(blacklist_file):
+        try:
+            with open(blacklist_file, 'r', encoding='utf-8') as f:
+                blacklist = json.load(f)
+            if episode_url in blacklist:
+                return jsonify({"error": "Blacklisted", "reason": "该视频暂不可用"}), 403
+        except Exception as e:
+            print(f"黑名单读取失败: {e}")
+
+    # 映射表
+    mapping_file = os.path.join(OVIDEO_DIR, 'url_mapping.json')
+    if not os.path.exists(mapping_file):
+        return jsonify({"error": "Mapping file not found"}), 404
+    try:
+        with open(mapping_file, 'r', encoding='utf-8') as f:
+            mappings = json.load(f)
+        if episode_url in mappings:
+            mapping_data = mappings[episode_url]
+            if isinstance(mapping_data, list) and len(mapping_data) > 0:
+                return jsonify({
+                    "real_url": mapping_data[0],
+                    "title": mapping_data[1] if len(mapping_data) > 1 else ""
+                })
+        return jsonify({"error": "URL not found in mapping"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# 4. 服务端搜索（可选，客户端也可以自己搜）
+@app.route('/api/OVideo/search', methods=['GET'])
+def search_ovideo():
+    keyword = request.args.get('q', '').strip().lower()
+    if not keyword:
+        return jsonify({"results": []})
+    video_file = os.path.join(OVIDEO_DIR, 'OVideos.json')
+    if not os.path.exists(video_file):
+        return jsonify({"results": []})
+    try:
+        with open(video_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        results = []
+        for category_name, items in data.items():
+            for item in items:
+                name = item.get('name', '').lower()
+                director = (item.get('导演') or '').lower()
+                cast = ' '.join(item.get('主演') or []).lower()
+                intro = (item.get('intro') or '').lower()
+                if (keyword in name or keyword in director
+                        or keyword in cast or keyword in intro):
+                    result_item = dict(item)
+                    result_item['category'] = category_name
+                    results.append(result_item)
+        return jsonify({"results": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+@app.route('/api/OVideo/report', methods=['POST'])
+def report_video_link():
+    try:
+        import time
+        data = request.get_json() or {}
+        user_id     = data.get('user_id')
+        source_url  = data.get('source_url')
+        episode_url = data.get('episode_url')
+        if not user_id or not (source_url or episode_url):
+            return jsonify({"error": "Invalid params"}), 400
+
+        report_type = data.get('report_type', 'other')
+        if report_type not in ALLOWED_REPORT_TYPES:
+            report_type = 'other'
+
+        # 服务端软限流:同一用户 10 秒内不可重复提交
+        now_ts = time.time()
+        if now_ts - report_last_time.get(user_id, 0) < 10:
+            return jsonify({"error": "Too frequent"}), 429
+        report_last_time[user_id] = now_ts
+
+        video_title  = data.get('video_title', '')
+        channel_name = data.get('channel_name', '')
+        episode_name = data.get('episode_name', '')
+        real_url     = data.get('real_url', '')
+        note         = (data.get('note', '') or '')[:500]
+        app_version  = data.get('app_version', '')
+        now = datetime.utcnow().isoformat()
+
+        conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO video_link_reports
+                (user_id, video_title, source_url, episode_url, channel_name,
+                 episode_name, real_url, report_type, note, app_version,
+                 first_at, last_at, count, status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,'pending')
+            ON CONFLICT(user_id, episode_url, report_type)
+            DO UPDATE SET last_at=?, count=count+1, note=excluded.note, status='pending'
+        ''', (user_id, video_title, source_url, episode_url, channel_name,
+              episode_name, real_url, report_type, note, app_version,
+              now, now, now))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    
+@app.route('/api/OVideo/track', methods=['POST'])
+def track_event():
+    try:
+        data = request.get_json()
+        user_id     = data.get('user_id')
+        user_type   = data.get('user_type', 'apple')   # 【新增】
+        video_url   = data.get('video_url')
+        video_title = data.get('video_title', '')
+        event_type  = data.get('event_type')
+        if not user_id or not video_url or event_type not in ALLOWED_EVENT_TYPES:
+            return jsonify({"error": "Invalid params"}), 400
+        now = datetime.utcnow().isoformat()
+        conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO user_video_events
+                (user_id, user_type, video_url, video_title, event_type, first_at, last_at, count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(user_id, video_url, event_type)
+            DO UPDATE SET last_at = ?, count = count + 1
+        ''', (user_id, user_type, video_url, video_title, event_type, now, now, now))
+
+        # 流水表：每次都插
+        c.execute('''
+            INSERT INTO event_logs
+                (user_id, user_type, video_url, video_title, event_type, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, user_type, video_url, video_title, event_type, now))
+
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    
+# 视频 - 某个用户的详细观看/下载历史
+@app.route('/admin/api/video/user_details', methods=['GET'])
+@require_admin
+def admin_video_user_details():
+    user_id = request.args.get('user_id')
+    event_type = request.args.get('type')
+    suffix = request.args.get('suffix', '')  # 新增
+    
+    if not user_id or not event_type:
+        return jsonify({"error": "Missing parameters"}), 400
+        
+    sql = f'''
+        SELECT video_url, video_title,
+               MAX(created_at) AS last_time,
+               COUNT(*) AS click_count
+        FROM event_logs
+        WHERE user_id = ? AND event_type = ?
+        {suffix}  -- 在线/离线过滤
+        GROUP BY video_url
+        ORDER BY last_time DESC
+    '''
+    rows = _query_analytics(sql, (user_id, event_type))
+    return jsonify(rows)
+
+# 概览：今日 / 总计
+@app.route('/admin/api/overview', methods=['GET'])
+@require_admin
+def admin_overview():
+    today = datetime.utcnow().strftime('%Y-%m-%d')
+    return jsonify({
+        "total_users":          _query_analytics("SELECT COUNT(DISTINCT user_id) AS c FROM event_logs")[0]['c'],
+        "total_play_events":    _query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='play'")[0]['c'],
+        "total_download_events":_query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='download_complete'")[0]['c'],
+        "today_active_users":   _query_analytics("SELECT COUNT(DISTINCT user_id) AS c FROM event_logs WHERE date(created_at)=?", (today,))[0]['c'],
+        "today_play":           _query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='play' AND date(created_at)=?", (today,))[0]['c'],
+        "today_download":       _query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='download_complete' AND date(created_at)=?", (today,))[0]['c'],
+        "pending_reports":      _query_analytics("SELECT COUNT(DISTINCT episode_url) AS c FROM video_link_reports WHERE status='pending'")[0]['c'],
+    })
+
+# 视频排行榜（区分唯一用户数 / 总次数）
+@app.route('/admin/api/top_videos', methods=['GET'])
+@require_admin
+def admin_top_videos():
+    event_type = request.args.get('type', 'play')   # play / download_complete
+    period = request.args.get('period', 'all')      # today / 7d / all
+    limit = int(request.args.get('limit', 20))
+    where_time = ""
+    params = [event_type]
+    if period == 'today':
+        where_time = "AND date(created_at) = date('now')"
+    elif period == '7d':
+        where_time = "AND created_at >= datetime('now', '-7 days')"
+
+    # 用流水表统计：唯一用户数 + 总触发次数
+    sql = f'''
+        SELECT video_url, video_title,
+               COUNT(DISTINCT user_id) AS unique_users,
+               COUNT(*) AS total_count
+        FROM event_logs
+        WHERE event_type = ? {where_time}
+        GROUP BY video_url
+        ORDER BY unique_users DESC, total_count DESC
+        LIMIT ?
+    '''
+    params.append(limit)
+    return jsonify(_query_analytics(sql, params))
+
+# 某个视频的观看用户列表
+@app.route('/admin/api/video_users', methods=['GET'])
+@require_admin
+def admin_video_users():
+    video_url = request.args.get('video_url')
+    event_type = request.args.get('type', 'play')
+    rows = _query_analytics('''
+        SELECT user_id, first_at, last_at, count
+        FROM user_video_events
+        WHERE video_url = ? AND event_type = ?
+        ORDER BY last_at DESC
+    ''', (video_url, event_type))
+    return jsonify(rows)
+
+# 每日趋势（最近 30 天）
+@app.route('/admin/api/daily_trend', methods=['GET'])
+@require_admin
+def admin_daily_trend():
+    rows = _query_analytics('''
+        SELECT date(created_at) AS day,
+               event_type,
+               COUNT(*) AS cnt,
+               COUNT(DISTINCT user_id) AS uu
+        FROM event_logs
+        WHERE created_at >= datetime('now', '-30 days')
+        GROUP BY day, event_type
+        ORDER BY day ASC
+    ''')
+    return jsonify(rows)
+
+# 错误链接举报列表(按 集数+类型 聚合)
+@app.route('/admin/api/video_reports', methods=['GET'])
+@require_admin
+def admin_video_reports():
+    status = request.args.get('status', 'pending')   # pending / all
+    where = "WHERE status='pending'" if status == 'pending' else ""
+    sql = f'''
+        SELECT video_title, source_url, episode_url, channel_name, episode_name,
+               report_type,
+               MAX(real_url) AS real_url,
+               COUNT(DISTINCT user_id) AS unique_users,
+               SUM(count) AS total_count,
+               MAX(last_at) AS last_at,
+               GROUP_CONCAT(DISTINCT NULLIF(note,'')) AS notes
+        FROM video_link_reports
+        {where}
+        GROUP BY episode_url, report_type
+        ORDER BY unique_users DESC, total_count DESC
+        LIMIT 200
+    '''
+    return jsonify(_query_analytics(sql))
+
+# 标记某条举报为已处理
+@app.route('/admin/api/resolve_report', methods=['POST'])
+@require_admin
+def admin_resolve_report():
+    data = request.get_json() or {}
+    episode_url = data.get('episode_url')
+    if not episode_url:
+        return jsonify({"error": "Missing episode_url"}), 400
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    c = conn.cursor()
+    c.execute("UPDATE video_link_reports SET status='resolved' WHERE episode_url=?", (episode_url,))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "success"})
+
+# 活跃用户排行
+@app.route('/admin/api/top_users', methods=['GET'])
+@require_admin
+def admin_top_users():
+    rows = _query_analytics('''
+        SELECT user_id,
+               MAX(user_type) AS user_type,
+               COUNT(DISTINCT CASE WHEN event_type='play' THEN video_url END) AS play_videos,
+               COUNT(DISTINCT CASE WHEN event_type='download_complete' THEN video_url END) AS download_videos,
+               COUNT(DISTINCT CASE WHEN event_type='play' AND video_url NOT LIKE '%.m3u8' THEN video_url END) AS online_play,
+               COUNT(DISTINCT CASE WHEN event_type='play' AND video_url LIKE '%.m3u8' THEN video_url END) AS offline_play,
+               COUNT(*) AS total_actions,
+               MAX(created_at) AS last_active
+        FROM event_logs
+        GROUP BY user_id
+        ORDER BY total_actions DESC
+        LIMIT 50
+    ''')
+    return jsonify(rows)
+    
+
+# 分割线
 # ==========================================
 # 新增：Finance 数据查询 API (替代本地 SQL)
-# ==========================================
 
 # 1. 获取所有市值数据
 @app.route('/api/Finance/query/market_cap', methods=['GET'])
@@ -660,560 +1367,7 @@ def query_options_rank():
         print(f"Error querying options rank: {e}")
         return jsonify({"error": str(e)}), 500
 
-# --- 用户认证与权限核心逻辑 ---
-def check_user_subscription_status(user_row, app_name):
-    """
-    检查用户权限。
-    逻辑：
-    1. 先检查该 App 的 is_permanent (亲友/后门)。如果是 1，直接返回 2099年。
-    2. 再检查该 App 的 expire_at (付费)。如果时间还没到，返回该时间。
-    3. 否则返回 False。
-    """
-    now = datetime.utcnow()
-    
-    # 根据传入的 app_name 决定查哪些字段
-    # 比如 app_name="Finance" -> prefix="finance"
-    prefix = app_name.lower() 
-    perm_col = f"{prefix}_is_permanent"
-    expire_col = f"{prefix}_expire_at"
-    
-    # 1. 【优先】检查永久 VIP (亲友/后门)
-    # 数据库里取出来可能是 1 或 True，做个兼容
-    if user_row[perm_col] == 1:
-        # 对于亲友，我们返回一个极远的未来时间，让前端显示“长期有效”或类似效果
-        return True, "2099-12-31T23:59:59"
-        
-    # 2. 检查付费订阅的过期时间
-    if user_row[expire_col]:
-        try:
-            # 数据库存的是字符串，转回 datetime
-            expires_at = datetime.fromisoformat(str(user_row[expire_col]))
-            if expires_at > now:
-                return True, user_row[expire_col]
-            else:
-                # 【优化】如果已经过期，虽然逻辑上返回 False，
-                # 但可以在这里记录一下，或者由 App 端下次登录时更新
-                return False, user_row[expire_col]
-        except:
-            pass
-            
-    return False, None
-
-# --- 用户认证相关 ---
-def handle_auth(app_name):
-    try:
-        data = request.get_json()
-        user_id = data.get('user_id')
-        device_id = data.get('device_id') # 【新增】接收客户端传来的设备ID
-        
-        if not user_id: return jsonify({"error": "Missing user_id"}), 400
-        conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
-        user = c.fetchone()
-        now = datetime.utcnow()
-        is_subscribed = False
-        expiration_date = None
-        if user:
-            # 老用户：更新登录时间，同时关联/更新最新的 device_id
-            c.execute(
-                "UPDATE users SET last_login_at = ?, device_id = ? WHERE apple_user_id = ?", 
-                (now, device_id, user_id)
-            )
-            # 检查权限 (传入 app_name)
-            is_subscribed, expiration_date = check_user_subscription_status(user, app_name)
-        else:
-            # 新用户：插入记录，同时写入 device_id
-            c.execute(
-                "INSERT INTO users (apple_user_id, device_id, created_at, last_login_at) VALUES (?, ?, ?, ?)",
-                (user_id, device_id, now, now)
-            )
-            # 新用户肯定没订阅且不是VIP
-        
-        conn.commit()
-        conn.close()
-        return jsonify({
-            "status": "success", 
-            "is_subscribed": is_subscribed,
-            "subscription_expires_at": expiration_date,
-            "video_module_blocked": user_id in VIDEO_MODULE_BLOCKED_USERS   # 【新增】
-        }), 200
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-def handle_status_check(app_name):
-    user_id = request.args.get('user_id')
-    if not user_id: return jsonify({"error": "Missing user_id"}), 400
-    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    try:
-        c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
-        row = c.fetchone()
-        is_subscribed = False
-        expires_at_str = None
-        if row:
-            is_subscribed, expires_at_str = check_user_subscription_status(row, app_name)
-        return jsonify({
-            "is_subscribed": is_subscribed, 
-            "subscription_expires_at": expires_at_str,
-            "video_module_blocked": user_id in VIDEO_MODULE_BLOCKED_USERS   # 【新增】
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        conn.close()
-
-# 【新增】处理邀请码兑换
-def handle_redeem_invite(app_name):
-    data = request.get_json()
-    user_id = data.get('user_id')
-    invite_code = data.get('invite_code')
-    if not user_id or not invite_code:
-        return jsonify({"error": "缺少参数"}), 400
-        
-    # 验证邀请码
-    if invite_code not in VALID_INVITE_CODES:
-        return jsonify({"error": "无效的邀请码"}), 403
-    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
-    c = conn.cursor()
-    try:
-        # 确定要更新哪个字段
-        perm_col = f"{app_name.lower()}_is_permanent"
-        
-        # 设置永久 VIP 标记为 1
-        query = f"UPDATE users SET {perm_col} = 1 WHERE apple_user_id = ?"
-        c.execute(query, (user_id,))
-        if c.rowcount == 0:
-            return jsonify({"error": "用户不存在，请先登录"}), 404
-        conn.commit()
-        print(f"[{app_name}] 用户 {user_id} 使用邀请码 {invite_code} 升级为永久 VIP")
-        
-        return jsonify({
-            "status": "success",
-            "is_subscribed": True,
-            "subscription_expires_at": "2099-12-31T23:59:59"
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        conn.close()
-
-def handle_payment(app_name):
-    data = request.get_json()
-    user_id = data.get('user_id')
-    days = data.get('days', 30) # 保持默认值用于兼容旧版本或手动充值
-    # 【新增】接收客户端传来的真实过期时间字符串 (ISO 8601 格式)
-    explicit_expiry = data.get('explicit_expiry') 
-    if not user_id: return jsonify({"error": "Missing user_id"}), 400
-    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    try:
-        c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
-        row = c.fetchone()
-        if not row: return jsonify({"error": "User not found"}), 404
-        now = datetime.utcnow()
-        
-        # 确定要更新哪个字段
-        expire_col = f"{app_name.lower()}_expire_at"
-        new_expiry_str = ""
-
-        # 【核心修改】逻辑分支
-        if explicit_expiry:
-            # 方案 A: 客户端传了真实的 Apple 过期时间，直接使用
-            # 这样就实现了"同步"，而不是"充值"
-            print(f"[{app_name}] 同步用户 {user_id} 订阅时间至: {explicit_expiry}")
-            new_expiry_str = explicit_expiry
-        else:
-            # 方案 B: 旧逻辑 (充值模式) - 依然保留以备不时之需
-            current_expiry_str = row[expire_col]
-            new_expiry = now + timedelta(days=days) 
-            
-            if current_expiry_str:
-                try:
-                    current_expiry = datetime.fromisoformat(current_expiry_str)
-                    if current_expiry > now:
-                        new_expiry = current_expiry + timedelta(days=days)
-                except: pass
-            new_expiry_str = new_expiry.isoformat()
-        
-        # 执行更新
-        query = f"UPDATE users SET {expire_col} = ? WHERE apple_user_id = ?"
-        c.execute(query, (new_expiry_str, user_id))
-        conn.commit()
-        return jsonify({
-            "status": "success", 
-            "is_subscribed": True, 
-            "subscription_expires_at": new_expiry_str
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        conn.close()
-
-# --- ONews 路由 (保持兼容) ---
-@app.route('/api/ONews/auth/apple', methods=['POST'])
-def onews_auth(): return handle_auth('ONews')
-
-@app.route('/api/ONews/payment/subscribe', methods=['POST'])
-def onews_pay(): return handle_payment('ONews')
-
-# 注意状态检查也要传 App 名，因为我们要看特定 App 的权限
-@app.route('/api/ONews/user/status', methods=['GET'])
-def onews_status(): 
-    # 这里复用 handle_auth 里的 check 逻辑，稍微改写一下 handle_status_check
-    return handle_status_check('ONews') 
-
-# ONews 兑换路由
-@app.route('/api/ONews/user/redeem', methods=['POST'])
-def onews_redeem(): return handle_redeem_invite('ONews')
-
-# --- Prediction 路由 ---
-@app.route('/api/Prediction/auth/apple', methods=['POST'])
-def prediction_auth(): return handle_auth('Prediction')
-
-@app.route('/api/Prediction/payment/subscribe', methods=['POST'])
-def prediction_pay(): return handle_payment('Prediction')
-
-@app.route('/api/Prediction/user/status', methods=['GET'])
-def prediction_status(): return handle_status_check('Prediction')
-
-@app.route('/api/Prediction/user/redeem', methods=['POST'])
-def prediction_redeem(): return handle_redeem_invite('Prediction')
-
-@app.route('/api/Prediction/user/delete', methods=['POST'])
-def prediction_delete(): return delete_user('Prediction')
-
-# --- Finance 路由 ---
-@app.route('/api/Finance/auth/apple', methods=['POST'])
-def finance_auth(): return handle_auth('Finance')
-
-@app.route('/api/Finance/payment/subscribe', methods=['POST'])
-def finance_pay(): return handle_payment('Finance')
-
-@app.route('/api/Finance/user/status', methods=['GET'])
-def finance_status(): return handle_status_check('Finance')
-
-# 注册 Finance 的兑换路由！！！
-@app.route('/api/Finance/user/redeem', methods=['POST'])
-def finance_redeem(): return handle_redeem_invite('Finance')
-
-
-# ==========================================
-# OVideo 视频模块 API
-# ==========================================
-OVIDEO_DIR = os.path.join(BASE_RESOURCES_DIR, 'OVideo')
-OVIDEO_COVER_DIR = os.path.join(OVIDEO_DIR, 'cover_image')
-
-# 1. 获取视频目录（保证分类顺序 Movie/Drama/Show/Anime ...）
-# 【修改】只显示在 url_mapping.json 中存在真实播放链接的剧集
-@app.route('/api/OVideo/videos', methods=['GET'])
-def get_ovideos():
-    video_file = os.path.join(OVIDEO_DIR, 'OVideos.json')
-    mapping_file = os.path.join(OVIDEO_DIR, 'url_mapping.json')
-
-    if not os.path.exists(video_file):
-        return jsonify({"error": "Video file not found"}), 404
-
-    try:
-        # 0. 读取地区屏蔽 + 类型屏蔽配置（来自 ONews/version.json）
-        region_filter_enabled = False
-        region_keywords = []
-        type_filter_enabled = False
-        type_keywords = []
-        version_file_path = os.path.join(BASE_RESOURCES_DIR, 'ONews', 'version.json')
-        if os.path.exists(version_file_path):
-            try:
-                with open(version_file_path, 'r', encoding='utf-8') as vf:
-                    vdata = json.load(vf)
-                    # 地区屏蔽
-                    rf = vdata.get('video_region_filter', {}) or {}
-                    region_filter_enabled = bool(rf.get('enabled', False))
-                    region_keywords = [k for k in rf.get('keywords', []) if k]
-                    # 类型屏蔽
-                    tf = vdata.get('video_type_filter', {}) or {}
-                    type_filter_enabled = bool(tf.get('enabled', False))
-                    type_keywords = [k for k in tf.get('keywords', []) if k]
-            except Exception as e:
-                print(f"读取屏蔽配置失败: {e}")
-
-        # 针对 redeem_invite 永久 VIP 用户：强制关闭过滤
-        user_id = request.args.get('user_id')
-        # 【新增】黑名单用户直接返回空,数据层兜底
-        if user_id and user_id in VIDEO_MODULE_BLOCKED_USERS:
-            print(f"[OVideo] 用户 {user_id} 在视频黑名单中,返回空列表")
-            return jsonify({"categories": []})
-        if user_id:
-            try:
-                conn = sqlite3.connect(USER_DB_PATH, timeout=10.0)
-                conn.row_factory = sqlite3.Row
-                c = conn.cursor()
-                # 检查该用户是否在任意应用中拥有永久 VIP（is_permanent == 1）
-                c.execute("""
-                    SELECT onews_is_permanent, finance_is_permanent, prediction_is_permanent 
-                    FROM users WHERE apple_user_id = ?
-                """, (user_id,))
-                row = c.fetchone()
-                if row and any([
-                    row['onews_is_permanent'] == 1,
-                    row['finance_is_permanent'] == 1,
-                    row['prediction_is_permanent'] == 1
-                ]):
-                    print(f"[OVideo] 用户 {user_id} 是永久 VIP(redeem)，跳过地区/类型过滤")
-                    region_filter_enabled = False
-                    type_filter_enabled = False
-                conn.close()
-            except Exception as e:
-                print(f"[OVideo] 查询用户VIP状态失败: {e}")
-
-        def is_region_blocked(item):
-            if not region_filter_enabled or not region_keywords:
-                return False
-            region = item.get('地区') or ''
-            # return any(kw in region for kw in region_keywords)
-            # 精确匹配：只有当"地区"字段完全等于 keywords 中的某一项时才屏蔽
-            return region in region_keywords
-
-        # 【新增】类型屏蔽：类型是数组，需要遍历每个元素
-        def is_type_blocked(item):
-            if not type_filter_enabled or not type_keywords:
-                return False
-            types = item.get('类型') or []
-            # 兼容万一类型被写成字符串的情况
-            if isinstance(types, str):
-                types = [types]
-            for t in types:
-                if any(kw in t for kw in type_keywords):
-                    return True
-            return False
-
-        # 1. 读取原始视频数据
-        with open(video_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
-        # 2. 读取 url_mapping 数据，用于过滤无效播放源
-        valid_urls = set()
-        if os.path.exists(mapping_file):
-            with open(mapping_file, 'r', encoding='utf-8') as f_map:
-                mappings = json.load(f_map)
-                # 只有 mapping 中值不为空的 URL 才是有效的
-                valid_urls = set(mappings.keys())
-
-        # 3. 转为有序列表，同时过滤 playlist、被屏蔽地区、被屏蔽类型
-        categories = []
-        for key, value in data.items():
-            filtered_items = []
-            for item in value:
-                # 地区屏蔽
-                if is_region_blocked(item):
-                    continue
-                # 【新增】类型屏蔽
-                if is_type_blocked(item):
-                    continue
-
-                new_item = dict(item)
-                filtered_playlist = []
-                if 'playlist' in item:
-                    for channel in item['playlist']:
-                        # 【核心修改】：如果 url 在 mapping 中，或者 url 本身包含 .m3u8，都视作有效
-                        filtered_episodes = {
-                            ep_name: ep_url
-                            for ep_name, ep_url in channel.get('episodes', {}).items()
-                            if ep_url in valid_urls or '.m3u8' in ep_url.lower()
-                        }
-                        
-                        # 如果过滤后该播放源还有剧集，则保留该播放源
-                        if filtered_episodes:
-                            new_channel = dict(channel)
-                            new_channel['episodes'] = filtered_episodes
-                            filtered_playlist.append(new_channel)
-
-                new_item['playlist'] = filtered_playlist
-                filtered_items.append(new_item)
-
-            categories.append({"name": key, "items": filtered_items})
-
-        return jsonify({"categories": categories})
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-# 2. 获取封面图片
-@app.route('/api/OVideo/cover/<path:filename>', methods=['GET'])
-def get_ovideo_cover(filename):
-    try:
-        safe_path = safe_join(OVIDEO_COVER_DIR, filename)
-    except Exception:
-        return jsonify({"error": "Invalid path"}), 400
-    if not safe_path or not os.path.isfile(safe_path):
-        return jsonify({"error": "Image not found"}), 404
-    directory, file = os.path.split(safe_path)
-    # 加个缓存头，减少 App 反复拉图片
-    response = send_from_directory(directory, file)
-    response.headers['Cache-Control'] = 'public, max-age=604800'  # 7天
-    return response
-
-# 3. 解析页面 URL -> 真实 m3u8（同时做黑名单拦截）
-@app.route('/api/OVideo/resolve', methods=['POST'])
-def resolve_ovideo_url():
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "Missing body"}), 400
-    episode_url = data.get('url')
-    if not episode_url:
-        return jsonify({"error": "Missing url"}), 400
-
-    # 【核心修改】：如果是直接写在 json 里的 m3u8 链接，直接返回它自己，跳过 mapping 检索
-    if '.m3u8' in episode_url.lower():
-        return jsonify({
-            "real_url": episode_url,
-            "title": ""
-        })
-
-    blacklist_file = os.path.join(OVIDEO_DIR, 'blacklist_url.json')
-    if os.path.exists(blacklist_file):
-        try:
-            with open(blacklist_file, 'r', encoding='utf-8') as f:
-                blacklist = json.load(f)
-            if episode_url in blacklist:
-                return jsonify({"error": "Blacklisted", "reason": "该视频暂不可用"}), 403
-        except Exception as e:
-            print(f"黑名单读取失败: {e}")
-
-    # 映射表
-    mapping_file = os.path.join(OVIDEO_DIR, 'url_mapping.json')
-    if not os.path.exists(mapping_file):
-        return jsonify({"error": "Mapping file not found"}), 404
-    try:
-        with open(mapping_file, 'r', encoding='utf-8') as f:
-            mappings = json.load(f)
-        if episode_url in mappings:
-            mapping_data = mappings[episode_url]
-            if isinstance(mapping_data, list) and len(mapping_data) > 0:
-                return jsonify({
-                    "real_url": mapping_data[0],
-                    "title": mapping_data[1] if len(mapping_data) > 1 else ""
-                })
-        return jsonify({"error": "URL not found in mapping"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# 4. 服务端搜索（可选，客户端也可以自己搜）
-@app.route('/api/OVideo/search', methods=['GET'])
-def search_ovideo():
-    keyword = request.args.get('q', '').strip().lower()
-    if not keyword:
-        return jsonify({"results": []})
-    video_file = os.path.join(OVIDEO_DIR, 'OVideos.json')
-    if not os.path.exists(video_file):
-        return jsonify({"results": []})
-    try:
-        with open(video_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        results = []
-        for category_name, items in data.items():
-            for item in items:
-                name = item.get('name', '').lower()
-                director = (item.get('导演') or '').lower()
-                cast = ' '.join(item.get('主演') or []).lower()
-                intro = (item.get('intro') or '').lower()
-                if (keyword in name or keyword in director
-                        or keyword in cast or keyword in intro):
-                    result_item = dict(item)
-                    result_item['category'] = category_name
-                    results.append(result_item)
-        return jsonify({"results": results})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    
-@app.route('/api/OVideo/report', methods=['POST'])
-def report_video_link():
-    try:
-        import time
-        data = request.get_json() or {}
-        user_id     = data.get('user_id')
-        source_url  = data.get('source_url')
-        episode_url = data.get('episode_url')
-        if not user_id or not (source_url or episode_url):
-            return jsonify({"error": "Invalid params"}), 400
-
-        report_type = data.get('report_type', 'other')
-        if report_type not in ALLOWED_REPORT_TYPES:
-            report_type = 'other'
-
-        # 服务端软限流:同一用户 10 秒内不可重复提交
-        now_ts = time.time()
-        if now_ts - report_last_time.get(user_id, 0) < 10:
-            return jsonify({"error": "Too frequent"}), 429
-        report_last_time[user_id] = now_ts
-
-        video_title  = data.get('video_title', '')
-        channel_name = data.get('channel_name', '')
-        episode_name = data.get('episode_name', '')
-        real_url     = data.get('real_url', '')
-        note         = (data.get('note', '') or '')[:500]
-        app_version  = data.get('app_version', '')
-        now = datetime.utcnow().isoformat()
-
-        conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
-        c = conn.cursor()
-        c.execute('''
-            INSERT INTO video_link_reports
-                (user_id, video_title, source_url, episode_url, channel_name,
-                 episode_name, real_url, report_type, note, app_version,
-                 first_at, last_at, count, status)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,'pending')
-            ON CONFLICT(user_id, episode_url, report_type)
-            DO UPDATE SET last_at=?, count=count+1, note=excluded.note, status='pending'
-        ''', (user_id, video_title, source_url, episode_url, channel_name,
-              episode_name, real_url, report_type, note, app_version,
-              now, now, now))
-        conn.commit()
-        conn.close()
-        return jsonify({"status": "ok"}), 200
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-    
-@app.route('/api/OVideo/track', methods=['POST'])
-def track_event():
-    try:
-        data = request.get_json()
-        user_id     = data.get('user_id')
-        user_type   = data.get('user_type', 'apple')   # 【新增】
-        video_url   = data.get('video_url')
-        video_title = data.get('video_title', '')
-        event_type  = data.get('event_type')
-        if not user_id or not video_url or event_type not in ALLOWED_EVENT_TYPES:
-            return jsonify({"error": "Invalid params"}), 400
-        now = datetime.utcnow().isoformat()
-        conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
-        c = conn.cursor()
-        c.execute('''
-            INSERT INTO user_video_events
-                (user_id, user_type, video_url, video_title, event_type, first_at, last_at, count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-            ON CONFLICT(user_id, video_url, event_type)
-            DO UPDATE SET last_at = ?, count = count + 1
-        ''', (user_id, user_type, video_url, video_title, event_type, now, now, now))
-
-        # 流水表：每次都插
-        c.execute('''
-            INSERT INTO event_logs
-                (user_id, user_type, video_url, video_title, event_type, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (user_id, user_type, video_url, video_title, event_type, now))
-
-        conn.commit()
-        conn.close()
-        return jsonify({"status": "ok"}), 200
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-    
+# Onews 新闻类接口
 @app.route('/api/ONews/track', methods=['POST'])
 def track_news_event():
     try:
@@ -1398,160 +1552,6 @@ def admin_news_user_details():
     rows = _query_analytics(sql, (user_id, event_type))
     return jsonify(rows)
 
-# 视频 - 某个用户的详细观看/下载历史
-@app.route('/admin/api/video/user_details', methods=['GET'])
-@require_admin
-def admin_video_user_details():
-    user_id = request.args.get('user_id')
-    event_type = request.args.get('type')
-    suffix = request.args.get('suffix', '')  # 新增
-    
-    if not user_id or not event_type:
-        return jsonify({"error": "Missing parameters"}), 400
-        
-    sql = f'''
-        SELECT video_url, video_title,
-               MAX(created_at) AS last_time,
-               COUNT(*) AS click_count
-        FROM event_logs
-        WHERE user_id = ? AND event_type = ?
-        {suffix}  -- 在线/离线过滤
-        GROUP BY video_url
-        ORDER BY last_time DESC
-    '''
-    rows = _query_analytics(sql, (user_id, event_type))
-    return jsonify(rows)
-
-# 概览：今日 / 总计
-@app.route('/admin/api/overview', methods=['GET'])
-@require_admin
-def admin_overview():
-    today = datetime.utcnow().strftime('%Y-%m-%d')
-    return jsonify({
-        "total_users":          _query_analytics("SELECT COUNT(DISTINCT user_id) AS c FROM event_logs")[0]['c'],
-        "total_play_events":    _query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='play'")[0]['c'],
-        "total_download_events":_query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='download_complete'")[0]['c'],
-        "today_active_users":   _query_analytics("SELECT COUNT(DISTINCT user_id) AS c FROM event_logs WHERE date(created_at)=?", (today,))[0]['c'],
-        "today_play":           _query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='play' AND date(created_at)=?", (today,))[0]['c'],
-        "today_download":       _query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='download_complete' AND date(created_at)=?", (today,))[0]['c'],
-        "pending_reports":      _query_analytics("SELECT COUNT(DISTINCT episode_url) AS c FROM video_link_reports WHERE status='pending'")[0]['c'],
-    })
-
-# 视频排行榜（区分唯一用户数 / 总次数）
-@app.route('/admin/api/top_videos', methods=['GET'])
-@require_admin
-def admin_top_videos():
-    event_type = request.args.get('type', 'play')   # play / download_complete
-    period = request.args.get('period', 'all')      # today / 7d / all
-    limit = int(request.args.get('limit', 20))
-    where_time = ""
-    params = [event_type]
-    if period == 'today':
-        where_time = "AND date(created_at) = date('now')"
-    elif period == '7d':
-        where_time = "AND created_at >= datetime('now', '-7 days')"
-
-    # 用流水表统计：唯一用户数 + 总触发次数
-    sql = f'''
-        SELECT video_url, video_title,
-               COUNT(DISTINCT user_id) AS unique_users,
-               COUNT(*) AS total_count
-        FROM event_logs
-        WHERE event_type = ? {where_time}
-        GROUP BY video_url
-        ORDER BY unique_users DESC, total_count DESC
-        LIMIT ?
-    '''
-    params.append(limit)
-    return jsonify(_query_analytics(sql, params))
-
-# 某个视频的观看用户列表
-@app.route('/admin/api/video_users', methods=['GET'])
-@require_admin
-def admin_video_users():
-    video_url = request.args.get('video_url')
-    event_type = request.args.get('type', 'play')
-    rows = _query_analytics('''
-        SELECT user_id, first_at, last_at, count
-        FROM user_video_events
-        WHERE video_url = ? AND event_type = ?
-        ORDER BY last_at DESC
-    ''', (video_url, event_type))
-    return jsonify(rows)
-
-# 每日趋势（最近 30 天）
-@app.route('/admin/api/daily_trend', methods=['GET'])
-@require_admin
-def admin_daily_trend():
-    rows = _query_analytics('''
-        SELECT date(created_at) AS day,
-               event_type,
-               COUNT(*) AS cnt,
-               COUNT(DISTINCT user_id) AS uu
-        FROM event_logs
-        WHERE created_at >= datetime('now', '-30 days')
-        GROUP BY day, event_type
-        ORDER BY day ASC
-    ''')
-    return jsonify(rows)
-
-# 错误链接举报列表(按 集数+类型 聚合)
-@app.route('/admin/api/video_reports', methods=['GET'])
-@require_admin
-def admin_video_reports():
-    status = request.args.get('status', 'pending')   # pending / all
-    where = "WHERE status='pending'" if status == 'pending' else ""
-    sql = f'''
-        SELECT video_title, source_url, episode_url, channel_name, episode_name,
-               report_type,
-               MAX(real_url) AS real_url,
-               COUNT(DISTINCT user_id) AS unique_users,
-               SUM(count) AS total_count,
-               MAX(last_at) AS last_at,
-               GROUP_CONCAT(DISTINCT NULLIF(note,'')) AS notes
-        FROM video_link_reports
-        {where}
-        GROUP BY episode_url, report_type
-        ORDER BY unique_users DESC, total_count DESC
-        LIMIT 200
-    '''
-    return jsonify(_query_analytics(sql))
-
-# 标记某条举报为已处理
-@app.route('/admin/api/resolve_report', methods=['POST'])
-@require_admin
-def admin_resolve_report():
-    data = request.get_json() or {}
-    episode_url = data.get('episode_url')
-    if not episode_url:
-        return jsonify({"error": "Missing episode_url"}), 400
-    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
-    c = conn.cursor()
-    c.execute("UPDATE video_link_reports SET status='resolved' WHERE episode_url=?", (episode_url,))
-    conn.commit()
-    conn.close()
-    return jsonify({"status": "success"})
-
-# 活跃用户排行
-@app.route('/admin/api/top_users', methods=['GET'])
-@require_admin
-def admin_top_users():
-    rows = _query_analytics('''
-        SELECT user_id,
-               MAX(user_type) AS user_type,
-               COUNT(DISTINCT CASE WHEN event_type='play' THEN video_url END) AS play_videos,
-               COUNT(DISTINCT CASE WHEN event_type='download_complete' THEN video_url END) AS download_videos,
-               COUNT(DISTINCT CASE WHEN event_type='play' AND video_url NOT LIKE '%.m3u8' THEN video_url END) AS online_play,
-               COUNT(DISTINCT CASE WHEN event_type='play' AND video_url LIKE '%.m3u8' THEN video_url END) AS offline_play,
-               COUNT(*) AS total_actions,
-               MAX(created_at) AS last_active
-        FROM event_logs
-        GROUP BY user_id
-        ORDER BY total_actions DESC
-        LIMIT 50
-    ''')
-    return jsonify(rows)
-
 # 【新增】一键清除数据库 API
 @app.route('/admin/api/clear_db', methods=['POST'])
 @require_admin
@@ -1685,7 +1685,7 @@ ADMIN_HTML = r'''
     </div>
   </div>
 
-  <!-- ============ 视频模块 ============ -->
+  <!-- 视频模块 -->
   <div class="module-section active" id="moduleVideo">
     <div class="stats" id="statsBox"></div>
 
@@ -1762,7 +1762,7 @@ ADMIN_HTML = r'''
     </div>
   </div>
 
-  <!-- ============ 新闻模块 ============ -->
+  <!-- 新闻模块 -->
   <div class="module-section" id="moduleNews">
     <!-- 1. 统计卡片 -->
     <div class="stats" id="newsStatsBox"></div>
@@ -1962,7 +1962,7 @@ function loadCurrentModule(){
   else loadNewsModule();
 }
 
-// ============ 视频模块 ============
+// 视频模块 
 async function loadVideoModule(){
   loadVideoOverview();
   loadVideoTrend();
@@ -2137,7 +2137,7 @@ function switchDlPeriod(el,p){
   el.classList.add('active');dlPeriod=p;loadTopVideos('download_complete',p);
 }
 
-// ============ 新闻模块 ============
+//  新闻模块 
 async function loadNewsModule(){
   loadNewsOverview();
   loadNewsTrend();
@@ -2351,7 +2351,7 @@ function switchArticlePeriod(el,p){
   el.classList.add('active');articlePeriod=p;loadTopArticles(articleType,p);
 }
 
-// ============ 通用弹窗 ============
+//  通用弹窗 
 function showInfoModal(title, htmlBody){
   document.getElementById('modalTitle').innerText = title;
   document.getElementById('modalMsg').innerHTML = htmlBody;
@@ -2361,7 +2361,7 @@ function showInfoModal(title, htmlBody){
   document.getElementById('confirmModal').style.display = 'flex';
 }
 
-// ============ 危险操作 ============
+// 危险操作 
 function triggerClear(type) {
   pendingClearType = type;
   let targetName = "";
@@ -2400,7 +2400,7 @@ function closeModal() {
 }
 
 if(TOKEN) showDashboard();
-// ============ 新增：ESC 键关闭弹窗 ============
+// 新增：ESC 键关闭弹窗 
 document.addEventListener('keydown', function(e) {
   if (e.key === 'Escape') {
     closeModal();

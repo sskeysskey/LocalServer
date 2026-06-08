@@ -704,17 +704,19 @@ def get_ovideos():
                 filtered_playlist = []
                 if 'playlist' in item:
                     for channel in item['playlist']:
-                        # 【核心修改】：如果 url 在 mapping 中，或者 url 本身包含 .m3u8，都视作有效
-                        filtered_episodes = {
-                            ep_name: ep_url
-                            for ep_name, ep_url in channel.get('episodes', {}).items()
-                            if ep_url in valid_urls or '.m3u8' in ep_url.lower()
-                        }
-                        
+                        # 【修改】构建过滤后的剧集时，同时记录原始顺序
+                        filtered_episodes = {}
+                        episode_order = []
+                        for ep_name, ep_url in channel.get('episodes', {}).items():
+                            if ep_url in valid_urls or '.m3u8' in ep_url.lower():
+                                filtered_episodes[ep_name] = ep_url
+                                episode_order.append(ep_name)   # 保留 JSON 原始顺序
+
                         # 如果过滤后该播放源还有剧集，则保留该播放源
                         if filtered_episodes:
                             new_channel = dict(channel)
                             new_channel['episodes'] = filtered_episodes
+                            new_channel['episode_order'] = episode_order   # 【新增】下发顺序
                             filtered_playlist.append(new_channel)
 
                 new_item['playlist'] = filtered_playlist

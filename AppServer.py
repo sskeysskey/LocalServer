@@ -135,6 +135,20 @@ def init_user_db():
     conn.close()
     print("用户数据库已准备就绪。")
 
+def get_video_free_quota():
+    """从 ONews/version.json 读取每日免费次数，关闭或异常时返回 0"""
+    version_file_path = os.path.join(BASE_RESOURCES_DIR, 'ONews', 'version.json')
+    try:
+        with open(version_file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            q = data.get('video_free_quota', {}) or {}
+            if not q.get('enabled', False):
+                return 0
+            return int(q.get('daily_count', 0))
+    except Exception as e:
+        print(f"读取免费次数配置失败: {e}")
+        return 0
+    
 def init_analytics_db():
     print(f"检查行为数据库: {ANALYTICS_DB_PATH}")
     conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=60.0)
@@ -199,6 +213,20 @@ def init_analytics_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_news_logs_time ON news_event_logs(created_at)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_news_logs_source ON news_event_logs(source_id)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_news_logs_type ON news_event_logs(event_type)')
+
+    # 【新增】视频免费次数解锁表
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS video_free_unlocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            episode_key TEXT NOT NULL,
+            unlock_date TEXT NOT NULL,      -- 服务器本地日期 YYYY-MM-DD
+            video_title TEXT,
+            created_at TIMESTAMP NOT NULL,
+            UNIQUE(user_id, episode_key, unlock_date)
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_unlock_user_date ON video_free_unlocks(user_id, unlock_date)')
     
     #【新增】错误链接举报表
     c.execute('''
@@ -1025,6 +1053,73 @@ def admin_top_users():
         LIMIT 50
     ''')
     return jsonify(rows)
+
+# 查询某用户今日的免费次数状态 + 已解锁剧集列表
+@app.route('/api/OVideo/quota/status', methods=['GET'])
+def video_quota_status():
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return jsonify({"error": "Missing user_id"}), 400
+    quota = get_video_free_quota()
+    today = datetime.now().strftime('%Y-%m-%d')
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT episode_key FROM video_free_unlocks WHERE user_id=? AND unlock_date=?",
+              (user_id, today))
+    keys = [r['episode_key'] for r in c.fetchall()]
+    conn.close()
+    used = len(keys)
+    return jsonify({
+        "daily_quota": quota,
+        "used_today": used,
+        "remaining": max(0, quota - used),
+        "unlocked_episodes": keys
+    })
+
+# 消耗一次免费次数解锁某剧集（幂等）
+@app.route('/api/OVideo/quota/unlock', methods=['POST'])
+def video_quota_unlock():
+    data = request.get_json() or {}
+    user_id = data.get('user_id')
+    episode_key = data.get('episode_key')
+    if not user_id or not episode_key:
+        return jsonify({"error": "Missing params"}), 400
+
+    quota = get_video_free_quota()
+    today = datetime.now().strftime('%Y-%m-%d')
+    now = datetime.utcnow().isoformat()
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        # 1) 本集今天是否已解锁 → 幂等，不再扣次数
+        c.execute("SELECT 1 FROM video_free_unlocks WHERE user_id=? AND episode_key=? AND unlock_date=?",
+                  (user_id, episode_key, today))
+        if c.fetchone():
+            c.execute("SELECT COUNT(*) AS n FROM video_free_unlocks WHERE user_id=? AND unlock_date=?",
+                      (user_id, today))
+            used = c.fetchone()['n']
+            return jsonify({"status": "already_unlocked", "remaining": max(0, quota - used)})
+
+        # 2) 今天已用多少
+        c.execute("SELECT COUNT(*) AS n FROM video_free_unlocks WHERE user_id=? AND unlock_date=?",
+                  (user_id, today))
+        used = c.fetchone()['n']
+        if used >= quota:
+            return jsonify({"status": "quota_exceeded", "remaining": 0})
+
+        # 3) 扣次数并绑定
+        c.execute('''INSERT INTO video_free_unlocks (user_id, episode_key, unlock_date, video_title, created_at)
+                     VALUES (?,?,?,?,?)''',
+                  (user_id, episode_key, today, data.get('video_title', ''), now))
+        conn.commit()
+        return jsonify({"status": "success", "remaining": max(0, quota - used - 1)})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
     
 
 # 分割线

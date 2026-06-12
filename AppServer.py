@@ -9,9 +9,13 @@ from werkzeug.utils import safe_join
 from datetime import datetime, timedelta
 import secrets, hashlib
 from functools import wraps
+from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
+# 以北京时间作为"每日免费次数"的统一基准，不再依赖服务器系统时区
+APP_TZ = timezone(timedelta(hours=8))
 CORS(app)
+_last_unlock_cleanup_date = None
 
 # 【新增】初始化 Gzip 压缩
 # 这会自动压缩 application/json, text/csv, text/plain 等响应
@@ -53,6 +57,41 @@ VALID_INVITE_CODES = {
 VIDEO_MODULE_BLOCKED_USERS = {
     "001356.cdec6d350edb4646b0130f9363b6d37e.2149",
 }
+
+def cleanup_old_unlocks(days_to_keep=7):
+    """删除 days_to_keep 天前的解锁记录，保持表轻量。"""
+    cutoff = (datetime.now(APP_TZ) - timedelta(days=days_to_keep)).strftime('%Y-%m-%d')
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    try:
+        c = conn.cursor()
+        c.execute("DELETE FROM video_free_unlocks WHERE unlock_date < ?", (cutoff,))
+        deleted = c.rowcount
+        conn.commit()
+        if deleted:
+            print(f"[cleanup] 已清理 {deleted} 条过期解锁记录 (< {cutoff})")
+    except Exception as e:
+        print(f"[cleanup] 清理失败: {e}")
+    finally:
+        conn.close()
+
+def maybe_cleanup_old_unlocks():
+    """每个北京自然日最多真正执行一次，避免每次请求都 DELETE。"""
+    global _last_unlock_cleanup_date
+    today = today_str()
+    if _last_unlock_cleanup_date == today:
+        return
+    _last_unlock_cleanup_date = today
+    cleanup_old_unlocks(days_to_keep=7)
+
+def today_str():
+    """统一的"自然日"字符串，永远按北京时间 00:00 切分"""
+    return datetime.now(APP_TZ).strftime('%Y-%m-%d')
+
+def now_iso():
+    """统一时间戳：北京时间，且不带 +08:00 后缀（naive）。
+       这样 SQLite 的 date()/datetime() 不会再把它换算成 UTC，
+       date(created_at) 得到的就是北京自然日。"""
+    return datetime.now(APP_TZ).replace(tzinfo=None).isoformat()
 
 # --- 数据库连接辅助函数 ---
 def require_admin(f):
@@ -844,7 +883,7 @@ def report_video_link():
         real_url     = data.get('real_url', '')
         note         = (data.get('note', '') or '')[:500]
         app_version  = data.get('app_version', '')
-        now = datetime.utcnow().isoformat()
+        now = now_iso()        # ⭐ 北京时间(无时区后缀)
 
         conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
         c = conn.cursor()
@@ -877,7 +916,7 @@ def track_event():
         event_type  = data.get('event_type')
         if not user_id or not video_url or event_type not in ALLOWED_EVENT_TYPES:
             return jsonify({"error": "Invalid params"}), 400
-        now = datetime.utcnow().isoformat()
+        now = now_iso()        # ⭐ 北京时间(无时区后缀)
         conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
         c = conn.cursor()
         c.execute('''
@@ -930,7 +969,7 @@ def admin_video_user_details():
 @app.route('/admin/api/overview', methods=['GET'])
 @require_admin
 def admin_overview():
-    today = datetime.utcnow().strftime('%Y-%m-%d')
+    today = today_str()    # ⭐ 北京时间今天
     return jsonify({
         "total_users":          _query_analytics("SELECT COUNT(DISTINCT user_id) AS c FROM event_logs")[0]['c'],
         "total_play_events":    _query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='play'")[0]['c'],
@@ -951,9 +990,9 @@ def admin_top_videos():
     where_time = ""
     params = [event_type]
     if period == 'today':
-        where_time = "AND date(created_at) = date('now')"
+        where_time = "AND date(created_at) = date('now', '+8 hours')"
     elif period == '7d':
-        where_time = "AND created_at >= datetime('now', '-7 days')"
+        where_time = "AND created_at >= datetime('now', '+8 hours', '-7 days')"
 
     # 用流水表统计：唯一用户数 + 总触发次数
     sql = f'''
@@ -993,7 +1032,7 @@ def admin_daily_trend():
                COUNT(*) AS cnt,
                COUNT(DISTINCT user_id) AS uu
         FROM event_logs
-        WHERE created_at >= datetime('now', '-30 days')
+        WHERE created_at >= datetime('now', '+8 hours', '-30 days')
         GROUP BY day, event_type
         ORDER BY day ASC
     ''')
@@ -1062,15 +1101,18 @@ def video_quota_status():
     user_id = request.args.get('user_id')
     if not user_id:
         return jsonify({"error": "Missing user_id"}), 400
+    maybe_cleanup_old_unlocks()   # ⭐ 每天首个请求触发一次清理
     quota = get_video_free_quota()
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = today_str()                      # ⭐ 改为钉死北京时间
     conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute("SELECT episode_key FROM video_free_unlocks WHERE user_id=? AND unlock_date=?",
-              (user_id, today))
-    keys = [r['episode_key'] for r in c.fetchall()]
-    conn.close()
+    try:
+        c.execute("SELECT episode_key FROM video_free_unlocks WHERE user_id=? AND unlock_date=?",
+                  (user_id, today))
+        keys = [r['episode_key'] for r in c.fetchall()]
+    finally:
+        conn.close()
     used = len(keys)
     return jsonify({
         "daily_quota": quota,
@@ -1079,7 +1121,7 @@ def video_quota_status():
         "unlocked_episodes": keys
     })
 
-# 消耗一次免费次数解锁某剧集（幂等）
+# 消耗一次免费次数解锁某剧集（幂等 + 并发安全）
 @app.route('/api/OVideo/quota/unlock', methods=['POST'])
 def video_quota_unlock():
     data = request.get_json() or {}
@@ -1089,12 +1131,17 @@ def video_quota_unlock():
         return jsonify({"error": "Missing params"}), 400
 
     quota = get_video_free_quota()
-    today = datetime.now().strftime('%Y-%m-%d')
-    now = datetime.utcnow().isoformat()
-    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    today = today_str()                      # ⭐ 改为钉死北京时间
+    now = now_iso()
+
+    # ⭐ isolation_level=None：关闭 Python 隐式事务管理，由我们手动控制
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     try:
+        # ⭐ 立即拿写锁，把"检查 + 插入"串行化，杜绝并发超额白嫖
+        c.execute("BEGIN IMMEDIATE")
+
         # 1) 本集今天是否已解锁 → 幂等，不再扣次数
         c.execute("SELECT 1 FROM video_free_unlocks WHERE user_id=? AND episode_key=? AND unlock_date=?",
                   (user_id, episode_key, today))
@@ -1102,6 +1149,7 @@ def video_quota_unlock():
             c.execute("SELECT COUNT(*) AS n FROM video_free_unlocks WHERE user_id=? AND unlock_date=?",
                       (user_id, today))
             used = c.fetchone()['n']
+            c.execute("COMMIT")
             return jsonify({"status": "already_unlocked", "remaining": max(0, quota - used)})
 
         # 2) 今天已用多少
@@ -1109,15 +1157,20 @@ def video_quota_unlock():
                   (user_id, today))
         used = c.fetchone()['n']
         if used >= quota:
+            c.execute("COMMIT")
             return jsonify({"status": "quota_exceeded", "remaining": 0})
 
         # 3) 扣次数并绑定
         c.execute('''INSERT INTO video_free_unlocks (user_id, episode_key, unlock_date, video_title, created_at)
                      VALUES (?,?,?,?,?)''',
                   (user_id, episode_key, today, data.get('video_title', ''), now))
-        conn.commit()
+        c.execute("COMMIT")
         return jsonify({"status": "success", "remaining": max(0, quota - used - 1)})
     except Exception as e:
+        try:
+            c.execute("ROLLBACK")
+        except Exception:
+            pass
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
     finally:
@@ -1478,7 +1531,7 @@ def track_news_event():
         event_type    = data.get('event_type')
         if not user_id or not article_key or event_type not in ALLOWED_NEWS_EVENT_TYPES:
             return jsonify({"error": "Invalid params"}), 400
-        now = datetime.utcnow().isoformat()
+        now = now_iso()        # ⭐ 北京时间(无时区后缀)
         conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
         c = conn.cursor()
         c.execute('''
@@ -1525,7 +1578,7 @@ def _query_analytics(sql, params=()):
 @app.route('/admin/api/news/overview', methods=['GET'])
 @require_admin
 def admin_news_overview():
-    today = datetime.utcnow().strftime('%Y-%m-%d')
+    today = today_str()    # ⭐ 北京时间今天
     return jsonify({
         "total_users":     _query_analytics("SELECT COUNT(DISTINCT user_id) c FROM news_event_logs")[0]['c'],
         "total_view":      _query_analytics("SELECT COUNT(*) c FROM news_event_logs WHERE event_type='view'")[0]['c'],
@@ -1542,9 +1595,9 @@ def admin_top_sources():
     period = request.args.get('period', '7d')
     where = ""
     if period == 'today':
-        where = "AND date(created_at) = date('now')"
+        where = "AND date(created_at) = date('now', '+8 hours')"
     elif period == '7d':
-        where = "AND created_at >= datetime('now', '-7 days')"
+        where = "AND created_at >= datetime('now', '+8 hours', '-7 days')"
     
     sql = f'''
         SELECT source_id,
@@ -1566,9 +1619,9 @@ def admin_top_articles():
     period = request.args.get('period', '7d')
     where = ""
     if period == 'today':
-        where = "AND date(created_at) = date('now')"
+        where = "AND date(created_at) = date('now', '+8 hours')"
     elif period == '7d':
-        where = "AND created_at >= datetime('now', '-7 days')"
+        where = "AND created_at >= datetime('now', '+8 hours', '-7 days')"
     sql = f'''
         SELECT article_key, article_topic, source_id,
                COUNT(DISTINCT user_id) AS unique_users,
@@ -1591,7 +1644,7 @@ def admin_news_daily_trend():
                COUNT(*) AS cnt,
                COUNT(DISTINCT user_id) AS uu
         FROM news_event_logs
-        WHERE created_at >= datetime('now', '-30 days')
+        WHERE created_at >= datetime('now', '+8 hours', '-30 days')
         GROUP BY day, event_type
         ORDER BY day ASC
     ''')

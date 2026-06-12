@@ -58,6 +58,11 @@ VIDEO_MODULE_BLOCKED_USERS = {
     "001356.cdec6d350edb4646b0130f9363b6d37e.2149",
 }
 
+def is_real_login_user(user_id):
+    """只有 Apple 登录用户(稳定 Apple ID)才享受免费次数。
+       dev_ 开头是设备标识(可被重置)，guest_user 是兜底，都不给。"""
+    return bool(user_id) and not user_id.startswith('dev_') and user_id != 'guest_user'
+
 def cleanup_old_unlocks(days_to_keep=7):
     """删除 days_to_keep 天前的解锁记录，保持表轻量。"""
     cutoff = (datetime.now(APP_TZ) - timedelta(days=days_to_keep)).strftime('%Y-%m-%d')
@@ -1101,6 +1106,14 @@ def video_quota_status():
     user_id = request.args.get('user_id')
     if not user_id:
         return jsonify({"error": "Missing user_id"}), 400
+    # ⭐ 未登录(设备/游客)不享受免费次数
+    if not is_real_login_user(user_id):
+        return jsonify({
+            "daily_quota": get_video_free_quota(),
+            "used_today": 0,
+            "remaining": 0,
+            "unlocked_episodes": []
+        })
     maybe_cleanup_old_unlocks()   # ⭐ 每天首个请求触发一次清理
     quota = get_video_free_quota()
     today = today_str()                      # ⭐ 改为钉死北京时间
@@ -1129,7 +1142,9 @@ def video_quota_unlock():
     episode_key = data.get('episode_key')
     if not user_id or not episode_key:
         return jsonify({"error": "Missing params"}), 400
-
+    # ⭐ 未登录用户不能解锁免费次数
+    if not is_real_login_user(user_id):
+        return jsonify({"status": "quota_exceeded", "remaining": 0})
     quota = get_video_free_quota()
     today = today_str()                      # ⭐ 改为钉死北京时间
     now = now_iso()

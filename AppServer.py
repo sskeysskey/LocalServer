@@ -1,4 +1,6 @@
 import os
+import re
+import threading
 import json
 import sqlite3
 import traceback
@@ -638,6 +640,276 @@ def finance_redeem(): return handle_redeem_invite('Finance')
 OVIDEO_DIR = os.path.join(BASE_RESOURCES_DIR, 'OVideo')
 OVIDEO_COVER_DIR = os.path.join(OVIDEO_DIR, 'cover_image')
 
+#  OVideo SQLite 化 
+OVIDEO_DB_PATH = os.path.join(OVIDEO_DIR, 'OVideo.db')
+_video_db_lock = threading.Lock()
+_url_mapping_cache = {"mtime": 0.0, "valid": set()}
+
+# —— 与客户端完全一致的归一化映射（务必保持同步）——
+TYPE_MAPPING = {
+    "科幻片":"科幻","奇幻":"科幻","异世界":"科幻","玄幻":"科幻",
+    "运动":"体育","动作片":"动作","武侠":"古装","战争片":"战争","战斗":"战争","同杏":"同性",
+    "剧情片":"剧情","日常":"剧情","黑色电影":"剧情","韩剧":"剧情","美剧":"剧情","国产剧":"剧情",
+    "港台剧":"剧情","日剧":"剧情","国产":"剧情","大陆":"剧情","泰剧":"剧情","美国":"剧情","欧美":"剧情",
+    "美国剧":"剧情","欧美剧":"剧情","日本剧":"剧情","日本":"剧情","香港剧":"剧情","韩国剧":"剧情",
+    "韩国":"剧情","日韩":"剧情","日韩剧":"剧情","香港":"剧情","台湾":"剧情","港台":"剧情","邵氏电影":"剧情",
+    "泰国":"剧情","海外剧":"剧情","海外":"剧情","台湾剧":"剧情",
+    "喜剧片":"喜剧","搞笑":"喜剧","爱情片":"爱情","恋爱":"爱情","情":"爱情","浪漫":"爱情",
+    "丧尸":"恐怖","恐怖片":"恐怖","惊栗":"惊悚","犯罪片":"犯罪",
+    "记录":"纪录片","其他":"纪录片","纪录":"纪录片","记录片":"纪录片",
+    "选秀":"其它","大陆综艺":"其它","晚会":"其它","日韩综艺":"其它","欧美综艺":"其它","相声":"其它",
+    "访谈":"其它","戏曲":"其它","港台综艺":"其它","国产综艺":"其它","动画":"其它","海外动漫":"其它",
+    "鬼怪":"其它","日本动漫":"其它","综艺":"其它","有声动漫":"其它","机战":"其它","日韩动漫":"其它",
+    "欧美动漫":"其它","脱口秀":"其它","游戏":"其它","热血":"其它","致郁":"其它","动漫片":"其它",
+    "动漫":"其它","动漫电影":"其它","动画电影":"其它","国产动漫":"其它","真人秀":"其它",
+}
+_R_CHINA = {"中国大陆","内地","澳门","大陆","大陆国语","中国"}
+_R_TW    = {"台湾","港台","中国台湾"}
+_R_HK    = {"香港","中国香港","中国澳门"}
+_R_EU    = {"英国","西班牙","挪威","瑞典","丹麦","乌克兰","南斯拉夫","塞浦路斯","奥地利","UK","United Kingdom",
+            "保加利亚","克罗地亚","塞尔维亚","德国","意大利","捷克","捷克斯洛伐克","法国","波黑","玻利维亚",
+            "突尼斯","罗马尼亚","西德","马耳他","澳大利亚","爱尔兰","瑞士","立陶宛","芬兰","荷兰","匈牙利",
+            "希腊","拉脱维亚","马其顿","新西兰","比利时","波兰","NZ","冰岛","北马其顿","卢森堡","斯洛伐克",
+            "斯洛文尼亚","澳大利亚Australia","爱沙尼亚","英语","葡萄牙"}
+_R_ASIA  = {"乌兹别克斯坦","俄罗斯","印度尼西亚","土耳其","新加坡","格鲁吉亚","泰国","苏联","菲律宾",
+            "巴基斯坦","不丹","哈萨克斯坦","塔吉克斯坦","尼泊尔","柬埔寨","蒙古","越南","马来西亚"}
+_R_MID   = {"伊拉克","伊朗","以色列","埃及","巴勒斯坦","叙利亚","巴勒斯坦被占领区","沙特阿拉伯","约旦","苏丹","阿富汗","黎巴嫩"}
+_R_AM    = {"加拿大","墨西哥","哥伦比亚","巴西","智利","厄瓜多尔","阿根廷","秘鲁","Aruba","Canada","Jamaica",
+            "USA","乌拉圭","古巴","委内瑞拉","牙买加","特立尼达和多巴哥"}
+_R_AF    = {"南非","乍得","埃塞俄比亚","塞内加尔","摩洛哥","阿尔及利亚","阿尔巴尼亚"}
+_CHINESE_RE = re.compile(r'[\u4e00-\u9fa5·]+')
+
+def _normalize_region(region):
+    if not region or not region.strip():
+        return "其它"
+    first = region.split('/')[0].strip()
+    if first in _R_CHINA: return "中国"
+    if first in _R_TW:    return "中国台湾"
+    if first in _R_HK:    return "香港澳门"
+    if first in _R_EU:    return "欧洲"
+    if first in _R_ASIA:  return "亚洲"
+    if first in _R_MID:   return "中东"
+    if first in _R_AM:    return "北美洲/南美洲"
+    if first in _R_AF:    return "非洲"
+    return first
+
+def _normalize_types(types):
+    if not types: return []
+    return list({TYPE_MAPPING.get(t, t) for t in types})
+
+def _clean_name(raw):
+    t = (raw or "").strip()
+    if not t: return ""
+    m = _CHINESE_RE.search(t)
+    return m.group(0).strip() if m else t
+
+def _norm_search(text):
+    return (text or "").lower().replace('·', '').replace(' ', '')
+
+def _release_sort_key(date):
+    if not date: return ""
+    return date.split('(')[0]
+
+def _release_year(date):
+    if not date: return None
+    cleaned = date.split('(')[0]
+    parts = cleaned.split('-')
+    try:
+        return int(parts[0])
+    except Exception:
+        return None
+
+def _best_rating(ratings):
+    if not ratings: return 0.0
+    vals = []
+    for v in ratings.values():
+        try: vals.append(float(v))
+        except Exception: pass
+    return max(vals) if vals else 0.0
+
+def build_video_db():
+    """把 OVideos.json 全量构建成 SQLite（不含 playlist 的列表 + 单独存 playlist）"""
+    video_file = os.path.join(OVIDEO_DIR, 'OVideos.json')
+    if not os.path.exists(video_file):
+        return
+    print("[OVideo] 开始构建 SQLite ...")
+    with open(video_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=60.0)
+    c = conn.cursor()
+    c.execute("DROP TABLE IF EXISTS videos")
+    c.execute('''
+        CREATE TABLE videos (
+            url TEXT PRIMARY KEY,
+            category TEXT, name TEXT,
+            region TEXT, norm_region TEXT,
+            release_year INTEGER, release_sort_key TEXT,
+            update_sort_key TEXT, best_rating REAL,
+            norm_types TEXT, raw_types TEXT, has_documentary INTEGER,
+            name_lower TEXT, alias_lower TEXT, types_lower TEXT,
+            director_lower TEXT, cast_lower TEXT, intro_lower TEXT,
+            name_norm TEXT, alias_norm TEXT, director_norm TEXT, cast_norm TEXT,
+            item_json TEXT, playlist_json TEXT
+        )
+    ''')
+    c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+
+    rows = []
+    cat_order = list(data.keys())
+    for category, items in data.items():
+        for item in items:
+            url = item.get('url')
+            if not url:
+                continue
+            name   = item.get('name', '') or ''
+            region = item.get('地区', '') or ''
+            date   = item.get('date', '') or ''
+            ratings = item.get('评分') or {}
+            ntypes  = _normalize_types(item.get('类型') or [])
+            director = item.get('导演') or ''
+            cast = item.get('主演') or []
+            alias = item.get('alias') or ''
+            intro = item.get('intro') or ''
+            cleaned_cast = [_clean_name(x) for x in cast]
+            cleaned_dir  = _clean_name(director)
+
+            item_nolist = dict(item)
+            playlist = item_nolist.pop('playlist', [])
+
+            rows.append((
+                url, category, name,
+                region, _normalize_region(region),
+                _release_year(date), _release_sort_key(date),
+                item.get('update', '') or '', _best_rating(ratings),
+                '|' + '|'.join(ntypes) + '|',
+                '|' + '|'.join(item.get('类型') or []) + '|',
+                1 if '纪录片' in ntypes else 0,
+                name.lower(), alias.lower(),
+                ('\x1f'.join(item.get('类型') or [])).lower(),
+                cleaned_dir.lower(), ('\x1f'.join(cleaned_cast)).lower(), intro.lower(),
+                _norm_search(name), _norm_search(alias),
+                _norm_search(cleaned_dir), _norm_search('\x1f'.join(cleaned_cast)),
+                json.dumps(item_nolist, ensure_ascii=False),
+                json.dumps(playlist, ensure_ascii=False),
+            ))
+
+    c.executemany("INSERT OR REPLACE INTO videos VALUES (%s)" % ",".join("?"*24), rows)
+    c.execute("CREATE INDEX idx_cat_update  ON videos(category, update_sort_key)")
+    c.execute("CREATE INDEX idx_cat_release ON videos(category, release_sort_key)")
+    c.execute("CREATE INDEX idx_cat_rating  ON videos(category, best_rating)")
+    c.execute("CREATE INDEX idx_doc ON videos(has_documentary)")
+    c.execute("INSERT OR REPLACE INTO meta VALUES ('source_mtime', ?)",
+              (str(os.path.getmtime(video_file)),))
+    c.execute("INSERT OR REPLACE INTO meta VALUES ('categories', ?)",
+              (json.dumps(cat_order, ensure_ascii=False),))
+    conn.commit()
+    conn.close()
+    print(f"[OVideo] 构建完成，共 {len(rows)} 条。")
+
+def ensure_video_db():
+    """JSON 变更时自动重建（加锁，避免并发重复构建）"""
+    video_file = os.path.join(OVIDEO_DIR, 'OVideos.json')
+    if not os.path.exists(video_file):
+        return
+    src_m = str(os.path.getmtime(video_file))
+    need = False
+    if not os.path.exists(OVIDEO_DB_PATH):
+        need = True
+    else:
+        try:
+            conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=10.0)
+            r = conn.execute("SELECT value FROM meta WHERE key='source_mtime'").fetchone()
+            conn.close()
+            if not r or r[0] != src_m:
+                need = True
+        except Exception:
+            need = True
+    if need:
+        with _video_db_lock:
+            # 双重检查
+            try:
+                conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=10.0)
+                r = conn.execute("SELECT value FROM meta WHERE key='source_mtime'").fetchone()
+                conn.close()
+                if r and r[0] == src_m:
+                    return
+            except Exception:
+                pass
+            build_video_db()
+
+def _get_video_conn():
+    conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _get_valid_urls():
+    """缓存 url_mapping 的 key 集合，文件变更才重载"""
+    mapping_file = os.path.join(OVIDEO_DIR, 'url_mapping.json')
+    if not os.path.exists(mapping_file):
+        return set()
+    m = os.path.getmtime(mapping_file)
+    if _url_mapping_cache['mtime'] != m:
+        try:
+            with open(mapping_file, 'r', encoding='utf-8') as f:
+                mappings = json.load(f)
+            _url_mapping_cache['valid'] = set(mappings.keys())
+            _url_mapping_cache['mtime'] = m
+        except Exception as e:
+            print(f"url_mapping 读取失败: {e}")
+    return _url_mapping_cache['valid']
+
+def _is_vip_permanent(user_id):
+    if not user_id:
+        return False
+    try:
+        conn = sqlite3.connect(USER_DB_PATH, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("""SELECT onews_is_permanent, finance_is_permanent, prediction_is_permanent
+                              FROM users WHERE apple_user_id=?""", (user_id,)).fetchone()
+        conn.close()
+        return bool(row and (row['onews_is_permanent'] == 1
+                             or row['finance_is_permanent'] == 1
+                             or row['prediction_is_permanent'] == 1))
+    except Exception:
+        return False
+
+def _get_block_config(user_id):
+    """返回 (region_keywords, type_keywords)；VIP 或未开启时为空"""
+    region_kw, type_kw = [], []
+    rf_on = tf_on = False
+    version_file = os.path.join(BASE_RESOURCES_DIR, 'ONews', 'version.json')
+    if os.path.exists(version_file):
+        try:
+            with open(version_file, 'r', encoding='utf-8') as vf:
+                vdata = json.load(vf)
+            rf = vdata.get('video_region_filter', {}) or {}
+            rf_on = bool(rf.get('enabled', False))
+            region_kw = [k for k in rf.get('keywords', []) if k]
+            tf = vdata.get('video_type_filter', {}) or {}
+            tf_on = bool(tf.get('enabled', False))
+            type_kw = [k for k in tf.get('keywords', []) if k]
+        except Exception as e:
+            print(f"屏蔽配置读取失败: {e}")
+    if _is_vip_permanent(user_id):
+        return [], []
+    return (region_kw if rf_on else []), (type_kw if tf_on else [])
+
+def _block_where(region_kw, type_kw):
+    clauses, params = [], []
+    if region_kw:
+        clauses.append("region NOT IN (%s)" % ",".join("?" * len(region_kw)))
+        params += region_kw
+    for kw in type_kw:
+        clauses.append("raw_types NOT LIKE ?")
+        params.append(f"%{kw}%")
+    return clauses, params
+
+def _order_clause(sort):
+    if sort == 'date':   return "release_sort_key DESC"
+    if sort == 'rating': return "best_rating DESC, release_sort_key DESC"
+    return "update_sort_key DESC"
+
 # 1. 获取视频目录（保证分类顺序 Movie/Drama/Show/Anime ...）
 # 【修改】只显示在 url_mapping.json 中存在真实播放链接的剧集
 @app.route('/api/OVideo/videos', methods=['GET'])
@@ -832,6 +1104,210 @@ def resolve_ovideo_url():
         return jsonify({"error": "URL not found in mapping"}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+#  OVideo 分页 / 搜索 / 筛选 / 详情 新接口 
+
+@app.route('/api/OVideo/categories', methods=['GET'])
+def ovideo_categories():
+    ensure_video_db()
+    try:
+        conn = _get_video_conn()
+        r = conn.execute("SELECT value FROM meta WHERE key='categories'").fetchone()
+        conn.close()
+        cats = json.loads(r['value']) if r else ["Movie", "Drama", "Show", "Anime"]
+    except Exception:
+        cats = ["Movie", "Drama", "Show", "Anime"]
+    return jsonify({"categories": cats})
+
+@app.route('/api/OVideo/list', methods=['GET'])
+def ovideo_list():
+    ensure_video_db()
+    user_id = request.args.get('user_id')
+    if user_id and user_id in VIDEO_MODULE_BLOCKED_USERS:
+        return jsonify({"items": [], "has_more": False, "page": 0})
+
+    category = request.args.get('category', 'Movie')
+    sort = request.args.get('sort', 'update')
+    page = max(0, int(request.args.get('page', 0)))
+    page_size = min(60, int(request.args.get('page_size', 24)))
+
+    region_kw, type_kw = _get_block_config(user_id)
+    where, params = [], []
+    if category == 'Documentary':
+        where.append("has_documentary=1")
+    else:
+        where.append("category=?"); params.append(category)
+    bc, bp = _block_where(region_kw, type_kw)
+    where += bc; params += bp
+
+    sql = (f"SELECT item_json FROM videos WHERE {' AND '.join(where)} "
+           f"ORDER BY {_order_clause(sort)} LIMIT ? OFFSET ?")
+    params += [page_size + 1, page * page_size]
+
+    conn = _get_video_conn()
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    has_more = len(rows) > page_size
+    items = [json.loads(r['item_json']) for r in rows[:page_size]]
+    return jsonify({"items": items, "has_more": has_more, "page": page})
+
+@app.route('/api/OVideo/filter', methods=['GET'])
+def ovideo_filter():
+    ensure_video_db()
+    user_id = request.args.get('user_id')
+    if user_id and user_id in VIDEO_MODULE_BLOCKED_USERS:
+        return jsonify({"items": [], "has_more": False, "page": 0})
+
+    category = request.args.get('category')
+    f_type   = request.args.get('type')
+    f_year   = request.args.get('year')
+    f_region = request.args.get('region')
+    sort = request.args.get('sort', 'update')
+    page = max(0, int(request.args.get('page', 0)))
+    page_size = min(60, int(request.args.get('page_size', 24)))
+
+    where, params = [], []
+    if category:
+        if category == 'Documentary':
+            where.append("has_documentary=1")
+        else:
+            where.append("category=?"); params.append(category)
+    if f_type:
+        where.append("norm_types LIKE ?"); params.append(f"%|{f_type}|%")
+    if f_year:
+        try:
+            where.append("release_year=?"); params.append(int(f_year))
+        except Exception:
+            pass
+    if f_region:
+        where.append("norm_region=?"); params.append(f_region)
+
+    region_kw, type_kw = _get_block_config(user_id)
+    bc, bp = _block_where(region_kw, type_kw)
+    where += bc; params += bp
+    if not where:
+        where.append("1=1")
+
+    sql = (f"SELECT item_json FROM videos WHERE {' AND '.join(where)} "
+           f"ORDER BY {_order_clause(sort)} LIMIT ? OFFSET ?")
+    params += [page_size + 1, page * page_size]
+
+    conn = _get_video_conn()
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    has_more = len(rows) > page_size
+    items = [json.loads(r['item_json']) for r in rows[:page_size]]
+    return jsonify({"items": items, "has_more": has_more, "page": page})
+
+@app.route('/api/OVideo/filter_options', methods=['GET'])
+def ovideo_filter_options():
+    ensure_video_db()
+    user_id = request.args.get('user_id')
+    if user_id and user_id in VIDEO_MODULE_BLOCKED_USERS:
+        return jsonify({"types": [], "years": [], "regions": []})
+
+    region_kw, type_kw = _get_block_config(user_id)
+    bc, bp = _block_where(region_kw, type_kw)
+    wsql = (" WHERE " + " AND ".join(bc)) if bc else ""
+
+    conn = _get_video_conn()
+    type_set = set()
+    for r in conn.execute(f"SELECT norm_types FROM videos{wsql}", bp):
+        for t in (r['norm_types'] or '').split('|'):
+            if t and t != '纪录片':
+                type_set.add(t)
+    years = sorted({r['release_year'] for r in
+                    conn.execute(f"SELECT DISTINCT release_year FROM videos{wsql}", bp)
+                    if r['release_year'] is not None}, reverse=True)
+    regions = sorted({r['norm_region'] for r in
+                      conn.execute(f"SELECT DISTINCT norm_region FROM videos{wsql}", bp)
+                      if r['norm_region'] and r['norm_region'] != '其它'})
+    conn.close()
+    return jsonify({"types": sorted(type_set), "years": years, "regions": regions})
+
+@app.route('/api/OVideo/search2', methods=['GET'])
+def ovideo_search2():
+    ensure_video_db()
+    user_id = request.args.get('user_id')
+    if user_id and user_id in VIDEO_MODULE_BLOCKED_USERS:
+        return jsonify({"items": []})
+
+    q = request.args.get('q', '').strip().lower()
+    if not q:
+        return jsonify({"items": []})
+    qn = q.replace('·', '').replace(' ', '')
+    limit = min(300, int(request.args.get('limit', 150)))
+
+    region_kw, type_kw = _get_block_config(user_id)
+    bc, bp = _block_where(region_kw, type_kw)
+
+    like, like_n = f"%{q}%", f"%{qn}%"
+    cond = ("(name_lower LIKE ? OR name_norm LIKE ? OR alias_lower LIKE ? OR alias_norm LIKE ? "
+            "OR types_lower LIKE ? OR director_lower LIKE ? OR director_norm LIKE ? "
+            "OR cast_lower LIKE ? OR cast_norm LIKE ? OR intro_lower LIKE ?)")
+    params = [like, like_n, like, like_n, like, like, like_n, like, like_n, like]
+    where = [cond] + bc
+    params += bp
+
+    sql = (f"SELECT category, item_json, name_lower, name_norm, alias_lower, alias_norm, "
+           f"types_lower, director_lower, director_norm, cast_lower, cast_norm, intro_lower, "
+           f"release_sort_key, update_sort_key FROM videos WHERE {' AND '.join(where)}")
+    conn = _get_video_conn()
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+
+    def mp(r):
+        if q in r['name_lower'] or qn in r['name_norm']: return 0
+        if q in r['alias_lower'] or qn in r['alias_norm'] or q in r['types_lower']: return 1
+        if (q in r['director_lower'] or qn in r['director_norm']
+                or q in r['cast_lower'] or qn in r['cast_norm']): return 2
+        if q in r['intro_lower']: return 3
+        return None
+
+    cat_order = {"Movie": 0, "Drama": 1, "Show": 2, "Anime": 3}
+    scored = []
+    for r in rows:
+        p = mp(r)
+        if p is None:
+            continue
+        scored.append({"r": r, "mp": p,
+                       "rel": r['release_sort_key'] or "",
+                       "cat": cat_order.get(r['category'], 4),
+                       "upd": r['update_sort_key'] or ""})
+    # 稳定排序，从次要到主要
+    scored.sort(key=lambda x: x['upd'], reverse=True)
+    scored.sort(key=lambda x: x['cat'])
+    scored.sort(key=lambda x: x['rel'], reverse=True)
+    scored.sort(key=lambda x: x['mp'])
+    items = [json.loads(s['r']['item_json']) for s in scored[:limit]]
+    return jsonify({"items": items, "has_more": False, "page": 0})
+
+@app.route('/api/OVideo/playlist', methods=['GET'])
+def ovideo_playlist():
+    ensure_video_db()
+    url = request.args.get('url')
+    if not url:
+        return jsonify({"error": "Missing url"}), 400
+    conn = _get_video_conn()
+    row = conn.execute("SELECT playlist_json FROM videos WHERE url=?", (url,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"playlist": []})
+    raw = json.loads(row['playlist_json'] or '[]')
+    valid = _get_valid_urls()
+    filtered = []
+    for channel in raw:
+        eps, order = {}, []
+        for ep_name, ep_url in channel.get('episodes', {}).items():
+            if ep_url in valid or '.m3u8' in ep_url.lower():
+                eps[ep_name] = ep_url
+                order.append(ep_name)
+        if eps:
+            nc = dict(channel)
+            nc['episodes'] = eps
+            nc['episode_order'] = order
+            filtered.append(nc)
+    return jsonify({"playlist": filtered})
 
 # 4. 服务端搜索（可选，客户端也可以自己搜）
 @app.route('/api/OVideo/search', methods=['GET'])
@@ -2581,6 +3057,7 @@ if __name__ == '__main__':
     # 【新增】在启动时初始化数据库
     init_user_db()
     init_analytics_db()
+    ensure_video_db()        # ← 新增：启动时构建/检查 OVideo.db
     supported_apps_str = ", ".join(ALLOWED_APPS)
     print("多应用服务器正在启动...")
     print(f"支持的应用: {supported_apps_str}")

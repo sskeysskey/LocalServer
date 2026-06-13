@@ -638,6 +638,146 @@ def finance_redeem(): return handle_redeem_invite('Finance')
 OVIDEO_DIR = os.path.join(BASE_RESOURCES_DIR, 'OVideo')
 OVIDEO_COVER_DIR = os.path.join(OVIDEO_DIR, 'cover_image')
 
+# SQLite 分页接口 
+OVIDEO_DB_PATH = os.path.join(OVIDEO_DIR, 'ovideo.db')
+
+OVIDEO_ORDER_MAP = {
+    'update': "update_sort_key DESC, seq ASC",
+    'date':   "release_sort_key DESC, seq ASC",
+    'rating': "best_rating DESC, release_sort_key DESC, seq ASC",
+}
+
+
+def _ovideo_filter_keywords(user_id):
+    """返回 (region_keywords, type_keywords)，已处理 VIP（VIP 返回空，即不过滤）。"""
+    region_enabled = False
+    region_kw = []
+    type_enabled = False
+    type_kw = []
+    version_file_path = os.path.join(BASE_RESOURCES_DIR, 'ONews', 'version.json')
+    if os.path.exists(version_file_path):
+        try:
+            with open(version_file_path, 'r', encoding='utf-8') as vf:
+                vdata = json.load(vf)
+                rf = vdata.get('video_region_filter', {}) or {}
+                region_enabled = bool(rf.get('enabled', False))
+                region_kw = [k for k in rf.get('keywords', []) if k]
+                tf = vdata.get('video_type_filter', {}) or {}
+                type_enabled = bool(tf.get('enabled', False))
+                type_kw = [k for k in tf.get('keywords', []) if k]
+        except Exception as e:
+            print(f"读取屏蔽配置失败: {e}")
+
+    # 永久 VIP（redeem）跳过过滤
+    if user_id:
+        try:
+            conn = sqlite3.connect(USER_DB_PATH, timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("""SELECT onews_is_permanent, finance_is_permanent, prediction_is_permanent
+                         FROM users WHERE apple_user_id = ?""", (user_id,))
+            row = c.fetchone()
+            conn.close()
+            if row and any([row['onews_is_permanent'] == 1,
+                            row['finance_is_permanent'] == 1,
+                            row['prediction_is_permanent'] == 1]):
+                region_enabled = False
+                type_enabled = False
+        except Exception as e:
+            print(f"[OVideo] 查询用户VIP状态失败: {e}")
+
+    return (region_kw if region_enabled else []), (type_kw if type_enabled else [])
+
+
+def _ovideo_where(user_id):
+    rkw, tkw = _ovideo_filter_keywords(user_id)
+    clauses = []
+    params = []
+    if rkw:
+        clauses.append("region NOT IN (%s)" % (",".join(["?"] * len(rkw))))
+        params += rkw
+    for kw in tkw:
+        clauses.append("types_text NOT LIKE ?")
+        params.append("%" + kw + "%")
+    return clauses, params
+
+
+@app.route('/api/OVideo/categories', methods=['GET'])
+def ovideo_categories():
+    user_id = request.args.get('user_id')
+    if user_id and user_id in VIDEO_MODULE_BLOCKED_USERS:
+        return jsonify({"categories": []})
+    if not os.path.exists(OVIDEO_DB_PATH):
+        return jsonify({"error": "DB not built"}), 500
+    conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT name FROM categories ORDER BY ord ASC")
+    names = [r['name'] for r in c.fetchall()]
+    conn.close()
+    return jsonify({"categories": names})
+
+
+@app.route('/api/OVideo/list', methods=['GET'])
+def ovideo_list():
+    category = request.args.get('category')
+    if not category:
+        return jsonify({"error": "Missing category"}), 400
+    sort = request.args.get('sort', 'update')
+    if sort not in OVIDEO_ORDER_MAP:
+        sort = 'update'
+    try:
+        page = max(0, int(request.args.get('page', 0)))
+        page_size = min(max(1, int(request.args.get('page_size', 20))), 100)
+    except (TypeError, ValueError):
+        page, page_size = 0, 20
+
+    user_id = request.args.get('user_id')
+    if user_id and user_id in VIDEO_MODULE_BLOCKED_USERS:
+        return jsonify({"items": [], "has_more": False})
+    if not os.path.exists(OVIDEO_DB_PATH):
+        return jsonify({"error": "DB not built"}), 500
+
+    where, params = _ovideo_where(user_id)
+    where_sql = "WHERE category = ?"
+    if where:
+        where_sql += " AND " + " AND ".join(where)
+
+    # 多取一条用于判断 has_more，避免昂贵的 COUNT
+    sql = f"""SELECT list_json FROM videos
+              {where_sql}
+              ORDER BY {OVIDEO_ORDER_MAP[sort]}
+              LIMIT ? OFFSET ?"""
+    q = [category] + params + [page_size + 1, page * page_size]
+
+    conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=30.0)
+    c = conn.cursor()
+    rows = c.execute(sql, q).fetchall()
+    conn.close()
+
+    has_more = len(rows) > page_size
+    rows = rows[:page_size]
+    items = [json.loads(r[0]) for r in rows]
+    return jsonify({"items": items, "has_more": has_more})
+
+@app.route('/api/OVideo/detail', methods=['GET'])
+def ovideo_detail():
+    url = request.args.get('url')
+    if not url:
+        return jsonify({"error": "Missing url"}), 400
+    user_id = request.args.get('user_id')
+    if user_id and user_id in VIDEO_MODULE_BLOCKED_USERS:
+        return jsonify({"playlist": []})
+    if not os.path.exists(OVIDEO_DB_PATH):
+        return jsonify({"error": "DB not built"}), 500
+    conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=30.0)
+    c = conn.cursor()
+    row = c.execute("SELECT detail_json FROM videos WHERE url = ? LIMIT 1", (url,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"playlist": []})
+    return jsonify(json.loads(row[0]))   # detail_json 本身就是 {"playlist":[...]}
+
 # 1. 获取视频目录（保证分类顺序 Movie/Drama/Show/Anime ...）
 # 【修改】只显示在 url_mapping.json 中存在真实播放链接的剧集
 @app.route('/api/OVideo/videos', methods=['GET'])

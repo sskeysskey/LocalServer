@@ -736,6 +736,16 @@ def build_video_db():
     with open(video_file, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
+    # ⭐ 新增：读取黑名单 key 集合，用于判断「Movie 全部 episode 失效」
+    blacklist_file = os.path.join(OVIDEO_DIR, 'blacklist_url.json')
+    blacklist_set = set()
+    if os.path.exists(blacklist_file):
+        try:
+            with open(blacklist_file, 'r', encoding='utf-8') as bf:
+                blacklist_set = set(json.load(bf).keys())
+        except Exception as e:
+            print(f"[OVideo] 黑名单读取失败: {e}")
+
     conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=60.0)
     c = conn.cursor()
     c.execute("DROP TABLE IF EXISTS videos")
@@ -750,7 +760,8 @@ def build_video_db():
             name_lower TEXT, alias_lower TEXT, types_lower TEXT,
             director_lower TEXT, cast_lower TEXT, intro_lower TEXT,
             name_norm TEXT, alias_norm TEXT, director_norm TEXT, cast_norm TEXT,
-            item_json TEXT, playlist_json TEXT
+            item_json TEXT, playlist_json TEXT,
+            hide_blacklisted INTEGER DEFAULT 0
         )
     ''')
     c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
@@ -777,6 +788,20 @@ def build_video_db():
             item_nolist = dict(item)
             playlist = item_nolist.pop('playlist', [])
 
+            # ⭐ 新增：仅针对 Movie 大类，若 playlist 中「所有」episode 的 url
+            #    都存在于黑名单中，则标记隐藏（hide_blacklisted=1）。
+            #    只要有任意一个 url 不在黑名单里（哪怕它也不在 mapping 里），
+            #    就保留显示（详情页仍走原有「洽谈中」逻辑）。
+            hide_blacklisted = 0
+            if category == 'Movie' and blacklist_set:
+                all_ep_urls = []
+                for ch in playlist:
+                    for ep_url in (ch.get('episodes') or {}).values():
+                        all_ep_urls.append(ep_url)
+                # 必须存在至少一个 episode，且全部命中黑名单才隐藏
+                if all_ep_urls and all(u in blacklist_set for u in all_ep_urls):
+                    hide_blacklisted = 1
+
             rows.append((
                 url, category, name,
                 region, _normalize_region(region),
@@ -792,15 +817,21 @@ def build_video_db():
                 _norm_search(cleaned_dir), _norm_search('\x1f'.join(cleaned_cast)),
                 json.dumps(item_nolist, ensure_ascii=False),
                 json.dumps(playlist, ensure_ascii=False),
+                hide_blacklisted,
             ))
 
-    c.executemany("INSERT OR REPLACE INTO videos VALUES (%s)" % ",".join("?"*24), rows)
+    # ⭐ 列数从 24 改为 25
+    c.executemany("INSERT OR REPLACE INTO videos VALUES (%s)" % ",".join("?"*25), rows)
     c.execute("CREATE INDEX idx_cat_update  ON videos(category, update_sort_key)")
     c.execute("CREATE INDEX idx_cat_release ON videos(category, release_sort_key)")
     c.execute("CREATE INDEX idx_cat_rating  ON videos(category, best_rating)")
     c.execute("CREATE INDEX idx_doc ON videos(has_documentary)")
+    c.execute("CREATE INDEX idx_hide ON videos(hide_blacklisted)")   # ⭐ 新增
     c.execute("INSERT OR REPLACE INTO meta VALUES ('source_mtime', ?)",
               (str(os.path.getmtime(video_file)),))
+    # ⭐ 新增：记录黑名单文件 mtime，用于黑名单变化时自动重建
+    c.execute("INSERT OR REPLACE INTO meta VALUES ('blacklist_mtime', ?)",
+              (str(os.path.getmtime(blacklist_file)) if os.path.exists(blacklist_file) else "0",))
     c.execute("INSERT OR REPLACE INTO meta VALUES ('categories', ?)",
               (json.dumps(cat_order, ensure_ascii=False),))
     conn.commit()
@@ -808,20 +839,28 @@ def build_video_db():
     print(f"[OVideo] 构建完成，共 {len(rows)} 条。")
 
 def ensure_video_db():
-    """JSON 变更时自动重建（加锁，避免并发重复构建）"""
+    """JSON 或 黑名单 变更时自动重建（加锁，避免并发重复构建）"""
     video_file = os.path.join(OVIDEO_DIR, 'OVideos.json')
     if not os.path.exists(video_file):
         return
     src_m = str(os.path.getmtime(video_file))
+
+    # ⭐ 新增：黑名单文件 mtime
+    blacklist_file = os.path.join(OVIDEO_DIR, 'blacklist_url.json')
+    bl_m = str(os.path.getmtime(blacklist_file)) if os.path.exists(blacklist_file) else "0"
+
     need = False
     if not os.path.exists(OVIDEO_DB_PATH):
         need = True
     else:
         try:
             conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=10.0)
-            r = conn.execute("SELECT value FROM meta WHERE key='source_mtime'").fetchone()
+            r  = conn.execute("SELECT value FROM meta WHERE key='source_mtime'").fetchone()
+            r2 = conn.execute("SELECT value FROM meta WHERE key='blacklist_mtime'").fetchone()
             conn.close()
             if not r or r[0] != src_m:
+                need = True
+            if not r2 or r2[0] != bl_m:   # ⭐ 黑名单变了也要重建
                 need = True
         except Exception:
             need = True
@@ -830,9 +869,10 @@ def ensure_video_db():
             # 双重检查
             try:
                 conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=10.0)
-                r = conn.execute("SELECT value FROM meta WHERE key='source_mtime'").fetchone()
+                r  = conn.execute("SELECT value FROM meta WHERE key='source_mtime'").fetchone()
+                r2 = conn.execute("SELECT value FROM meta WHERE key='blacklist_mtime'").fetchone()
                 conn.close()
-                if r and r[0] == src_m:
+                if r and r[0] == src_m and r2 and r2[0] == bl_m:
                     return
             except Exception:
                 pass
@@ -1137,6 +1177,7 @@ def ovideo_list():
         where.append("has_documentary=1")
     else:
         where.append("category=?"); params.append(category)
+    where.append("hide_blacklisted=0")   # ⭐ 新增：过滤掉全黑名单的 Movie
     bc, bp = _block_where(region_kw, type_kw)
     where += bc; params += bp
 
@@ -1182,6 +1223,8 @@ def ovideo_filter():
     if f_region:
         where.append("norm_region=?"); params.append(f_region)
 
+    where.append("hide_blacklisted=0")   # ⭐ 新增
+
     region_kw, type_kw = _get_block_config(user_id)
     bc, bp = _block_where(region_kw, type_kw)
     where += bc; params += bp
@@ -1208,7 +1251,8 @@ def ovideo_filter_options():
 
     region_kw, type_kw = _get_block_config(user_id)
     bc, bp = _block_where(region_kw, type_kw)
-    wsql = (" WHERE " + " AND ".join(bc)) if bc else ""
+    clauses = ["hide_blacklisted=0"] + bc   # ⭐ 新增
+    wsql = " WHERE " + " AND ".join(clauses)
 
     conn = _get_video_conn()
     type_set = set()
@@ -1246,7 +1290,7 @@ def ovideo_search2():
             "OR types_lower LIKE ? OR director_lower LIKE ? OR director_norm LIKE ? "
             "OR cast_lower LIKE ? OR cast_norm LIKE ? OR intro_lower LIKE ?)")
     params = [like, like_n, like, like_n, like, like, like_n, like, like_n, like]
-    where = [cond] + bc
+    where = [cond, "hide_blacklisted=0"] + bc   # ⭐ 新增 hide_blacklisted=0
     params += bp
 
     sql = (f"SELECT category, item_json, name_lower, name_norm, alias_lower, alias_norm, "
@@ -1274,7 +1318,6 @@ def ovideo_search2():
                        "rel": r['release_sort_key'] or "",
                        "cat": cat_order.get(r['category'], 4),
                        "upd": r['update_sort_key'] or ""})
-    # 稳定排序，从次要到主要
     scored.sort(key=lambda x: x['upd'], reverse=True)
     scored.sort(key=lambda x: x['cat'])
     scored.sort(key=lambda x: x['rel'], reverse=True)

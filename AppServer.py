@@ -38,6 +38,7 @@ ALLOWED_EVENT_TYPES = {'play', 'download_complete'}
 ALLOWED_NEWS_EVENT_TYPES = {'view', 'listen'}
 ALLOWED_REPORT_TYPES = {'playback_failed', 'download_failed', 'media_error', 'content_mismatch', 'other'}
 report_last_time = {}  # 内存软限流: user_id -> 最近提交时间戳
+wish_last_time = {}   # 内存软限流: user_id -> 最近提交时间戳
 
 # 【新增】用户数据库路径
 USER_DB_PATH = os.path.join(PARENT_DIR, 'user_data.db')
@@ -307,6 +308,28 @@ def init_analytics_db():
         c.execute("ALTER TABLE user_video_events ADD COLUMN user_type TEXT DEFAULT 'apple'")
     except sqlite3.OperationalError:
         pass
+    
+    # 【新增】用户寻片/许愿请求表（含第二阶段的管理员回复字段）
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS video_wish_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            user_type TEXT DEFAULT 'apple',
+            keyword TEXT,                 -- 用户当时搜索的关键词
+            wish_content TEXT NOT NULL,   -- 用户想看的剧集名称等
+            app_version TEXT,
+            first_at TIMESTAMP NOT NULL,
+            last_at TIMESTAMP NOT NULL,
+            count INTEGER DEFAULT 1,
+            status TEXT DEFAULT 'pending',      -- pending / resolved
+            admin_reply TEXT,                   -- 第二阶段：管理员回复内容
+            reply_status TEXT DEFAULT 'none',   -- none / unread / read
+            replied_at TIMESTAMP,
+            UNIQUE(user_id, wish_content)
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_wish_status ON video_wish_requests(status)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_wish_reply ON video_wish_requests(user_id, reply_status)')
     
     conn.commit()
     conn.close()
@@ -1440,6 +1463,83 @@ def report_video_link():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+@app.route('/api/OVideo/wish', methods=['POST'])
+def submit_video_wish():
+    try:
+        import time
+        data = request.get_json() or {}
+        user_id      = data.get('user_id')
+        wish_content = (data.get('wish_content', '') or '').strip()[:200]
+        if not user_id or not wish_content:
+            return jsonify({"error": "Invalid params"}), 400
+
+        # 软限流：同一用户 10 秒内不可重复提交
+        now_ts = time.time()
+        if now_ts - wish_last_time.get(user_id, 0) < 10:
+            return jsonify({"error": "Too frequent"}), 429
+        wish_last_time[user_id] = now_ts
+
+        user_type   = data.get('user_type', 'apple')
+        keyword     = (data.get('keyword', '') or '')[:100]
+        app_version = data.get('app_version', '')
+        now = now_iso()
+
+        conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO video_wish_requests
+                (user_id, user_type, keyword, wish_content, app_version,
+                 first_at, last_at, count, status, reply_status)
+            VALUES (?,?,?,?,?,?,?,1,'pending','none')
+            ON CONFLICT(user_id, wish_content)
+            DO UPDATE SET last_at=?, count=count+1, status='pending',
+                          keyword=excluded.keyword
+        ''', (user_id, user_type, keyword, wish_content, app_version, now, now, now))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+# 【第二阶段】客户端拉取“我的未读回复”
+@app.route('/api/OVideo/wish/my_replies', methods=['GET'])
+def get_my_wish_replies():
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return jsonify({"replies": []})
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute('''
+            SELECT id, wish_content, admin_reply, replied_at
+            FROM video_wish_requests
+            WHERE user_id=? AND reply_status='unread'
+              AND admin_reply IS NOT NULL AND admin_reply != ''
+            ORDER BY replied_at DESC
+        ''', (user_id,)).fetchall()
+        return jsonify({"replies": [dict(r) for r in rows]})
+    finally:
+        conn.close()
+
+
+# 【第二阶段】客户端标记回复已读
+@app.route('/api/OVideo/wish/ack_reply', methods=['POST'])
+def ack_wish_reply():
+    data = request.get_json() or {}
+    user_id  = data.get('user_id')
+    reply_id = data.get('id')
+    if not user_id or not reply_id:
+        return jsonify({"error": "Invalid params"}), 400
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    c = conn.cursor()
+    c.execute("UPDATE video_wish_requests SET reply_status='read' WHERE id=? AND user_id=?",
+              (reply_id, user_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
     
 @app.route('/api/OVideo/track', methods=['POST'])
 def track_event():
@@ -1607,6 +1707,45 @@ def admin_resolve_report():
     conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
     c = conn.cursor()
     c.execute("UPDATE video_link_reports SET status='resolved' WHERE episode_url=?", (episode_url,))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "success"})
+
+# 用户寻片请求列表（按状态过滤）
+@app.route('/admin/api/video_wishes', methods=['GET'])
+@require_admin
+def admin_video_wishes():
+    status = request.args.get('status', 'pending')   # pending / all
+    where = "WHERE status='pending'" if status == 'pending' else ""
+    sql = f'''
+        SELECT id, user_id, user_type, keyword, wish_content, app_version,
+               count, first_at, last_at, status, admin_reply, reply_status
+        FROM video_wish_requests
+        {where}
+        ORDER BY (status='pending') DESC, last_at DESC
+        LIMIT 200
+    '''
+    return jsonify(_query_analytics(sql))
+
+
+# 处理寻片请求（reply 留空=仅标记已处理；填写=第二阶段回复用户）
+@app.route('/admin/api/resolve_wish', methods=['POST'])
+@require_admin
+def admin_resolve_wish():
+    data = request.get_json() or {}
+    wish_id = data.get('id')
+    reply   = (data.get('reply', '') or '').strip()[:500]
+    if not wish_id:
+        return jsonify({"error": "Missing id"}), 400
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    c = conn.cursor()
+    now = now_iso()
+    if reply:
+        c.execute('''UPDATE video_wish_requests
+                     SET status='resolved', admin_reply=?, reply_status='unread', replied_at=?
+                     WHERE id=?''', (reply, now, wish_id))
+    else:
+        c.execute("UPDATE video_wish_requests SET status='resolved' WHERE id=?", (wish_id,))
     conn.commit()
     conn.close()
     return jsonify({"status": "success"})
@@ -2267,6 +2406,7 @@ def admin_clear_db():
             c.execute("DELETE FROM user_news_events")
             c.execute("DELETE FROM news_event_logs")
             c.execute("DELETE FROM video_link_reports")
+            c.execute("DELETE FROM video_wish_requests")   # 【新增】
             conn.commit()
             conn.close()
             
@@ -2426,6 +2566,22 @@ ADMIN_HTML = r'''
         <tbody id="reportBody"></tbody>
       </table>
     </div>
+    <!-- 用户寻片请求 -->
+    <div class="panel" style="margin-bottom:24px">
+      <h3>🙋 用户寻片请求
+        <span class="tabs">
+          <span class="tab active" onclick="switchWishStatus(this,'pending')">待处理</span>
+          <span class="tab" onclick="switchWishStatus(this,'all')">全部</span>
+        </span>
+      </h3>
+      <table>
+        <thead><tr>
+          <th>#</th><th>想看的内容</th><th>搜索词</th><th>用户ID</th>
+          <th>次数</th><th>提交时间</th><th>状态</th><th>操作</th>
+        </tr></thead>
+        <tbody id="wishBody"></tbody>
+      </table>
+    </div>
     <div class="row">
       <div class="panel">
         <h3>
@@ -2573,6 +2729,75 @@ let newsUserSortOrder = 'desc';            // 默认降序
 let cachedVideoUsers = [];
 let videoUserSortField = 'total_actions';  // 默认按总操作数
 let videoUserSortOrder = 'desc';
+let wishStatus = 'pending';
+let pendingWishId = null;
+
+async function loadVideoWishes(){
+  const data = await api(`/admin/api/video_wishes?status=${wishStatus}`);
+  if(!data) return;
+  document.getElementById('wishBody').innerHTML = data.length===0
+    ? '<tr><td colspan="8" style="text-align:center;color:#64748b">暂无请求</td></tr>'
+    : data.map((r,i)=>{
+        const isDevice = (r.user_type==='device') || (r.user_id||'').startsWith('dev_');
+        const idLabel = isDevice ? 'device' : 'apple';
+        let stateBadge;
+        if(r.reply_status==='unread')      stateBadge = '<span class="pill pill-orange">已回复·待读</span>';
+        else if(r.reply_status==='read')   stateBadge = '<span class="pill pill-green">已读</span>';
+        else if(r.status==='resolved')     stateBadge = '<span class="pill pill-blue">已处理</span>';
+        else                               stateBadge = '<span class="pill pill-purple">待处理</span>';
+
+        const safeContent = (r.wish_content||'').replace(/'/g,"\\'").replace(/"/g,'&quot;');
+        const actionBtn = r.status==='pending'
+          ? `<span class="clickable" onclick="openWishReply(${r.id}, '${safeContent}')">✓ 处理/回复</span>`
+          : '<span style="color:#64748b">-</span>';
+        const replyLine = r.admin_reply
+          ? `<br><span style="font-size:11px;color:#86efac">↳ 回复: ${r.admin_reply}</span>` : '';
+
+        return `<tr>
+          <td>${i+1}</td>
+          <td><strong>${r.wish_content||''}</strong>${replyLine}</td>
+          <td><span style="font-size:12px;color:#94a3b8">${r.keyword||'-'}</span></td>
+          <td><span class="pill ${isDevice?'pill-purple':'pill-blue'}">${idLabel}</span><br>
+              <span style="font-family:monospace;font-size:10px">${(r.user_id||'').substring(0,16)}...</span></td>
+          <td>${r.count}</td>
+          <td style="color:#94a3b8;font-size:12px">${(r.last_at||'').replace('T',' ').substring(0,16)}</td>
+          <td>${stateBadge}</td>
+          <td>${actionBtn}</td>
+        </tr>`;
+      }).join('');
+}
+
+function switchWishStatus(el,s){
+  el.parentNode.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  el.classList.add('active'); wishStatus=s; loadVideoWishes();
+}
+
+// 复用全局 modal：弹出含回复输入框的处理框
+function openWishReply(id, content){
+  pendingWishId = id;
+  document.getElementById('modalTitle').innerText = "💬 处理寻片请求";
+  document.getElementById('modalMsg').innerHTML = `
+    <div style="text-align:left">
+      <p style="margin-bottom:8px">用户想看：<strong style="color:#60a5fa">${content}</strong></p>
+      <p style="font-size:12px;color:#94a3b8;margin-bottom:8px">
+        可填写回复留言（用户下次打开 App 会在首页收到；留空则仅标记“已处理”）：</p>
+      <textarea id="wishReplyInput" rows="3"
+        style="width:100%;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:10px;font-size:14px;"
+        placeholder="例如：视频已找到，请享用 / 该剧下月上线"></textarea>
+    </div>`;
+  const btn = document.getElementById('modalConfirmBtn');
+  btn.innerText = "提交并标记已处理";
+  btn.onclick = submitWishReply;
+  document.getElementById('confirmModal').style.display = 'flex';
+}
+
+async function submitWishReply(){
+  const el = document.getElementById('wishReplyInput');
+  const reply = el ? el.value : '';
+  const r = await api('/admin/api/resolve_wish','POST',{ id: pendingWishId, reply: reply });
+  closeModal();
+  if(r && r.status==='success') loadVideoWishes();
+}
 
 async function loadVideoReports(){
   const data = await api(`/admin/api/video_reports?status=${reportStatus}`);
@@ -2666,6 +2891,7 @@ async function loadVideoModule(){
   loadTopVideos('download_complete', dlPeriod);
   loadTopUsers();
   loadVideoReports();
+  loadVideoWishes();          // 【新增】
 }
 
 async function loadVideoOverview(){

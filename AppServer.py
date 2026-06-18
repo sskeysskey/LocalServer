@@ -1157,6 +1157,8 @@ def ovideo_categories():
         cats = json.loads(r['value']) if r else ["Movie", "Drama", "Show", "Anime"]
     except Exception:
         cats = ["Movie", "Drama", "Show", "Anime"]
+    # ⭐ 需求1：把“精选”置顶，作为默认页
+    cats = ["Featured"] + [c for c in cats if c != "Featured"]
     return jsonify({"categories": cats})
 
 @app.route('/api/OVideo/list', methods=['GET'])
@@ -1173,15 +1175,21 @@ def ovideo_list():
 
     region_kw, type_kw = _get_block_config(user_id)
     where, params = [], []
-    if category == 'Documentary':
+
+    # ⭐ 需求1：Featured 不按分类过滤，混合全部
+    if category == 'Featured':
+        pass
+    elif category == 'Documentary':
         where.append("has_documentary=1")
     else:
         where.append("category=?"); params.append(category)
-    where.append("hide_blacklisted=0")   # ⭐ 新增：过滤掉全黑名单的 Movie
+
+    where.append("hide_blacklisted=0")
     bc, bp = _block_where(region_kw, type_kw)
     where += bc; params += bp
 
-    sql = (f"SELECT item_json FROM videos WHERE {' AND '.join(where)} "
+    # ⭐ 需求3：把 category 一起查出来，注入到每个 item
+    sql = (f"SELECT category, item_json FROM videos WHERE {' AND '.join(where)} "
            f"ORDER BY {_order_clause(sort)} LIMIT ? OFFSET ?")
     params += [page_size + 1, page * page_size]
 
@@ -1189,7 +1197,11 @@ def ovideo_list():
     rows = conn.execute(sql, params).fetchall()
     conn.close()
     has_more = len(rows) > page_size
-    items = [json.loads(r['item_json']) for r in rows[:page_size]]
+    items = []
+    for r in rows[:page_size]:
+        it = json.loads(r['item_json'])
+        it['category'] = r['category']   # ⭐ 注入真实分类
+        items.append(it)
     return jsonify({"items": items, "has_more": has_more, "page": page})
 
 @app.route('/api/OVideo/filter', methods=['GET'])

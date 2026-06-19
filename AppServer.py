@@ -275,7 +275,18 @@ def init_analytics_db():
     ''')
     c.execute('CREATE INDEX IF NOT EXISTS idx_unlock_user_date ON video_free_unlocks(user_id, unlock_date)')
     
-    #【新增】错误链接举报表
+    # 【新增】给举报表补充回复字段（兼容老库）
+    for ddl in [
+        "ALTER TABLE video_link_reports ADD COLUMN admin_reply TEXT",
+        "ALTER TABLE video_link_reports ADD COLUMN reply_status TEXT DEFAULT 'none'",
+        "ALTER TABLE video_link_reports ADD COLUMN replied_at TIMESTAMP",
+    ]:
+        try:
+            c.execute(ddl)
+        except sqlite3.OperationalError:
+            pass
+        
+    #【新增】错误链接举报表（补充回复字段，与 wish 一致）
     c.execute('''
         CREATE TABLE IF NOT EXISTS video_link_reports (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -293,11 +304,15 @@ def init_analytics_db():
             last_at TIMESTAMP NOT NULL,
             count INTEGER DEFAULT 1,
             status TEXT DEFAULT 'pending',
+            admin_reply TEXT,
+            reply_status TEXT DEFAULT 'none',
+            replied_at TIMESTAMP,
             UNIQUE(user_id, episode_url, report_type)
         )
     ''')
     c.execute('CREATE INDEX IF NOT EXISTS idx_reports_status ON video_link_reports(status)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_reports_ep ON video_link_reports(episode_url)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_reports_reply ON video_link_reports(user_id, reply_status)')
 
     # 【新增】给视频统计表补充 user_type 字段（兼容老库）
     try:
@@ -1540,6 +1555,43 @@ def ack_wish_reply():
     conn.commit()
     conn.close()
     return jsonify({"status": "ok"})
+
+# 【新增】客户端拉取"我的举报未读回复"
+@app.route('/api/OVideo/report/my_replies', methods=['GET'])
+def get_my_report_replies():
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return jsonify({"replies": []})
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute('''
+            SELECT id, video_title, episode_name, admin_reply, replied_at
+            FROM video_link_reports
+            WHERE user_id=? AND reply_status='unread'
+              AND admin_reply IS NOT NULL AND admin_reply != ''
+            ORDER BY replied_at DESC
+        ''', (user_id,)).fetchall()
+        return jsonify({"replies": [dict(r) for r in rows]})
+    finally:
+        conn.close()
+
+
+# 【新增】客户端标记举报回复已读
+@app.route('/api/OVideo/report/ack_reply', methods=['POST'])
+def ack_report_reply():
+    data = request.get_json() or {}
+    user_id  = data.get('user_id')
+    reply_id = data.get('id')
+    if not user_id or not reply_id:
+        return jsonify({"error": "Invalid params"}), 400
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    c = conn.cursor()
+    c.execute("UPDATE video_link_reports SET reply_status='read' WHERE id=? AND user_id=?",
+              (reply_id, user_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
     
 @app.route('/api/OVideo/track', methods=['POST'])
 def track_event():
@@ -1687,7 +1739,9 @@ def admin_video_reports():
                COUNT(DISTINCT user_id) AS unique_users,
                SUM(count) AS total_count,
                MAX(last_at) AS last_at,
-               GROUP_CONCAT(DISTINCT NULLIF(note,'')) AS notes
+               GROUP_CONCAT(DISTINCT NULLIF(note,'')) AS notes,
+               MAX(admin_reply) AS admin_reply,
+               MAX(reply_status) AS reply_status
         FROM video_link_reports
         {where}
         GROUP BY episode_url, report_type
@@ -1696,17 +1750,24 @@ def admin_video_reports():
     '''
     return jsonify(_query_analytics(sql))
 
-# 标记某条举报为已处理
+# 处理某条举报（reply 留空=仅标记已处理；填写=回复举报该集的所有用户）
 @app.route('/admin/api/resolve_report', methods=['POST'])
 @require_admin
 def admin_resolve_report():
     data = request.get_json() or {}
     episode_url = data.get('episode_url')
+    reply = (data.get('reply', '') or '').strip()[:500]
     if not episode_url:
         return jsonify({"error": "Missing episode_url"}), 400
     conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
     c = conn.cursor()
-    c.execute("UPDATE video_link_reports SET status='resolved' WHERE episode_url=?", (episode_url,))
+    now = now_iso()
+    if reply:
+        c.execute('''UPDATE video_link_reports
+                     SET status='resolved', admin_reply=?, reply_status='unread', replied_at=?
+                     WHERE episode_url=?''', (reply, now, episode_url))
+    else:
+        c.execute("UPDATE video_link_reports SET status='resolved' WHERE episode_url=?", (episode_url,))
     conn.commit()
     conn.close()
     return jsonify({"status": "success"})
@@ -2731,6 +2792,7 @@ let videoUserSortField = 'total_actions';  // 默认按总操作数
 let videoUserSortOrder = 'desc';
 let wishStatus = 'pending';
 let pendingWishId = null;
+let pendingReportEpisodeUrl = null;
 
 async function loadVideoWishes(){
   const data = await api(`/admin/api/video_wishes?status=${wishStatus}`);
@@ -2806,23 +2868,34 @@ async function loadVideoReports(){
     ? '<tr><td colspan="9" style="text-align:center;color:#64748b">暂无举报</td></tr>'
     : data.map((r,i)=>{
         const typeName = REPORT_TYPE_MAP[r.report_type] || r.report_type;
-        // 1. 提取播放源线路和集数
         const channel = r.channel_name ? `<span class="pill pill-blue">${r.channel_name}</span>` : '<span style="color:#64748b">-</span>';
         const episode = r.episode_name ? `<span class="pill pill-purple">${r.episode_name}</span>` : '<span style="color:#64748b">-</span>';
         const realLink = r.real_url
           ? `<a href="${r.real_url}" target="_blank" style="color:#60a5fa">打开</a>` : '-';
-        const noteTip = r.notes ? ` title="${(r.notes||'').replace(/"/g,'')}"` : '';
+
+        // 【优化2】补充说明(note)显眼展示
+        const noteLine = r.notes
+          ? `<br><span style="font-size:11px;color:#fdba74">📝 ${r.notes}</span>` : '';
+        // 回复内容回显
+        const replyLine = r.admin_reply
+          ? `<br><span style="font-size:11px;color:#86efac">↳ 回复: ${r.admin_reply}</span>` : '';
+        // 回复状态徽标
+        let stateBadge = '';
+        if(r.reply_status==='unread')    stateBadge = ' <span class="pill pill-orange">已回复·待读</span>';
+        else if(r.reply_status==='read') stateBadge = ' <span class="pill pill-green">已读</span>';
+
+        const safeTitle = (r.video_title||'').replace(/'/g,"\\'").replace(/"/g,'&quot;');
         return `<tr>
           <td>${i+1}</td>
-          <td${noteTip}><strong>${r.video_title||'(未知)'}</strong><br>
+          <td><strong>${r.video_title||'(未知)'}</strong>${noteLine}${replyLine}<br>
               <span style="font-size:11px;color:#64748b">${(r.episode_url||'').substring(0,48)}</span></td>
           <td>${channel}</td>
           <td>${episode}</td>
-          <td><span class="pill pill-orange">${typeName}</span></td>
+          <td><span class="pill pill-orange">${typeName}</span>${stateBadge}</td>
           <td><span class="pill pill-green">${r.unique_users}</span></td>
           <td>${r.total_count}</td>
           <td>${realLink}</td>
-          <td><span class="clickable" onclick="resolveReport('${encodeURIComponent(r.episode_url)}')">✓ 处理</span></td>
+          <td><span class="clickable" onclick="openReportReply('${encodeURIComponent(r.episode_url)}', '${safeTitle}')">✓ 处理/回复</span></td>
         </tr>`;
       }).join('');
 }
@@ -2832,9 +2905,31 @@ function switchReportStatus(el,s){
   el.classList.add('active'); reportStatus=s; loadVideoReports();
 }
 
-async function resolveReport(epEnc){
-  const ep = decodeURIComponent(epEnc);
-  const r = await api('/admin/api/resolve_report','POST',{episode_url:ep});
+// 弹出含回复输入框的处理框（举报）
+function openReportReply(epEnc, title){
+  pendingReportEpisodeUrl = decodeURIComponent(epEnc);
+  document.getElementById('modalTitle').innerText = "💬 处理举报";
+  document.getElementById('modalMsg').innerHTML = `
+    <div style="text-align:left">
+      <p style="margin-bottom:8px">视频：<strong style="color:#60a5fa">${title}</strong></p>
+      <p style="font-size:12px;color:#94a3b8;margin-bottom:8px">
+        可填写回复留言（举报该集的用户下次打开 App 会在首页收到；留空则仅标记"已处理"）：</p>
+      <textarea id="reportReplyInput" rows="3"
+        style="width:100%;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:10px;font-size:14px;"
+        placeholder="例如：链接已修复，请重试 / 已更换播放源"></textarea>
+    </div>`;
+  const btn = document.getElementById('modalConfirmBtn');
+  btn.innerText = "提交并标记已处理";
+  btn.onclick = submitReportReply;
+  document.getElementById('confirmModal').style.display = 'flex';
+}
+
+async function submitReportReply(){
+  const el = document.getElementById('reportReplyInput');
+  const reply = el ? el.value : '';
+  const r = await api('/admin/api/resolve_report','POST',
+                      { episode_url: pendingReportEpisodeUrl, reply: reply });
+  closeModal();
   if(r && r.status==='success') loadVideoReports();
 }
 

@@ -4,6 +4,7 @@ import threading
 import json
 import sqlite3
 import traceback
+from difflib import SequenceMatcher
 from flask import Flask, jsonify, send_from_directory, request, g
 from flask_cors import CORS
 from flask_compress import Compress
@@ -744,6 +745,36 @@ def _clean_name(raw):
 def _norm_search(text):
     return (text or "").lower().replace('·', '').replace(' ', '')
 
+def _char_overlap_ratio(query_set, text):
+    """query 字符集在 text 中出现的比例。
+       作为昂贵相似度计算前的廉价预过滤，重叠太低直接跳过。"""
+    if not query_set or not text:
+        return 0.0
+    inter = sum(1 for ch in query_set if ch in text)
+    return inter / len(query_set)
+
+def _fuzzy_best_score(query, text):
+    """query 对 text 的最佳模糊匹配分数(0~1)。
+       兼顾「整体相似度」与「局部滑窗相似度」：
+       - 整体：处理「整条标题打错一两个字」(我的王氏死对头 vs 我的王室死对头)
+       - 滑窗：处理「输入是标题的一部分且还打错字」(王氏死对头 vs 我的王室死对头)"""
+    if not query or not text:
+        return 0.0
+    if query in text:
+        return 1.0
+    whole = SequenceMatcher(None, query, text).ratio()
+    lq, lt = len(query), len(text)
+    best_local = 0.0
+    if lt > lq:
+        for i in range(0, lt - lq + 1):
+            seg = text[i:i + lq]
+            s = SequenceMatcher(None, query, seg).ratio()
+            if s > best_local:
+                best_local = s
+                if best_local >= 0.99:
+                    break
+    return max(whole, best_local)
+
 def _release_sort_key(date):
     if not date: return ""
     return date.split('(')[0]
@@ -1335,44 +1366,101 @@ def ovideo_search2():
     region_kw, type_kw = _get_block_config(user_id)
     bc, bp = _block_where(region_kw, type_kw)
 
+    # 公共过滤条件（黑名单隐藏 + 地区/类型屏蔽）
+    base_where = ["hide_blacklisted=0"] + bc
+    base_params = list(bp)
+
+    cat_order = {"Movie": 0, "Drama": 1, "Show": 2, "Anime": 3}
+    conn = _get_video_conn()
+
+    # ---------- 阶段 1：精确子串匹配（快路径，走 LIKE） ----------
     like, like_n = f"%{q}%", f"%{qn}%"
     cond = ("(name_lower LIKE ? OR name_norm LIKE ? OR alias_lower LIKE ? OR alias_norm LIKE ? "
             "OR types_lower LIKE ? OR director_lower LIKE ? OR director_norm LIKE ? "
             "OR cast_lower LIKE ? OR cast_norm LIKE ? OR intro_lower LIKE ?)")
-    params = [like, like_n, like, like_n, like, like, like_n, like, like_n, like]
-    where = [cond, "hide_blacklisted=0"] + bc   # ⭐ 新增 hide_blacklisted=0
-    params += bp
+    exact_params = [like, like_n, like, like_n, like, like, like_n, like, like_n, like]
+    where1 = [cond] + base_where
+    sql1 = (f"SELECT url, category, item_json, name_lower, name_norm, alias_lower, alias_norm, "
+            f"types_lower, director_lower, director_norm, cast_lower, cast_norm, intro_lower, "
+            f"release_sort_key, update_sort_key FROM videos WHERE {' AND '.join(where1)}")
+    exact_rows = conn.execute(sql1, exact_params + base_params).fetchall()
 
-    sql = (f"SELECT category, item_json, name_lower, name_norm, alias_lower, alias_norm, "
-           f"types_lower, director_lower, director_norm, cast_lower, cast_norm, intro_lower, "
-           f"release_sort_key, update_sort_key FROM videos WHERE {' AND '.join(where)}")
-    conn = _get_video_conn()
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
-
-    def mp(r):
+    def exact_priority(r):
         if q in r['name_lower'] or qn in r['name_norm']: return 0
         if q in r['alias_lower'] or qn in r['alias_norm'] or q in r['types_lower']: return 1
         if (q in r['director_lower'] or qn in r['director_norm']
                 or q in r['cast_lower'] or qn in r['cast_norm']): return 2
         if q in r['intro_lower']: return 3
-        return None
+        return 4
 
-    cat_order = {"Movie": 0, "Drama": 1, "Show": 2, "Anime": 3}
-    scored = []
-    for r in rows:
-        p = mp(r)
-        if p is None:
-            continue
-        scored.append({"r": r, "mp": p,
-                       "rel": r['release_sort_key'] or "",
-                       "cat": cat_order.get(r['category'], 4),
-                       "upd": r['update_sort_key'] or ""})
-    scored.sort(key=lambda x: x['upd'], reverse=True)
-    scored.sort(key=lambda x: x['cat'])
-    scored.sort(key=lambda x: x['rel'], reverse=True)
-    scored.sort(key=lambda x: x['mp'])
-    items = [json.loads(s['r']['item_json']) for s in scored[:limit]]
+    results_map = {}   # url -> 评分结构
+    for r in exact_rows:
+        results_map[r['url']] = {
+            "url": r['url'],
+            "item_json": r['item_json'],
+            "mp": exact_priority(r),     # 0~3：精确命中
+            "fuzzy": 1.0,
+            "rel": r['release_sort_key'] or "",
+            "cat": cat_order.get(r['category'], 4),
+            "upd": r['update_sort_key'] or "",
+        }
+
+    # ---------- 阶段 2：模糊匹配（容错兜底，补召回） ----------
+    # 仅当精确结果不足时才做整库扫描；关键词太短不做模糊(避免噪音)
+    FUZZY_TRIGGER = 30          # 精确结果 < 该值才触发模糊
+    FUZZY_THRESHOLD = 0.5       # 模糊命中阈值(越大越严格)
+    PREFILTER_OVERLAP = 0.5     # 廉价预过滤：字符集重叠下限
+    if len(results_map) < FUZZY_TRIGGER and len(qn) >= 2:
+        light_sql = (f"SELECT url, category, name_norm, alias_norm, "
+                     f"release_sort_key, update_sort_key "
+                     f"FROM videos WHERE {' AND '.join(base_where)}")
+        light_rows = conn.execute(light_sql, base_params).fetchall()
+        q_set = set(qn)
+        for r in light_rows:
+            if r['url'] in results_map:
+                continue
+            name  = r['name_norm'] or ""
+            alias = r['alias_norm'] or ""
+            # 廉价预过滤：字符集重叠不足，跳过昂贵的相似度计算
+            if (_char_overlap_ratio(q_set, name) < PREFILTER_OVERLAP and
+                _char_overlap_ratio(q_set, alias) < PREFILTER_OVERLAP):
+                continue
+            score = max(_fuzzy_best_score(qn, name), _fuzzy_best_score(qn, alias))
+            if score >= FUZZY_THRESHOLD:
+                results_map[r['url']] = {
+                    "url": r['url'],
+                    "item_json": None,   # 稍后批量补
+                    "mp": 5,             # 模糊命中排在所有精确命中之后
+                    "fuzzy": score,
+                    "rel": r['release_sort_key'] or "",
+                    "cat": cat_order.get(r['category'], 4),
+                    "upd": r['update_sort_key'] or "",
+                }
+
+    # 为模糊命中的项批量补 item_json
+    missing = [u for u, v in results_map.items() if v['item_json'] is None]
+    if missing:
+        CHUNK = 400
+        for i in range(0, len(missing), CHUNK):
+            chunk = missing[i:i + CHUNK]
+            ph = ",".join("?" * len(chunk))
+            for r in conn.execute(f"SELECT url, item_json FROM videos WHERE url IN ({ph})", chunk):
+                if r['url'] in results_map:
+                    results_map[r['url']]['item_json'] = r['item_json']
+    conn.close()
+
+    # ---------- 排序（稳定排序链：从低优先级到高优先级依次 sort） ----------
+    scored = list(results_map.values())
+    scored.sort(key=lambda x: x['upd'], reverse=True)   # 更新时间
+    scored.sort(key=lambda x: x['cat'])                 # 分类顺序
+    scored.sort(key=lambda x: x['rel'], reverse=True)   # 上映时间
+    scored.sort(key=lambda x: x['fuzzy'], reverse=True) # 模糊分(高在前)
+    scored.sort(key=lambda x: x['mp'])                  # 匹配优先级(最高优先)
+
+    items = []
+    for s in scored[:limit]:
+        if s['item_json']:
+            items.append(json.loads(s['item_json']))
     return jsonify({"items": items, "has_more": False, "page": 0})
 
 @app.route('/api/OVideo/playlist', methods=['GET'])

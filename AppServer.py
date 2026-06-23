@@ -324,6 +324,11 @@ def init_analytics_db():
         c.execute("ALTER TABLE user_video_events ADD COLUMN user_type TEXT DEFAULT 'apple'")
     except sqlite3.OperationalError:
         pass
+    # 【新增】给视频流水表补充 source 字段（播放来源；仅在线播放有值）
+    try:
+        c.execute("ALTER TABLE event_logs ADD COLUMN source TEXT")
+    except sqlite3.OperationalError:
+        pass
     
     # 【新增】用户寻片/许愿请求表（含第二阶段的管理员回复字段）
     c.execute('''
@@ -1686,10 +1691,11 @@ def track_event():
     try:
         data = request.get_json()
         user_id     = data.get('user_id')
-        user_type   = data.get('user_type', 'apple')   # 【新增】
+        user_type   = data.get('user_type', 'apple')
         video_url   = data.get('video_url')
         video_title = data.get('video_title', '')
         event_type  = data.get('event_type')
+        source      = data.get('source')          # ⭐ 新增：播放来源(仅在线播放会带)
         if not user_id or not video_url or event_type not in ALLOWED_EVENT_TYPES:
             return jsonify({"error": "Invalid params"}), 400
         now = now_iso()        # ⭐ 北京时间(无时区后缀)
@@ -1703,12 +1709,12 @@ def track_event():
             DO UPDATE SET last_at = ?, count = count + 1
         ''', (user_id, user_type, video_url, video_title, event_type, now, now, now))
 
-        # 流水表：每次都插
+        # 流水表：每次都插，额外记录 source
         c.execute('''
             INSERT INTO event_logs
-                (user_id, user_type, video_url, video_title, event_type, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (user_id, user_type, video_url, video_title, event_type, now))
+                (user_id, user_type, video_url, video_title, event_type, created_at, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, user_type, video_url, video_title, event_type, now, source))
 
         conn.commit()
         conn.close()
@@ -1723,7 +1729,7 @@ def track_event():
 def admin_video_user_details():
     user_id = request.args.get('user_id')
     event_type = request.args.get('type')
-    suffix = request.args.get('suffix', '')  # 新增
+    suffix = request.args.get('suffix', '')  # 在线/离线过滤
     
     if not user_id or not event_type:
         return jsonify({"error": "Missing parameters"}), 400
@@ -1731,7 +1737,8 @@ def admin_video_user_details():
     sql = f'''
         SELECT video_url, video_title,
                MAX(created_at) AS last_time,
-               COUNT(*) AS click_count
+               COUNT(*) AS click_count,
+               GROUP_CONCAT(DISTINCT source) AS sources   -- ⭐ 新增：聚合所有来源
         FROM event_logs
         WHERE user_id = ? AND event_type = ?
         {suffix}  -- 在线/离线过滤
@@ -2868,6 +2875,15 @@ const REPORT_TYPE_MAP = {
   playback_failed:'无法播放', download_failed:'无法缓存',
   media_error:'音画异常', content_mismatch:'内容不符', other:'其他'
 };
+// ⭐ 新增：播放来源中文映射
+const PLAY_SOURCE_MAP = {
+  home:    '🏠 首页瀑布流',
+  filter:  '🗂 分类检索',
+  search:  '🔍 搜索结果',
+  detail:  '📄 详情页',
+  history: '🕐 播放记录',
+  unknown: '❓ 未知来源'
+};
 
 // 缓存新闻用户数据，用于前端快速排序
 let cachedNewsUsers = [];
@@ -3189,10 +3205,12 @@ async function showUserVideoDetails(userIdEnc, type){
   let typeText = '';
   let sqlType = 'play';
   let suffixFilter = '';
+  let showSource = false;            // ⭐ 仅在线播放展示来源
 
   if (type === 'online') {
     typeText = '在线播放';
     suffixFilter = "AND video_url NOT LIKE '%.m3u8'";
+    showSource = true;               // ⭐ 在线播放才有来源意义
   } else if (type === 'offline') {
     typeText = '离线播放';
     suffixFilter = "AND video_url LIKE '%.m3u8'";
@@ -3214,9 +3232,20 @@ async function showUserVideoDetails(userIdEnc, type){
     const countBadge = item.click_count > 1
       ? `<span class="pill pill-blue" style="margin-left:6px;font-size:10px;padding:1px 4px;">${item.click_count}次</span>` : '';
     const timeStr = (item.last_time || '').replace('T',' ').substring(0,16);
+
+    // ⭐ 来源徽标（可能有多个来源，用 / 拼接）
+    let sourceLine = '';
+    if (showSource && item.sources) {
+      const labels = item.sources.split(',')
+        .map(s => PLAY_SOURCE_MAP[s] || (s || '未知来源'))
+        .join(' / ');
+      sourceLine = `<br><span class="pill pill-purple" style="font-size:10px;padding:1px 6px;margin-top:3px;display:inline-block;">📍 来源: ${labels}</span>`;
+    }
+
     html += `<li style="margin-bottom:10px;line-height:1.4;border-bottom:1px solid #334155;padding-bottom:6px;">`;
     html += `  <strong>${item.video_title || '无标题'}</strong>${countBadge}<br>`;
-    html += `  <span style="font-size:11px;color:#64748b;word-break:break-all;">${item.video_url || ''}</span><br>`;
+    html += `  <span style="font-size:11px;color:#64748b;word-break:break-all;">${item.video_url || ''}</span>`;
+    html += `  ${sourceLine}<br>`;
     html += `  <span style="font-size:11px;color:#94a3b8;">🕐 ${timeStr}</span>`;
     html += `</li>`;
   });

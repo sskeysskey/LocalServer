@@ -1250,7 +1250,6 @@ def ovideo_list():
     region_kw, type_kw = _get_block_config(user_id)
     where, params = [], []
 
-    # ⭐ 需求1：Featured 不按分类过滤，混合全部
     if category == 'Featured':
         pass
     elif category == 'Documentary':
@@ -1262,7 +1261,15 @@ def ovideo_list():
     bc, bp = _block_where(region_kw, type_kw)
     where += bc; params += bp
 
-    # ⭐ 需求3：把 category 一起查出来，注入到每个 item
+    # 【新增】审核员限定：只看 <= max_year 的老片
+    max_year = request.args.get('max_year')
+    if max_year:
+        try:
+            where.append("release_year IS NOT NULL AND release_year <= ?")
+            params.append(int(max_year))
+        except Exception:
+            pass
+
     sql = (f"SELECT category, item_json FROM videos WHERE {' AND '.join(where)} "
            f"ORDER BY {_order_clause(sort)} LIMIT ? OFFSET ?")
     params += [page_size + 1, page * page_size]
@@ -1274,7 +1281,7 @@ def ovideo_list():
     items = []
     for r in rows[:page_size]:
         it = json.loads(r['item_json'])
-        it['category'] = r['category']   # ⭐ 注入真实分类
+        it['category'] = r['category']
         items.append(it)
     return jsonify({"items": items, "has_more": has_more, "page": page})
 
@@ -1309,11 +1316,21 @@ def ovideo_filter():
     if f_region:
         where.append("norm_region=?"); params.append(f_region)
 
-    where.append("hide_blacklisted=0")   # ⭐ 新增
+    where.append("hide_blacklisted=0")
 
     region_kw, type_kw = _get_block_config(user_id)
     bc, bp = _block_where(region_kw, type_kw)
     where += bc; params += bp
+
+    # 【新增】审核员限定：只看 <= max_year 的老片
+    max_year = request.args.get('max_year')
+    if max_year:
+        try:
+            where.append("release_year IS NOT NULL AND release_year <= ?")
+            params.append(int(max_year))
+        except Exception:
+            pass
+
     if not where:
         where.append("1=1")
 
@@ -1370,10 +1387,17 @@ def ovideo_search2():
 
     region_kw, type_kw = _get_block_config(user_id)
     bc, bp = _block_where(region_kw, type_kw)
-
-    # 公共过滤条件（黑名单隐藏 + 地区/类型屏蔽）
     base_where = ["hide_blacklisted=0"] + bc
     base_params = list(bp)
+
+    # 【新增】审核员限定：只搜 <= max_year 的老片
+    max_year = request.args.get('max_year')
+    if max_year:
+        try:
+            base_where.append("release_year IS NOT NULL AND release_year <= ?")
+            base_params.append(int(max_year))
+        except Exception:
+            pass
 
     cat_order = {"Movie": 0, "Drama": 1, "Show": 2, "Anime": 3}
     conn = _get_video_conn()
@@ -1385,39 +1409,68 @@ def ovideo_search2():
             "OR cast_lower LIKE ? OR cast_norm LIKE ? OR intro_lower LIKE ?)")
     exact_params = [like, like_n, like, like_n, like, like, like_n, like, like_n, like]
     where1 = [cond] + base_where
-    sql1 = (f"SELECT url, category, item_json, name_lower, name_norm, alias_lower, alias_norm, "
-            f"types_lower, director_lower, director_norm, cast_lower, cast_norm, intro_lower, "
-            f"release_sort_key, update_sort_key FROM videos WHERE {' AND '.join(where1)}")
+    sql1 = ("SELECT url, category, item_json, best_rating, "
+            "name_lower, name_norm, alias_lower, alias_norm, types_lower, "
+            "director_lower, director_norm, cast_lower, cast_norm, intro_lower, "
+            "release_sort_key, update_sort_key "
+            f"FROM videos WHERE {' AND '.join(where1)}")
     exact_rows = conn.execute(sql1, exact_params + base_params).fetchall()
 
-    def exact_priority(r):
-        if q in r['name_lower'] or qn in r['name_norm']: return 0
-        if q in r['alias_lower'] or qn in r['alias_norm'] or q in r['types_lower']: return 1
-        if (q in r['director_lower'] or qn in r['director_norm']
-                or q in r['cast_lower'] or qn in r['cast_norm']): return 2
-        if q in r['intro_lower']: return 3
-        return 4
+    # ⭐ 细化匹配层级；人名/类型用「整词命中」而非子串，避免"黑泽明"匹配到"黑泽明日香"
+    def classify(r):
+        name       = r['name_lower'] or ''
+        name_n     = r['name_norm'] or ''
+        alias      = r['alias_lower'] or ''
+        alias_n    = r['alias_norm'] or ''
+        director   = r['director_lower'] or ''
+        director_n = r['director_norm'] or ''
+        cast_tok   = set((r['cast_lower'] or '').split('\x1f'))
+        cast_tok_n = set((r['cast_norm'] or '').split('\x1f'))
+        types      = set((r['types_lower'] or '').split('\x1f'))
+        # 0 完整片名（最高优先：搜"乱"时《乱》置顶）
+        if name == q or name_n == qn:
+            return 0
+        # 1 片名前缀
+        if name.startswith(q) or name_n.startswith(qn):
+            return 1
+        # 2 片名包含
+        if q in name or qn in name_n:
+            return 2
+        # 3 别名命中
+        if alias == q or alias_n == qn or q in alias or qn in alias_n:
+            return 3
+        # 4 完整人名（导演 / 演员 整词命中，不接受子串）
+        if director == q or director_n == qn or q in cast_tok or qn in cast_tok_n:
+            return 4
+        # 5 类型整词命中
+        if q in types:
+            return 5
+        # 6 其它（人名子串 / 简介 / 类型子串）——被压到最后
+        return 6
 
-    results_map = {}   # url -> 评分结构
+    results_map = {}
     for r in exact_rows:
+        mp = classify(r)
+        nm = r['name_lower'] or ''
         results_map[r['url']] = {
             "url": r['url'],
             "item_json": r['item_json'],
-            "mp": exact_priority(r),     # 0~3：精确命中
+            "mp": mp,
             "fuzzy": 1.0,
+            "namelen": len(nm) if mp == 2 else 0,   # 仅"片名包含"层级用长度排序
+            "rating": r['best_rating'] or 0.0,
             "rel": r['release_sort_key'] or "",
             "cat": cat_order.get(r['category'], 4),
             "upd": r['update_sort_key'] or "",
         }
 
-    # ---------- 阶段 2：模糊匹配（容错兜底，补召回） ----------
-    # 仅当精确结果不足时才做整库扫描；关键词太短不做模糊(避免噪音)
-    FUZZY_TRIGGER = 30          # 精确结果 < 该值才触发模糊
-    FUZZY_THRESHOLD = 0.5       # 模糊命中阈值(越大越严格)
-    PREFILTER_OVERLAP = 0.5     # 廉价预过滤：字符集重叠下限
+    # ---------- 阶段 2：模糊匹配（⭐ 仅在精确结果极少时才触发，避免整库慢扫描） ----------
+    FUZZY_TRIGGER = 8          # ⭐ 由 30 降到 8：绝大多数查询不再触发慢扫描
+    FUZZY_THRESHOLD = 0.6
+    PREFILTER_OVERLAP = 0.6
     if len(results_map) < FUZZY_TRIGGER and len(qn) >= 2:
-        light_sql = (f"SELECT url, category, name_norm, alias_norm, "
-                     f"release_sort_key, update_sort_key "
+        light_sql = ("SELECT url, category, name_norm, alias_norm, name_lower, "
+                     "best_rating, release_sort_key, update_sort_key "
                      f"FROM videos WHERE {' AND '.join(base_where)}")
         light_rows = conn.execute(light_sql, base_params).fetchall()
         q_set = set(qn)
@@ -1426,7 +1479,6 @@ def ovideo_search2():
                 continue
             name  = r['name_norm'] or ""
             alias = r['alias_norm'] or ""
-            # 廉价预过滤：字符集重叠不足，跳过昂贵的相似度计算
             if (_char_overlap_ratio(q_set, name) < PREFILTER_OVERLAP and
                 _char_overlap_ratio(q_set, alias) < PREFILTER_OVERLAP):
                 continue
@@ -1434,9 +1486,11 @@ def ovideo_search2():
             if score >= FUZZY_THRESHOLD:
                 results_map[r['url']] = {
                     "url": r['url'],
-                    "item_json": None,   # 稍后批量补
-                    "mp": 5,             # 模糊命中排在所有精确命中之后
+                    "item_json": None,
+                    "mp": 7,
                     "fuzzy": score,
+                    "namelen": 0,
+                    "rating": r['best_rating'] or 0.0,
                     "rel": r['release_sort_key'] or "",
                     "cat": cat_order.get(r['category'], 4),
                     "upd": r['update_sort_key'] or "",
@@ -1454,13 +1508,15 @@ def ovideo_search2():
                     results_map[r['url']]['item_json'] = r['item_json']
     conn.close()
 
-    # ---------- 排序（稳定排序链：从低优先级到高优先级依次 sort） ----------
+    # ---------- 排序（多趟稳定排序：从最次要到最主要） ----------
     scored = list(results_map.values())
-    scored.sort(key=lambda x: x['upd'], reverse=True)   # 更新时间
-    scored.sort(key=lambda x: x['cat'])                 # 分类顺序
-    scored.sort(key=lambda x: x['rel'], reverse=True)   # 上映时间
-    scored.sort(key=lambda x: x['fuzzy'], reverse=True) # 模糊分(高在前)
-    scored.sort(key=lambda x: x['mp'])                  # 匹配优先级(最高优先)
+    scored.sort(key=lambda x: x['upd'], reverse=True)     # 更新时间(最次要)
+    scored.sort(key=lambda x: x['cat'])                   # 分类顺序
+    scored.sort(key=lambda x: x['rel'], reverse=True)     # 上映时间
+    scored.sort(key=lambda x: x['rating'], reverse=True)  # 评分(高优先)
+    scored.sort(key=lambda x: x['namelen'])               # 片名包含层级:短名优先
+    scored.sort(key=lambda x: x['fuzzy'], reverse=True)   # 模糊分(高优先)
+    scored.sort(key=lambda x: x['mp'])                    # 匹配层级(最主要)
 
     items = []
     for s in scored[:limit]:

@@ -1414,7 +1414,7 @@ def ovideo_search2():
     cat_order = {"Movie": 0, "Drama": 1, "Show": 2, "Anime": 3}
     conn = _get_video_conn()
 
-    # ---------- 阶段 1：精确子串匹配（快路径，走 LIKE） ----------
+    # ---------- 阶段 1：精确子串匹配 ----------
     like, like_n = f"%{q}%", f"%{qn}%"
     cond = ("(name_lower LIKE ? OR name_norm LIKE ? OR alias_lower LIKE ? OR alias_norm LIKE ? "
             "OR types_lower LIKE ? OR director_lower LIKE ? OR director_norm LIKE ? "
@@ -1428,7 +1428,9 @@ def ovideo_search2():
             f"FROM videos WHERE {' AND '.join(where1)}")
     exact_rows = conn.execute(sql1, exact_params + base_params).fetchall()
 
-    # ⭐ 细化匹配层级；人名/类型用「整词命中」而非子串，避免"黑泽明"匹配到"黑泽明日香"
+    # ⭐ 层级细化：导演(4) 与 主演(5) 分开；主演返回其在列表中的位次
+    #   返回 (匹配层级 mp, 演员位次 cast_pos)
+    BIG = 10 ** 6  # 非主演命中统一给一个大值，不影响其它层级排序
     def classify(r):
         name       = r['name_lower'] or ''
         name_n     = r['name_norm'] or ''
@@ -1436,48 +1438,62 @@ def ovideo_search2():
         alias_n    = r['alias_norm'] or ''
         director   = r['director_lower'] or ''
         director_n = r['director_norm'] or ''
-        cast_tok   = set((r['cast_lower'] or '').split('\x1f'))
-        cast_tok_n = set((r['cast_norm'] or '').split('\x1f'))
-        types      = set((r['types_lower'] or '').split('\x1f'))
-        # 0 完整片名（最高优先：搜"乱"时《乱》置顶）
+        cast_list   = (r['cast_lower'] or '').split('\x1f')
+        cast_list_n = (r['cast_norm'] or '').split('\x1f')
+        cast_tok    = set(cast_list)
+        cast_tok_n  = set(cast_list_n)
+        types       = set((r['types_lower'] or '').split('\x1f'))
+
+        # 0 完整片名
         if name == q or name_n == qn:
-            return 0
+            return 0, BIG
         # 1 片名前缀
         if name.startswith(q) or name_n.startswith(qn):
-            return 1
+            return 1, BIG
         # 2 片名包含
         if q in name or qn in name_n:
-            return 2
+            return 2, BIG
         # 3 别名命中
         if alias == q or alias_n == qn or q in alias or qn in alias_n:
-            return 3
-        # 4 完整人名（导演 / 演员 整词命中，不接受子串）
-        if director == q or director_n == qn or q in cast_tok or qn in cast_tok_n:
-            return 4
-        # 5 类型整词命中
+            return 3, BIG
+        # 4 导演整词命中（优先级高于主演）
+        if director == q or director_n == qn:
+            return 4, BIG
+        # 5 主演整词命中——计算该演员在主演列表中的最靠前位次
+        if q in cast_tok or qn in cast_tok_n:
+            idx = BIG
+            for i, c in enumerate(cast_list):
+                if c == q:
+                    idx = min(idx, i); break
+            for i, c in enumerate(cast_list_n):
+                if c == qn:
+                    idx = min(idx, i); break
+            return 5, idx
+        # 6 类型整词命中
         if q in types:
-            return 5
-        # 6 其它（人名子串 / 简介 / 类型子串）——被压到最后
-        return 6
+            return 6, BIG
+        # 7 其它（人名子串 / 简介 / 类型子串）
+        return 7, BIG
 
     results_map = {}
     for r in exact_rows:
-        mp = classify(r)
+        mp, cast_pos = classify(r)
         nm = r['name_lower'] or ''
         results_map[r['url']] = {
             "url": r['url'],
             "item_json": r['item_json'],
             "mp": mp,
+            "cast_pos": cast_pos,                    # ⭐ 主演位次（越小越靠前）
             "fuzzy": 1.0,
-            "namelen": len(nm) if mp == 2 else 0,   # 仅"片名包含"层级用长度排序
+            "namelen": len(nm) if mp == 2 else 0,
             "rating": r['best_rating'] or 0.0,
             "rel": r['release_sort_key'] or "",
             "cat": cat_order.get(r['category'], 4),
             "upd": r['update_sort_key'] or "",
         }
 
-    # ---------- 阶段 2：模糊匹配（⭐ 仅在精确结果极少时才触发，避免整库慢扫描） ----------
-    FUZZY_TRIGGER = 8          # ⭐ 由 30 降到 8：绝大多数查询不再触发慢扫描
+    # ---------- 阶段 2：模糊匹配 ----------
+    FUZZY_TRIGGER = 8
     FUZZY_THRESHOLD = 0.6
     PREFILTER_OVERLAP = 0.6
     if len(results_map) < FUZZY_TRIGGER and len(qn) >= 2:
@@ -1499,7 +1515,8 @@ def ovideo_search2():
                 results_map[r['url']] = {
                     "url": r['url'],
                     "item_json": None,
-                    "mp": 7,
+                    "mp": 8,                         # ⭐ 模糊层级由 7 顺延为 8
+                    "cast_pos": BIG,
                     "fuzzy": score,
                     "namelen": 0,
                     "rating": r['best_rating'] or 0.0,
@@ -1528,6 +1545,7 @@ def ovideo_search2():
     scored.sort(key=lambda x: x['rating'], reverse=True)  # 评分(高优先)
     scored.sort(key=lambda x: x['namelen'])               # 片名包含层级:短名优先
     scored.sort(key=lambda x: x['fuzzy'], reverse=True)   # 模糊分(高优先)
+    scored.sort(key=lambda x: x['cast_pos'])              # ⭐ 主演位次:越靠前越优先
     scored.sort(key=lambda x: x['mp'])                    # 匹配层级(最主要)
 
     items = []

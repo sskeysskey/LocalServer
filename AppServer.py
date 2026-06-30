@@ -61,6 +61,9 @@ VALID_INVITE_CODES = {
 VIDEO_MODULE_BLOCKED_USERS = {
     "001356.cdec6d350edb4646b0130f9363b6d37e.2149",
 }
+# Featured 首页「按上映日期」排序时:
+# Drama 分类改用 (更新日期 − N 天) 作为排序键,N 可在此调整
+FEATURED_DRAMA_DATE_OFFSET_DAYS = 2
 
 def is_real_login_user(user_id):
     """只有 Apple 登录用户(稳定 Apple ID)才享受免费次数。
@@ -1261,7 +1264,7 @@ def ovideo_list():
     bc, bp = _block_where(region_kw, type_kw)
     where += bc; params += bp
 
-    # 【新增】审核员限定：只看 <= max_year 的老片
+    # 审核员限定:只看 <= max_year 的老片
     max_year = request.args.get('max_year')
     if max_year:
         try:
@@ -1270,8 +1273,17 @@ def ovideo_list():
         except Exception:
             pass
 
+    # ⭐ 新增:Featured 页按上映日期排序时,Drama 改用 (update − N 天)
+    if category == 'Featured' and sort == 'date':
+        n = int(FEATURED_DRAMA_DATE_OFFSET_DAYS)   # 取自可信常量,无注入风险
+        order = (f"CASE WHEN category='Drama' "
+                 f"THEN date(update_sort_key, '-{n} days') "
+                 f"ELSE release_sort_key END DESC")
+    else:
+        order = _order_clause(sort)
+
     sql = (f"SELECT category, item_json FROM videos WHERE {' AND '.join(where)} "
-           f"ORDER BY {_order_clause(sort)} LIMIT ? OFFSET ?")
+           f"ORDER BY {order} LIMIT ? OFFSET ?")
     params += [page_size + 1, page * page_size]
 
     conn = _get_video_conn()

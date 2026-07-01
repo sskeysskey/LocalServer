@@ -1447,8 +1447,12 @@ def ovideo_search2():
     #   10 简介包含
     #   11 类型 / 其它
     #
-    #   —— 第三大层：模糊匹配（阶段2 赋值）——
-    #   13 模糊命中
+    #   —— 第三大层：模糊匹配（阶段2 赋值，与前两层字段顺序一致）——
+    #   13 名称模糊
+    #   14 又名模糊
+    #   15 导演模糊
+    #   16 演员模糊（前 2 位）
+    #   17 演员模糊（第 3 位及以后）
     #
     #   返回 (mp, cast_pos)；cast_pos 仅在演员层级用于同级深层微调
     # ============================================================
@@ -1531,33 +1535,70 @@ def ovideo_search2():
             "upd": r['update_sort_key'] or "",
         }
 
-    # ---------- 阶段 2：模糊匹配（仅名称 / 又名做容错） ----------
+    # ---------- 阶段 2：模糊匹配（名称 / 又名 / 导演 / 演员 均做错字容错） ----------
     FUZZY_TRIGGER = 8
     FUZZY_THRESHOLD = 0.6
     PREFILTER_OVERLAP = 0.6
     if len(results_map) < FUZZY_TRIGGER and len(qn) >= 2:
         light_sql = ("SELECT url, category, name_norm, alias_norm, name_lower, "
+                     "director_norm, cast_norm, "
                      "best_rating, release_sort_key, update_sort_key "
                      f"FROM videos WHERE {' AND '.join(base_where)}")
         light_rows = conn.execute(light_sql, base_params).fetchall()
         q_set = set(qn)
+
         for r in light_rows:
             if r['url'] in results_map:
                 continue
-            name  = r['name_norm'] or ""
-            alias = r['alias_norm'] or ""
-            if (_char_overlap_ratio(q_set, name) < PREFILTER_OVERLAP and
-                _char_overlap_ratio(q_set, alias) < PREFILTER_OVERLAP):
-                continue
-            score = max(_fuzzy_best_score(qn, name), _fuzzy_best_score(qn, alias))
-            if score >= FUZZY_THRESHOLD:
+
+            name     = r['name_norm'] or ""
+            alias    = r['alias_norm'] or ""
+            director = r['director_norm'] or ""
+            cast_list_n = [c for c in (r['cast_norm'] or "").split('\x1f') if c]
+
+            # 按字段优先级依次判定（优先级 > 分数），命中即定级
+            best_mp       = None
+            best_score    = 0.0
+            best_cast_pos = BIG
+
+            # —— 名称模糊（13）——
+            if _char_overlap_ratio(q_set, name) >= PREFILTER_OVERLAP:
+                s = _fuzzy_best_score(qn, name)
+                if s >= FUZZY_THRESHOLD:
+                    best_mp, best_score = 13, s
+
+            # —— 又名模糊（14）——
+            if best_mp is None and _char_overlap_ratio(q_set, alias) >= PREFILTER_OVERLAP:
+                s = _fuzzy_best_score(qn, alias)
+                if s >= FUZZY_THRESHOLD:
+                    best_mp, best_score = 14, s
+
+            # —— 导演模糊（15）——
+            if best_mp is None and _char_overlap_ratio(q_set, director) >= PREFILTER_OVERLAP:
+                s = _fuzzy_best_score(qn, director)
+                if s >= FUZZY_THRESHOLD:
+                    best_mp, best_score = 15, s
+
+            # —— 演员模糊（16 前2位 / 17 之后）——
+            if best_mp is None:
+                for i, c in enumerate(cast_list_n):
+                    if _char_overlap_ratio(q_set, c) < PREFILTER_OVERLAP:
+                        continue
+                    s = _fuzzy_best_score(qn, c)
+                    if s >= FUZZY_THRESHOLD and s > best_score:
+                        best_score = s
+                        best_cast_pos = i
+                if best_cast_pos != BIG:
+                    best_mp = 16 if best_cast_pos <= 1 else 17
+
+            if best_mp is not None:
                 nm = r['name_lower'] or ''
                 results_map[r['url']] = {
                     "url": r['url'],
                     "item_json": None,
-                    "mp": 13,                     # ⭐ 模糊命中：最低层级
-                    "cast_pos": BIG,
-                    "fuzzy": score,
+                    "mp": best_mp,                # ⭐ 模糊命中：按字段分级
+                    "cast_pos": best_cast_pos,
+                    "fuzzy": best_score,
                     "namelen": len(nm),
                     "rating": r['best_rating'] or 0.0,
                     "rel": r['release_sort_key'] or "",

@@ -359,329 +359,6 @@ def init_analytics_db():
     conn.close()
     print("行为数据库已就绪。")
 
-# --- API 路由 ---
-@app.route('/api/<app_name>/check_version', methods=['GET'])
-def check_version(app_name):
-    print(f"收到来自应用 '{app_name}' 的版本检查请求")
-    if app_name not in ALLOWED_APPS:
-        return jsonify({"error": "无效的应用名称"}), 404
-    
-    # 获取服务器当前的日期，格式与你的 json 文件一致 (yyMMdd)
-    server_now = datetime.now()
-    server_date_str = server_now.strftime('%y%m%d')
-    
-    # 获取原始的 version.json 内容
-    version_file_path = os.path.join(BASE_RESOURCES_DIR, app_name, 'version.json')
-    if os.path.exists(version_file_path):
-        with open(version_file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        # 【关键】动态注入服务器当前日期
-        data['server_date'] = server_date_str
-        return jsonify(data)
-    else:
-        return jsonify({"error": "Version file not found"}), 404
-
-# --- 在 AppServer.py 中添加删除账号路由 ---
-@app.route('/api/<app_name>/user/delete', methods=['POST'])
-def delete_user(app_name):
-    data = request.get_json()
-    user_id = data.get('user_id')
-    
-    if not user_id: 
-        return jsonify({"error": "Missing user_id"}), 400
-        
-    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
-    c = conn.cursor()
-    try:
-        # 从数据库中永久删除该用户
-        c.execute("DELETE FROM users WHERE apple_user_id = ?", (user_id,))
-        if c.rowcount == 0:
-            return jsonify({"error": "User not found"}), 404
-        conn.commit()
-        print(f"[{app_name}] 用户 {user_id} 已成功删除账号。")
-        return jsonify({"status": "success"}), 200
-    except Exception as e:
-        print(f"删除账号失败: {e}")
-        return jsonify({"error": str(e)}), 500
-    finally:
-        conn.close()
-
-@app.route('/api/<app_name>/download', methods=['GET'])
-def download_file(app_name):
-    # filename 参数现在可能是 "some.json" 或 "some_dir/some_image.jpg"
-    filename = request.args.get('filename')
-    print(f"收到来自应用 '{app_name}' 的文件下载请求: {filename}")
-
-    if app_name not in ALLOWED_APPS:
-        return jsonify({"error": "无效的应用名称"}), 404
-    if not filename:
-        return jsonify({"error": "缺少文件名参数"}), 400
-
-    # --- 核心修改：使用 werkzeug.utils.safe_join 来构建安全路径 ---
-    # safe_join 是 Flask/Werkzeug 推荐的、更安全的方式来防止目录遍历攻击
-    try:
-        # safe_join 会自动处理路径规范化和安全检查
-        full_path = safe_join(BASE_RESOURCES_DIR, app_name, filename)
-    except Exception:
-        # 如果路径包含 '..' 或其他不安全部分，safe_join 会抛出异常
-        print(f"错误: 请求的路径不安全: {filename}")
-        return jsonify({"error": "无效的路径"}), 400
-        
-    if not os.path.isfile(full_path):
-        print(f"错误: 请求的文件不存在: {full_path}")
-        return jsonify({"error": "文件未找到"}), 404
-
-    try:
-        # send_from_directory 需要目录和文件名作为分离的参数
-        directory, file = os.path.split(full_path)
-        print(f"正在发送文件 '{file}' 从目录 '{directory}'")
-        return send_from_directory(directory, file, as_attachment=True)
-    except Exception as e:
-        print(f"发生错误: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# --- 用户认证与权限核心逻辑 ---
-def check_user_subscription_status(user_row, app_name):
-    """
-    检查用户权限。
-    逻辑：
-    1. 先检查该 App 的 is_permanent (亲友/后门)。如果是 1，直接返回 2099年。
-    2. 再检查该 App 的 expire_at (付费)。如果时间还没到，返回该时间。
-    3. 否则返回 False。
-    """
-    now = datetime.utcnow()
-    
-    # 根据传入的 app_name 决定查哪些字段
-    # 比如 app_name="Finance" -> prefix="finance"
-    prefix = app_name.lower() 
-    perm_col = f"{prefix}_is_permanent"
-    expire_col = f"{prefix}_expire_at"
-    
-    # 1. 【优先】检查永久 VIP (亲友/后门)
-    # 数据库里取出来可能是 1 或 True，做个兼容
-    if user_row[perm_col] == 1:
-        # 对于亲友，我们返回一个极远的未来时间，让前端显示“长期有效”或类似效果
-        return True, "2099-12-31T23:59:59"
-        
-    # 2. 检查付费订阅的过期时间
-    if user_row[expire_col]:
-        try:
-            # 数据库存的是字符串，转回 datetime
-            expires_at = datetime.fromisoformat(str(user_row[expire_col]))
-            if expires_at > now:
-                return True, user_row[expire_col]
-            else:
-                # 【优化】如果已经过期，虽然逻辑上返回 False，
-                # 但可以在这里记录一下，或者由 App 端下次登录时更新
-                return False, user_row[expire_col]
-        except:
-            pass
-            
-    return False, None
-
-# --- 用户认证相关 ---
-def handle_auth(app_name):
-    try:
-        data = request.get_json()
-        user_id = data.get('user_id')
-        device_id = data.get('device_id') # 【新增】接收客户端传来的设备ID
-        
-        if not user_id: return jsonify({"error": "Missing user_id"}), 400
-        conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
-        user = c.fetchone()
-        now = datetime.utcnow()
-        is_subscribed = False
-        expiration_date = None
-        if user:
-            # 老用户：更新登录时间，同时关联/更新最新的 device_id
-            c.execute(
-                "UPDATE users SET last_login_at = ?, device_id = ? WHERE apple_user_id = ?", 
-                (now, device_id, user_id)
-            )
-            # 检查权限 (传入 app_name)
-            is_subscribed, expiration_date = check_user_subscription_status(user, app_name)
-        else:
-            # 新用户：插入记录，同时写入 device_id
-            c.execute(
-                "INSERT INTO users (apple_user_id, device_id, created_at, last_login_at) VALUES (?, ?, ?, ?)",
-                (user_id, device_id, now, now)
-            )
-            # 新用户肯定没订阅且不是VIP
-        
-        conn.commit()
-        conn.close()
-        return jsonify({
-            "status": "success", 
-            "is_subscribed": is_subscribed,
-            "subscription_expires_at": expiration_date,
-            "video_module_blocked": user_id in VIDEO_MODULE_BLOCKED_USERS   # 【新增】
-        }), 200
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-def handle_status_check(app_name):
-    user_id = request.args.get('user_id')
-    if not user_id: return jsonify({"error": "Missing user_id"}), 400
-    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    try:
-        c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
-        row = c.fetchone()
-        is_subscribed = False
-        expires_at_str = None
-        if row:
-            is_subscribed, expires_at_str = check_user_subscription_status(row, app_name)
-        return jsonify({
-            "is_subscribed": is_subscribed, 
-            "subscription_expires_at": expires_at_str,
-            "video_module_blocked": user_id in VIDEO_MODULE_BLOCKED_USERS   # 【新增】
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        conn.close()
-
-# 【新增】处理邀请码兑换
-def handle_redeem_invite(app_name):
-    data = request.get_json()
-    user_id = data.get('user_id')
-    invite_code = data.get('invite_code')
-    if not user_id or not invite_code:
-        return jsonify({"error": "缺少参数"}), 400
-        
-    # 验证邀请码
-    if invite_code not in VALID_INVITE_CODES:
-        return jsonify({"error": "无效的邀请码"}), 403
-    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
-    c = conn.cursor()
-    try:
-        # 确定要更新哪个字段
-        perm_col = f"{app_name.lower()}_is_permanent"
-        
-        # 设置永久 VIP 标记为 1
-        query = f"UPDATE users SET {perm_col} = 1 WHERE apple_user_id = ?"
-        c.execute(query, (user_id,))
-        if c.rowcount == 0:
-            return jsonify({"error": "用户不存在，请先登录"}), 404
-        conn.commit()
-        print(f"[{app_name}] 用户 {user_id} 使用邀请码 {invite_code} 升级为永久 VIP")
-        
-        return jsonify({
-            "status": "success",
-            "is_subscribed": True,
-            "subscription_expires_at": "2099-12-31T23:59:59"
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        conn.close()
-
-def handle_payment(app_name):
-    data = request.get_json()
-    user_id = data.get('user_id')
-    days = data.get('days', 30) # 保持默认值用于兼容旧版本或手动充值
-    # 【新增】接收客户端传来的真实过期时间字符串 (ISO 8601 格式)
-    explicit_expiry = data.get('explicit_expiry') 
-    if not user_id: return jsonify({"error": "Missing user_id"}), 400
-    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    try:
-        c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
-        row = c.fetchone()
-        if not row: return jsonify({"error": "User not found"}), 404
-        now = datetime.utcnow()
-        
-        # 确定要更新哪个字段
-        expire_col = f"{app_name.lower()}_expire_at"
-        new_expiry_str = ""
-
-        # 【核心修改】逻辑分支
-        if explicit_expiry:
-            # 方案 A: 客户端传了真实的 Apple 过期时间，直接使用
-            # 这样就实现了"同步"，而不是"充值"
-            print(f"[{app_name}] 同步用户 {user_id} 订阅时间至: {explicit_expiry}")
-            new_expiry_str = explicit_expiry
-        else:
-            # 方案 B: 旧逻辑 (充值模式) - 依然保留以备不时之需
-            current_expiry_str = row[expire_col]
-            new_expiry = now + timedelta(days=days) 
-            
-            if current_expiry_str:
-                try:
-                    current_expiry = datetime.fromisoformat(current_expiry_str)
-                    if current_expiry > now:
-                        new_expiry = current_expiry + timedelta(days=days)
-                except: pass
-            new_expiry_str = new_expiry.isoformat()
-        
-        # 执行更新
-        query = f"UPDATE users SET {expire_col} = ? WHERE apple_user_id = ?"
-        c.execute(query, (new_expiry_str, user_id))
-        conn.commit()
-        return jsonify({
-            "status": "success", 
-            "is_subscribed": True, 
-            "subscription_expires_at": new_expiry_str
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        conn.close()
-
-# --- ONews 路由 (保持兼容) ---
-@app.route('/api/ONews/auth/apple', methods=['POST'])
-def onews_auth(): return handle_auth('ONews')
-
-@app.route('/api/ONews/payment/subscribe', methods=['POST'])
-def onews_pay(): return handle_payment('ONews')
-
-# 注意状态检查也要传 App 名，因为我们要看特定 App 的权限
-@app.route('/api/ONews/user/status', methods=['GET'])
-def onews_status(): 
-    # 这里复用 handle_auth 里的 check 逻辑，稍微改写一下 handle_status_check
-    return handle_status_check('ONews') 
-
-# ONews 兑换路由
-@app.route('/api/ONews/user/redeem', methods=['POST'])
-def onews_redeem(): return handle_redeem_invite('ONews')
-
-# --- Prediction 路由 ---
-@app.route('/api/Prediction/auth/apple', methods=['POST'])
-def prediction_auth(): return handle_auth('Prediction')
-
-@app.route('/api/Prediction/payment/subscribe', methods=['POST'])
-def prediction_pay(): return handle_payment('Prediction')
-
-@app.route('/api/Prediction/user/status', methods=['GET'])
-def prediction_status(): return handle_status_check('Prediction')
-
-@app.route('/api/Prediction/user/redeem', methods=['POST'])
-def prediction_redeem(): return handle_redeem_invite('Prediction')
-
-@app.route('/api/Prediction/user/delete', methods=['POST'])
-def prediction_delete(): return delete_user('Prediction')
-
-# --- Finance 路由 ---
-@app.route('/api/Finance/auth/apple', methods=['POST'])
-def finance_auth(): return handle_auth('Finance')
-
-@app.route('/api/Finance/payment/subscribe', methods=['POST'])
-def finance_pay(): return handle_payment('Finance')
-
-@app.route('/api/Finance/user/status', methods=['GET'])
-def finance_status(): return handle_status_check('Finance')
-
-# 注册 Finance 的兑换路由！！！
-@app.route('/api/Finance/user/redeem', methods=['POST'])
-def finance_redeem(): return handle_redeem_invite('Finance')
-
 
 # OVideo 视频模块 API
 OVIDEO_DIR = os.path.join(BASE_RESOURCES_DIR, 'OVideo')
@@ -691,6 +368,62 @@ OVIDEO_COVER_DIR = os.path.join(OVIDEO_DIR, 'cover_image')
 OVIDEO_DB_PATH = os.path.join(OVIDEO_DIR, 'OVideo.db')
 _video_db_lock = threading.Lock()
 _url_mapping_cache = {"mtime": 0.0, "valid": set()}
+# —— 模糊搜索候选缓存:全表预处理，仅在 OVideo.db 变更时重建 ——
+_fuzzy_cache = {"mtime": None, "rows": None}
+_fuzzy_cache_lock = threading.Lock()
+
+def _get_fuzzy_candidates():
+    """加载并缓存全表模糊匹配候选：
+       预切分 cast、预建每个字段的字符集合，避免每次请求读全表+反复建 set。
+       仅当 OVideo.db 的 mtime 变化时才重建。"""
+    try:
+        db_mtime = os.path.getmtime(OVIDEO_DB_PATH)
+    except OSError:
+        return []
+    if _fuzzy_cache["mtime"] == db_mtime and _fuzzy_cache["rows"] is not None:
+        return _fuzzy_cache["rows"]
+    with _fuzzy_cache_lock:
+        # 双重检查，避免并发重复构建
+        if _fuzzy_cache["mtime"] == db_mtime and _fuzzy_cache["rows"] is not None:
+            return _fuzzy_cache["rows"]
+        conn = _get_video_conn()
+        raw = conn.execute(
+            "SELECT url, category, name_norm, alias_norm, director_norm, cast_norm, "
+            "name_lower, best_rating, release_sort_key, update_sort_key, "
+            "hide_blacklisted, region, raw_types, release_year FROM videos"
+        ).fetchall()
+        conn.close()
+        rows = []
+        for r in raw:
+            name     = r['name_norm'] or ''
+            alias    = r['alias_norm'] or ''
+            director = r['director_norm'] or ''
+            cast_list = [c for c in (r['cast_norm'] or '').split('\x1f') if c]
+            rows.append({
+                'url': r['url'],
+                'category': r['category'],
+                'name': name,
+                'alias': alias,
+                'director': director,
+                'cast_list': cast_list,
+                # ⭐ 预建字符集合，供 O(1) 级交集预筛
+                'name_set': set(name),
+                'alias_set': set(alias),
+                'director_set': set(director),
+                'cast_sets': [set(c) for c in cast_list],
+                'name_len': len(r['name_lower'] or ''),
+                'rating': r['best_rating'] or 0.0,
+                'rel': r['release_sort_key'] or '',
+                'upd': r['update_sort_key'] or '',
+                # 以下字段用于在 Python 里复现 SQL 的 base_where 过滤
+                'hide': r['hide_blacklisted'] or 0,
+                'region': r['region'] or '',
+                'raw_types': r['raw_types'] or '',
+                'release_year': r['release_year'],
+            })
+        _fuzzy_cache["rows"] = rows
+        _fuzzy_cache["mtime"] = db_mtime
+        return rows
 
 # —— 与客户端完全一致的归一化映射（务必保持同步）——
 TYPE_MAPPING = {
@@ -753,36 +486,6 @@ def _clean_name(raw):
 def _norm_search(text):
     return (text or "").lower().replace('·', '').replace(' ', '')
 
-def _char_overlap_ratio(query_set, text):
-    """query 字符集在 text 中出现的比例。
-       作为昂贵相似度计算前的廉价预过滤，重叠太低直接跳过。"""
-    if not query_set or not text:
-        return 0.0
-    inter = sum(1 for ch in query_set if ch in text)
-    return inter / len(query_set)
-
-def _fuzzy_best_score(query, text):
-    """query 对 text 的最佳模糊匹配分数(0~1)。
-       兼顾「整体相似度」与「局部滑窗相似度」：
-       - 整体：处理「整条标题打错一两个字」(我的王氏死对头 vs 我的王室死对头)
-       - 滑窗：处理「输入是标题的一部分且还打错字」(王氏死对头 vs 我的王室死对头)"""
-    if not query or not text:
-        return 0.0
-    if query in text:
-        return 1.0
-    whole = SequenceMatcher(None, query, text).ratio()
-    lq, lt = len(query), len(text)
-    best_local = 0.0
-    if lt > lq:
-        for i in range(0, lt - lq + 1):
-            seg = text[i:i + lq]
-            s = SequenceMatcher(None, query, seg).ratio()
-            if s > best_local:
-                best_local = s
-                if best_local >= 0.99:
-                    break
-    return max(whole, best_local)
-
 def _release_sort_key(date):
     if not date: return ""
     return date.split('(')[0]
@@ -803,6 +506,22 @@ def _best_rating(ratings):
         try: vals.append(float(v))
         except Exception: pass
     return max(vals) if vals else 0.0
+
+def _get_valid_urls():
+    """缓存 url_mapping 的 key 集合，文件变更才重载"""
+    mapping_file = os.path.join(OVIDEO_DIR, 'url_mapping.json')
+    if not os.path.exists(mapping_file):
+        return set()
+    m = os.path.getmtime(mapping_file)
+    if _url_mapping_cache['mtime'] != m:
+        try:
+            with open(mapping_file, 'r', encoding='utf-8') as f:
+                mappings = json.load(f)
+            _url_mapping_cache['valid'] = set(mappings.keys())
+            _url_mapping_cache['mtime'] = m
+        except Exception as e:
+            print(f"url_mapping 读取失败: {e}")
+    return _url_mapping_cache['valid']
 
 def build_video_db():
     """把 OVideos.json 全量构建成 SQLite（不含 playlist 的列表 + 单独存 playlist）"""
@@ -959,22 +678,6 @@ def _get_video_conn():
     conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     return conn
-
-def _get_valid_urls():
-    """缓存 url_mapping 的 key 集合，文件变更才重载"""
-    mapping_file = os.path.join(OVIDEO_DIR, 'url_mapping.json')
-    if not os.path.exists(mapping_file):
-        return set()
-    m = os.path.getmtime(mapping_file)
-    if _url_mapping_cache['mtime'] != m:
-        try:
-            with open(mapping_file, 'r', encoding='utf-8') as f:
-                mappings = json.load(f)
-            _url_mapping_cache['valid'] = set(mappings.keys())
-            _url_mapping_cache['mtime'] = m
-        except Exception as e:
-            print(f"url_mapping 读取失败: {e}")
-    return _url_mapping_cache['valid']
 
 def _is_vip_permanent(user_id):
     if not user_id:
@@ -1161,6 +864,33 @@ def get_ovideos():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+    
+@app.route('/api/OVideo/playlist', methods=['GET'])
+def ovideo_playlist():
+    ensure_video_db()
+    url = request.args.get('url')
+    if not url:
+        return jsonify({"error": "Missing url"}), 400
+    conn = _get_video_conn()
+    row = conn.execute("SELECT playlist_json FROM videos WHERE url=?", (url,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"playlist": []})
+    raw = json.loads(row['playlist_json'] or '[]')
+    valid = _get_valid_urls()
+    filtered = []
+    for channel in raw:
+        eps, order = {}, []
+        for ep_name, ep_url in channel.get('episodes', {}).items():
+            if ep_url in valid or '.m3u8' in ep_url.lower():
+                eps[ep_name] = ep_url
+                order.append(ep_name)
+        if eps:
+            nc = dict(channel)
+            nc['episodes'] = eps
+            nc['episode_order'] = order
+            filtered.append(nc)
+    return jsonify({"playlist": filtered})
 
 # 2. 获取封面图片
 @app.route('/api/OVideo/cover/<path:filename>', methods=['GET'])
@@ -1297,6 +1027,9 @@ def ovideo_list():
         items.append(it)
     return jsonify({"items": items, "has_more": has_more, "page": page})
 
+# 分割线
+# ==========================================
+
 @app.route('/api/OVideo/filter', methods=['GET'])
 def ovideo_filter():
     ensure_video_db()
@@ -1428,7 +1161,6 @@ def ovideo_search2():
             f"FROM videos WHERE {' AND '.join(where1)}")
     exact_rows = conn.execute(sql1, exact_params + base_params).fetchall()
 
-    # ============================================================
     # 匹配层级 mp（数字越小优先级越高）：
     #
     #   —— 第一大层：完全匹配（字段整体 == 关键词）——
@@ -1455,7 +1187,7 @@ def ovideo_search2():
     #   17 演员模糊（第 3 位及以后）
     #
     #   返回 (mp, cast_pos)；cast_pos 仅在演员层级用于同级深层微调
-    # ============================================================
+
     BIG = 10 ** 6
 
     def classify(r):
@@ -1535,56 +1267,98 @@ def ovideo_search2():
             "upd": r['update_sort_key'] or "",
         }
 
-    # ---------- 阶段 2：模糊匹配（名称 / 又名 / 导演 / 演员 均做错字容错） ----------
+    # ---------- 阶段 2：模糊匹配（走内存缓存 + 集合预筛，避免全表实时计算） ----------
     FUZZY_TRIGGER = 8
     FUZZY_THRESHOLD = 0.6
     PREFILTER_OVERLAP = 0.6
     if len(results_map) < FUZZY_TRIGGER and len(qn) >= 2:
-        light_sql = ("SELECT url, category, name_norm, alias_norm, name_lower, "
-                     "director_norm, cast_norm, "
-                     "best_rating, release_sort_key, update_sort_key "
-                     f"FROM videos WHERE {' AND '.join(base_where)}")
-        light_rows = conn.execute(light_sql, base_params).fetchall()
+        candidates = _get_fuzzy_candidates()
         q_set = set(qn)
+        qn_len = len(q_set)
+        region_block = set(region_kw)
+        max_year_int = None
+        if max_year:
+            try:
+                max_year_int = int(max_year)
+            except Exception:
+                max_year_int = None
 
-        for r in light_rows:
+        # ⭐ 复用同一个 matcher：把查询词固定成 seq2，其索引只算一次
+        sm = SequenceMatcher(None)
+        sm.set_seq2(qn)
+
+        def overlap(text_set):
+            if not text_set or not q_set:
+                return 0.0
+            return len(q_set & text_set) / qn_len
+
+        def fuzzy_score(text):
+            if not text:
+                return 0.0
+            if qn in text:
+                return 1.0
+            sm.set_seq1(text)
+            # quick_ratio 是 ratio 的廉价上界，先用它挡掉大多数
+            whole = sm.ratio() if sm.quick_ratio() >= FUZZY_THRESHOLD else 0.0
+            lq, lt = len(qn), len(text)
+            best_local = 0.0
+            if lt > lq:
+                for i in range(lt - lq + 1):
+                    sm.set_seq1(text[i:i + lq])
+                    if sm.quick_ratio() < FUZZY_THRESHOLD:
+                        continue
+                    s = sm.ratio()
+                    if s > best_local:
+                        best_local = s
+                        if best_local >= 0.99:
+                            break
+            return max(whole, best_local)
+
+        for r in candidates:
             if r['url'] in results_map:
                 continue
+            # —— 在 Python 里复现 SQL base_where 的过滤 ——
+            if r['hide'] != 0:
+                continue
+            if region_block and r['region'] in region_block:
+                continue
+            if type_kw:
+                rt = r['raw_types']
+                if any(kw in rt for kw in type_kw):
+                    continue
+            if max_year_int is not None:
+                ry = r['release_year']
+                if ry is None or ry > max_year_int:
+                    continue
 
-            name     = r['name_norm'] or ""
-            alias    = r['alias_norm'] or ""
-            director = r['director_norm'] or ""
-            cast_list_n = [c for c in (r['cast_norm'] or "").split('\x1f') if c]
-
-            # 按字段优先级依次判定（优先级 > 分数），命中即定级
-            best_mp       = None
-            best_score    = 0.0
+            best_mp = None
+            best_score = 0.0
             best_cast_pos = BIG
 
             # —— 名称模糊（13）——
-            if _char_overlap_ratio(q_set, name) >= PREFILTER_OVERLAP:
-                s = _fuzzy_best_score(qn, name)
+            if overlap(r['name_set']) >= PREFILTER_OVERLAP:
+                s = fuzzy_score(r['name'])
                 if s >= FUZZY_THRESHOLD:
                     best_mp, best_score = 13, s
 
             # —— 又名模糊（14）——
-            if best_mp is None and _char_overlap_ratio(q_set, alias) >= PREFILTER_OVERLAP:
-                s = _fuzzy_best_score(qn, alias)
+            if best_mp is None and overlap(r['alias_set']) >= PREFILTER_OVERLAP:
+                s = fuzzy_score(r['alias'])
                 if s >= FUZZY_THRESHOLD:
                     best_mp, best_score = 14, s
 
             # —— 导演模糊（15）——
-            if best_mp is None and _char_overlap_ratio(q_set, director) >= PREFILTER_OVERLAP:
-                s = _fuzzy_best_score(qn, director)
+            if best_mp is None and overlap(r['director_set']) >= PREFILTER_OVERLAP:
+                s = fuzzy_score(r['director'])
                 if s >= FUZZY_THRESHOLD:
                     best_mp, best_score = 15, s
 
             # —— 演员模糊（16 前2位 / 17 之后）——
             if best_mp is None:
-                for i, c in enumerate(cast_list_n):
-                    if _char_overlap_ratio(q_set, c) < PREFILTER_OVERLAP:
+                for i, cset in enumerate(r['cast_sets']):
+                    if overlap(cset) < PREFILTER_OVERLAP:
                         continue
-                    s = _fuzzy_best_score(qn, c)
+                    s = fuzzy_score(r['cast_list'][i])
                     if s >= FUZZY_THRESHOLD and s > best_score:
                         best_score = s
                         best_cast_pos = i
@@ -1592,18 +1366,17 @@ def ovideo_search2():
                     best_mp = 16 if best_cast_pos <= 1 else 17
 
             if best_mp is not None:
-                nm = r['name_lower'] or ''
                 results_map[r['url']] = {
                     "url": r['url'],
                     "item_json": None,
-                    "mp": best_mp,                # ⭐ 模糊命中：按字段分级
+                    "mp": best_mp,
                     "cast_pos": best_cast_pos,
                     "fuzzy": best_score,
-                    "namelen": len(nm),
-                    "rating": r['best_rating'] or 0.0,
-                    "rel": r['release_sort_key'] or "",
+                    "namelen": r['name_len'],
+                    "rating": r['rating'],
+                    "rel": r['rel'],
                     "cat": cat_order.get(r['category'], 4),
-                    "upd": r['update_sort_key'] or "",
+                    "upd": r['upd'],
                 }
 
     # 为模糊命中的项批量补 item_json
@@ -1621,75 +1394,20 @@ def ovideo_search2():
     # ---------- 排序（多趟稳定排序：从最次要到最主要） ----------
     # 显著性（高→低）：mp > 上映日期 > 评分 > 短名 > 模糊分 > 演员位次 > 分类 > 更新时间
     scored = list(results_map.values())
-    scored.sort(key=lambda x: x['upd'], reverse=True)     # 更新时间（最次要）
-    scored.sort(key=lambda x: x['cat'])                   # 分类顺序
-    scored.sort(key=lambda x: x['cast_pos'])              # 演员位次（同级微调）
-    scored.sort(key=lambda x: x['fuzzy'], reverse=True)   # 模糊分（高优先）
-    scored.sort(key=lambda x: x['namelen'])               # 短名优先
-    scored.sort(key=lambda x: x['rating'], reverse=True)  # ⭐ 评分（高优先）
-    scored.sort(key=lambda x: x['rel'], reverse=True)     # ⭐ 上映日期（同级最主要）
-    scored.sort(key=lambda x: x['mp'])                    # ⭐ 匹配层级（最主要）
+    scored.sort(key=lambda x: x['upd'], reverse=True)
+    scored.sort(key=lambda x: x['cat'])
+    scored.sort(key=lambda x: x['cast_pos'])
+    scored.sort(key=lambda x: x['fuzzy'], reverse=True)
+    scored.sort(key=lambda x: x['namelen'])
+    scored.sort(key=lambda x: x['rating'], reverse=True)
+    scored.sort(key=lambda x: x['rel'], reverse=True)
+    scored.sort(key=lambda x: x['mp'])
 
     items = []
     for s in scored[:limit]:
         if s['item_json']:
             items.append(json.loads(s['item_json']))
     return jsonify({"items": items, "has_more": False, "page": 0})
-
-@app.route('/api/OVideo/playlist', methods=['GET'])
-def ovideo_playlist():
-    ensure_video_db()
-    url = request.args.get('url')
-    if not url:
-        return jsonify({"error": "Missing url"}), 400
-    conn = _get_video_conn()
-    row = conn.execute("SELECT playlist_json FROM videos WHERE url=?", (url,)).fetchone()
-    conn.close()
-    if not row:
-        return jsonify({"playlist": []})
-    raw = json.loads(row['playlist_json'] or '[]')
-    valid = _get_valid_urls()
-    filtered = []
-    for channel in raw:
-        eps, order = {}, []
-        for ep_name, ep_url in channel.get('episodes', {}).items():
-            if ep_url in valid or '.m3u8' in ep_url.lower():
-                eps[ep_name] = ep_url
-                order.append(ep_name)
-        if eps:
-            nc = dict(channel)
-            nc['episodes'] = eps
-            nc['episode_order'] = order
-            filtered.append(nc)
-    return jsonify({"playlist": filtered})
-
-# 4. 服务端搜索（可选，客户端也可以自己搜）
-@app.route('/api/OVideo/search', methods=['GET'])
-def search_ovideo():
-    keyword = request.args.get('q', '').strip().lower()
-    if not keyword:
-        return jsonify({"results": []})
-    video_file = os.path.join(OVIDEO_DIR, 'OVideos.json')
-    if not os.path.exists(video_file):
-        return jsonify({"results": []})
-    try:
-        with open(video_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        results = []
-        for category_name, items in data.items():
-            for item in items:
-                name = item.get('name', '').lower()
-                director = (item.get('导演') or '').lower()
-                cast = ' '.join(item.get('主演') or []).lower()
-                intro = (item.get('intro') or '').lower()
-                if (keyword in name or keyword in director
-                        or keyword in cast or keyword in intro):
-                    result_item = dict(item)
-                    result_item['category'] = category_name
-                    results.append(result_item)
-        return jsonify({"results": results})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
     
 @app.route('/api/OVideo/report', methods=['POST'])
 def report_video_link():
@@ -2188,6 +1906,357 @@ def video_quota_unlock():
 
 # 分割线
 # ==========================================
+# # 4. 服务端搜索（可选，客户端也可以自己搜）
+# @app.route('/api/OVideo/search', methods=['GET'])
+# def search_ovideo():
+#     keyword = request.args.get('q', '').strip().lower()
+#     if not keyword:
+#         return jsonify({"results": []})
+#     video_file = os.path.join(OVIDEO_DIR, 'OVideos.json')
+#     if not os.path.exists(video_file):
+#         return jsonify({"results": []})
+#     try:
+#         with open(video_file, 'r', encoding='utf-8') as f:
+#             data = json.load(f)
+#         results = []
+#         for category_name, items in data.items():
+#             for item in items:
+#                 name = item.get('name', '').lower()
+#                 director = (item.get('导演') or '').lower()
+#                 cast = ' '.join(item.get('主演') or []).lower()
+#                 intro = (item.get('intro') or '').lower()
+#                 if (keyword in name or keyword in director
+#                         or keyword in cast or keyword in intro):
+#                     result_item = dict(item)
+#                     result_item['category'] = category_name
+#                     results.append(result_item)
+#         return jsonify({"results": results})
+#     except Exception as e:
+#         return jsonify({"error": str(e)}), 500
+
+# --- ONews API 路由 ---
+@app.route('/api/<app_name>/check_version', methods=['GET'])
+def check_version(app_name):
+    print(f"收到来自应用 '{app_name}' 的版本检查请求")
+    if app_name not in ALLOWED_APPS:
+        return jsonify({"error": "无效的应用名称"}), 404
+    
+    # 获取服务器当前的日期，格式与你的 json 文件一致 (yyMMdd)
+    server_now = datetime.now()
+    server_date_str = server_now.strftime('%y%m%d')
+    
+    # 获取原始的 version.json 内容
+    version_file_path = os.path.join(BASE_RESOURCES_DIR, app_name, 'version.json')
+    if os.path.exists(version_file_path):
+        with open(version_file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # 【关键】动态注入服务器当前日期
+        data['server_date'] = server_date_str
+        return jsonify(data)
+    else:
+        return jsonify({"error": "Version file not found"}), 404
+
+# --- 在 AppServer.py 中添加删除账号路由 ---
+@app.route('/api/<app_name>/user/delete', methods=['POST'])
+def delete_user(app_name):
+    data = request.get_json()
+    user_id = data.get('user_id')
+    
+    if not user_id: 
+        return jsonify({"error": "Missing user_id"}), 400
+        
+    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
+    c = conn.cursor()
+    try:
+        # 从数据库中永久删除该用户
+        c.execute("DELETE FROM users WHERE apple_user_id = ?", (user_id,))
+        if c.rowcount == 0:
+            return jsonify({"error": "User not found"}), 404
+        conn.commit()
+        print(f"[{app_name}] 用户 {user_id} 已成功删除账号。")
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        print(f"删除账号失败: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/<app_name>/download', methods=['GET'])
+def download_file(app_name):
+    # filename 参数现在可能是 "some.json" 或 "some_dir/some_image.jpg"
+    filename = request.args.get('filename')
+    print(f"收到来自应用 '{app_name}' 的文件下载请求: {filename}")
+
+    if app_name not in ALLOWED_APPS:
+        return jsonify({"error": "无效的应用名称"}), 404
+    if not filename:
+        return jsonify({"error": "缺少文件名参数"}), 400
+
+    # --- 核心修改：使用 werkzeug.utils.safe_join 来构建安全路径 ---
+    # safe_join 是 Flask/Werkzeug 推荐的、更安全的方式来防止目录遍历攻击
+    try:
+        # safe_join 会自动处理路径规范化和安全检查
+        full_path = safe_join(BASE_RESOURCES_DIR, app_name, filename)
+    except Exception:
+        # 如果路径包含 '..' 或其他不安全部分，safe_join 会抛出异常
+        print(f"错误: 请求的路径不安全: {filename}")
+        return jsonify({"error": "无效的路径"}), 400
+        
+    if not os.path.isfile(full_path):
+        print(f"错误: 请求的文件不存在: {full_path}")
+        return jsonify({"error": "文件未找到"}), 404
+
+    try:
+        # send_from_directory 需要目录和文件名作为分离的参数
+        directory, file = os.path.split(full_path)
+        print(f"正在发送文件 '{file}' 从目录 '{directory}'")
+        return send_from_directory(directory, file, as_attachment=True)
+    except Exception as e:
+        print(f"发生错误: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# --- 用户认证与权限核心逻辑 ---
+def check_user_subscription_status(user_row, app_name):
+    """
+    检查用户权限。
+    逻辑：
+    1. 先检查该 App 的 is_permanent (亲友/后门)。如果是 1，直接返回 2099年。
+    2. 再检查该 App 的 expire_at (付费)。如果时间还没到，返回该时间。
+    3. 否则返回 False。
+    """
+    now = datetime.utcnow()
+    
+    # 根据传入的 app_name 决定查哪些字段
+    # 比如 app_name="Finance" -> prefix="finance"
+    prefix = app_name.lower() 
+    perm_col = f"{prefix}_is_permanent"
+    expire_col = f"{prefix}_expire_at"
+    
+    # 1. 【优先】检查永久 VIP (亲友/后门)
+    # 数据库里取出来可能是 1 或 True，做个兼容
+    if user_row[perm_col] == 1:
+        # 对于亲友，我们返回一个极远的未来时间，让前端显示“长期有效”或类似效果
+        return True, "2099-12-31T23:59:59"
+        
+    # 2. 检查付费订阅的过期时间
+    if user_row[expire_col]:
+        try:
+            # 数据库存的是字符串，转回 datetime
+            expires_at = datetime.fromisoformat(str(user_row[expire_col]))
+            if expires_at > now:
+                return True, user_row[expire_col]
+            else:
+                # 【优化】如果已经过期，虽然逻辑上返回 False，
+                # 但可以在这里记录一下，或者由 App 端下次登录时更新
+                return False, user_row[expire_col]
+        except:
+            pass
+            
+    return False, None
+
+# --- 用户认证相关 ---
+def handle_auth(app_name):
+    try:
+        data = request.get_json()
+        user_id = data.get('user_id')
+        device_id = data.get('device_id') # 【新增】接收客户端传来的设备ID
+        
+        if not user_id: return jsonify({"error": "Missing user_id"}), 400
+        conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
+        user = c.fetchone()
+        now = datetime.utcnow()
+        is_subscribed = False
+        expiration_date = None
+        if user:
+            # 老用户：更新登录时间，同时关联/更新最新的 device_id
+            c.execute(
+                "UPDATE users SET last_login_at = ?, device_id = ? WHERE apple_user_id = ?", 
+                (now, device_id, user_id)
+            )
+            # 检查权限 (传入 app_name)
+            is_subscribed, expiration_date = check_user_subscription_status(user, app_name)
+        else:
+            # 新用户：插入记录，同时写入 device_id
+            c.execute(
+                "INSERT INTO users (apple_user_id, device_id, created_at, last_login_at) VALUES (?, ?, ?, ?)",
+                (user_id, device_id, now, now)
+            )
+            # 新用户肯定没订阅且不是VIP
+        
+        conn.commit()
+        conn.close()
+        return jsonify({
+            "status": "success", 
+            "is_subscribed": is_subscribed,
+            "subscription_expires_at": expiration_date,
+            "video_module_blocked": user_id in VIDEO_MODULE_BLOCKED_USERS   # 【新增】
+        }), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+def handle_status_check(app_name):
+    user_id = request.args.get('user_id')
+    if not user_id: return jsonify({"error": "Missing user_id"}), 400
+    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
+        row = c.fetchone()
+        is_subscribed = False
+        expires_at_str = None
+        if row:
+            is_subscribed, expires_at_str = check_user_subscription_status(row, app_name)
+        return jsonify({
+            "is_subscribed": is_subscribed, 
+            "subscription_expires_at": expires_at_str,
+            "video_module_blocked": user_id in VIDEO_MODULE_BLOCKED_USERS   # 【新增】
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+# 【新增】处理邀请码兑换
+def handle_redeem_invite(app_name):
+    data = request.get_json()
+    user_id = data.get('user_id')
+    invite_code = data.get('invite_code')
+    if not user_id or not invite_code:
+        return jsonify({"error": "缺少参数"}), 400
+        
+    # 验证邀请码
+    if invite_code not in VALID_INVITE_CODES:
+        return jsonify({"error": "无效的邀请码"}), 403
+    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
+    c = conn.cursor()
+    try:
+        # 确定要更新哪个字段
+        perm_col = f"{app_name.lower()}_is_permanent"
+        
+        # 设置永久 VIP 标记为 1
+        query = f"UPDATE users SET {perm_col} = 1 WHERE apple_user_id = ?"
+        c.execute(query, (user_id,))
+        if c.rowcount == 0:
+            return jsonify({"error": "用户不存在，请先登录"}), 404
+        conn.commit()
+        print(f"[{app_name}] 用户 {user_id} 使用邀请码 {invite_code} 升级为永久 VIP")
+        
+        return jsonify({
+            "status": "success",
+            "is_subscribed": True,
+            "subscription_expires_at": "2099-12-31T23:59:59"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+def handle_payment(app_name):
+    data = request.get_json()
+    user_id = data.get('user_id')
+    days = data.get('days', 30) # 保持默认值用于兼容旧版本或手动充值
+    # 【新增】接收客户端传来的真实过期时间字符串 (ISO 8601 格式)
+    explicit_expiry = data.get('explicit_expiry') 
+    if not user_id: return jsonify({"error": "Missing user_id"}), 400
+    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
+        row = c.fetchone()
+        if not row: return jsonify({"error": "User not found"}), 404
+        now = datetime.utcnow()
+        
+        # 确定要更新哪个字段
+        expire_col = f"{app_name.lower()}_expire_at"
+        new_expiry_str = ""
+
+        # 【核心修改】逻辑分支
+        if explicit_expiry:
+            # 方案 A: 客户端传了真实的 Apple 过期时间，直接使用
+            # 这样就实现了"同步"，而不是"充值"
+            print(f"[{app_name}] 同步用户 {user_id} 订阅时间至: {explicit_expiry}")
+            new_expiry_str = explicit_expiry
+        else:
+            # 方案 B: 旧逻辑 (充值模式) - 依然保留以备不时之需
+            current_expiry_str = row[expire_col]
+            new_expiry = now + timedelta(days=days) 
+            
+            if current_expiry_str:
+                try:
+                    current_expiry = datetime.fromisoformat(current_expiry_str)
+                    if current_expiry > now:
+                        new_expiry = current_expiry + timedelta(days=days)
+                except: pass
+            new_expiry_str = new_expiry.isoformat()
+        
+        # 执行更新
+        query = f"UPDATE users SET {expire_col} = ? WHERE apple_user_id = ?"
+        c.execute(query, (new_expiry_str, user_id))
+        conn.commit()
+        return jsonify({
+            "status": "success", 
+            "is_subscribed": True, 
+            "subscription_expires_at": new_expiry_str
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+# --- ONews 路由 (保持兼容) ---
+@app.route('/api/ONews/auth/apple', methods=['POST'])
+def onews_auth(): return handle_auth('ONews')
+
+@app.route('/api/ONews/payment/subscribe', methods=['POST'])
+def onews_pay(): return handle_payment('ONews')
+
+# 注意状态检查也要传 App 名，因为我们要看特定 App 的权限
+@app.route('/api/ONews/user/status', methods=['GET'])
+def onews_status(): 
+    # 这里复用 handle_auth 里的 check 逻辑，稍微改写一下 handle_status_check
+    return handle_status_check('ONews') 
+
+# ONews 兑换路由
+@app.route('/api/ONews/user/redeem', methods=['POST'])
+def onews_redeem(): return handle_redeem_invite('ONews')
+
+# --- Prediction 路由 ---
+@app.route('/api/Prediction/auth/apple', methods=['POST'])
+def prediction_auth(): return handle_auth('Prediction')
+
+@app.route('/api/Prediction/payment/subscribe', methods=['POST'])
+def prediction_pay(): return handle_payment('Prediction')
+
+@app.route('/api/Prediction/user/status', methods=['GET'])
+def prediction_status(): return handle_status_check('Prediction')
+
+@app.route('/api/Prediction/user/redeem', methods=['POST'])
+def prediction_redeem(): return handle_redeem_invite('Prediction')
+
+@app.route('/api/Prediction/user/delete', methods=['POST'])
+def prediction_delete(): return delete_user('Prediction')
+
+# --- Finance 路由 ---
+@app.route('/api/Finance/auth/apple', methods=['POST'])
+def finance_auth(): return handle_auth('Finance')
+
+@app.route('/api/Finance/payment/subscribe', methods=['POST'])
+def finance_pay(): return handle_payment('Finance')
+
+@app.route('/api/Finance/user/status', methods=['GET'])
+def finance_status(): return handle_status_check('Finance')
+
+# 注册 Finance 的兑换路由！！！
+@app.route('/api/Finance/user/redeem', methods=['POST'])
+def finance_redeem(): return handle_redeem_invite('Finance')
+
 # 新增：Finance 数据查询 API (替代本地 SQL)
 
 # 1. 获取所有市值数据

@@ -532,7 +532,7 @@ def build_video_db():
     with open(video_file, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
-    # ⭐ 新增：读取黑名单 key 集合，用于判断「Movie 全部 episode 失效」
+    # ⭐ 读取黑名单 key 集合，用于判断「episode 失效」
     blacklist_file = os.path.join(OVIDEO_DIR, 'blacklist_url.json')
     blacklist_set = set()
     if os.path.exists(blacklist_file):
@@ -541,6 +541,16 @@ def build_video_db():
                 blacklist_set = set(json.load(bf).keys())
         except Exception as e:
             print(f"[OVideo] 黑名单读取失败: {e}")
+
+    # ⭐ 新增：读取 url_mapping 的有效 key 集合（Drama/Anime 隐藏判定需要）
+    mapping_file = os.path.join(OVIDEO_DIR, 'url_mapping.json')
+    valid_url_set = set()
+    if os.path.exists(mapping_file):
+        try:
+            with open(mapping_file, 'r', encoding='utf-8') as mf:
+                valid_url_set = set(json.load(mf).keys())
+        except Exception as e:
+            print(f"[OVideo] url_mapping 读取失败: {e}")
 
     conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=60.0)
     c = conn.cursor()
@@ -561,6 +571,10 @@ def build_video_db():
         )
     ''')
     c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+
+    # ⭐ 一个 url 是否「可播放」：在 mapping 里 或 本身就是 m3u8 直链
+    def _is_playable(u):
+        return (u in valid_url_set) or ('.m3u8' in (u or '').lower())
 
     rows = []
     cat_order = list(data.keys())
@@ -584,19 +598,37 @@ def build_video_db():
             item_nolist = dict(item)
             playlist = item_nolist.pop('playlist', [])
 
-            # ⭐ 新增：仅针对 Movie 大类，若 playlist 中「所有」episode 的 url
-            #    都存在于黑名单中，则标记隐藏（hide_blacklisted=1）。
-            #    只要有任意一个 url 不在黑名单里（哪怕它也不在 mapping 里），
-            #    就保留显示（详情页仍走原有「洽谈中」逻辑）。
             hide_blacklisted = 0
-            if category == 'Movie' and blacklist_set:
-                all_ep_urls = []
-                for ch in playlist:
-                    for ep_url in (ch.get('episodes') or {}).values():
-                        all_ep_urls.append(ep_url)
-                # 必须存在至少一个 episode，且全部命中黑名单才隐藏
-                if all_ep_urls and all(u in blacklist_set for u in all_ep_urls):
-                    hide_blacklisted = 1
+            if blacklist_set:
+                if category == 'Movie':
+                    # ── Movie 逻辑保持不变：所有 episode 全部命中黑名单才隐藏 ──
+                    all_ep_urls = []
+                    for ch in playlist:
+                        for ep_url in (ch.get('episodes') or {}).values():
+                            all_ep_urls.append(ep_url)
+                    if all_ep_urls and all(u in blacklist_set for u in all_ep_urls):
+                        hide_blacklisted = 1
+
+                elif category in ('Drama', 'Anime', 'Show'):
+                    # ── 新增 Drama/Anime 逻辑 ──
+                    # 对「每一个有剧集的渠道」都必须满足：
+                    #   (1) 该渠道里所有 url 都不可播放（不在 mapping 且非 m3u8）
+                    #   (2) 该渠道里至少有一个 url 在黑名单里
+                    # 只有全部渠道都满足，才隐藏。
+                    channels_with_eps = [
+                        ch for ch in playlist if (ch.get('episodes') or {})
+                    ]
+                    if channels_with_eps:
+                        hide = True
+                        for ch in channels_with_eps:
+                            ep_urls = list((ch.get('episodes') or {}).values())
+                            all_unplayable = all(not _is_playable(u) for u in ep_urls)
+                            has_blacklisted = any(u in blacklist_set for u in ep_urls)
+                            if not (all_unplayable and has_blacklisted):
+                                hide = False
+                                break
+                        if hide:
+                            hide_blacklisted = 1
 
             rows.append((
                 url, category, name,
@@ -622,12 +654,14 @@ def build_video_db():
     c.execute("CREATE INDEX idx_cat_release ON videos(category, release_sort_key)")
     c.execute("CREATE INDEX idx_cat_rating  ON videos(category, best_rating)")
     c.execute("CREATE INDEX idx_doc ON videos(has_documentary)")
-    c.execute("CREATE INDEX idx_hide ON videos(hide_blacklisted)")   # ⭐ 新增
+    c.execute("CREATE INDEX idx_hide ON videos(hide_blacklisted)")
     c.execute("INSERT OR REPLACE INTO meta VALUES ('source_mtime', ?)",
               (str(os.path.getmtime(video_file)),))
-    # ⭐ 新增：记录黑名单文件 mtime，用于黑名单变化时自动重建
     c.execute("INSERT OR REPLACE INTO meta VALUES ('blacklist_mtime', ?)",
               (str(os.path.getmtime(blacklist_file)) if os.path.exists(blacklist_file) else "0",))
+    # ⭐ 新增：记录 url_mapping 文件 mtime，用于 mapping 变化时自动重建
+    c.execute("INSERT OR REPLACE INTO meta VALUES ('mapping_mtime', ?)",
+              (str(os.path.getmtime(mapping_file)) if os.path.exists(mapping_file) else "0",))
     c.execute("INSERT OR REPLACE INTO meta VALUES ('categories', ?)",
               (json.dumps(cat_order, ensure_ascii=False),))
     conn.commit()
@@ -635,15 +669,18 @@ def build_video_db():
     print(f"[OVideo] 构建完成，共 {len(rows)} 条。")
 
 def ensure_video_db():
-    """JSON 或 黑名单 变更时自动重建（加锁，避免并发重复构建）"""
+    """JSON / 黑名单 / url_mapping 变更时自动重建（加锁，避免并发重复构建）"""
     video_file = os.path.join(OVIDEO_DIR, 'OVideos.json')
     if not os.path.exists(video_file):
         return
     src_m = str(os.path.getmtime(video_file))
 
-    # ⭐ 新增：黑名单文件 mtime
     blacklist_file = os.path.join(OVIDEO_DIR, 'blacklist_url.json')
     bl_m = str(os.path.getmtime(blacklist_file)) if os.path.exists(blacklist_file) else "0"
+
+    # ⭐ 新增：url_mapping mtime
+    mapping_file = os.path.join(OVIDEO_DIR, 'url_mapping.json')
+    map_m = str(os.path.getmtime(mapping_file)) if os.path.exists(mapping_file) else "0"
 
     need = False
     if not os.path.exists(OVIDEO_DB_PATH):
@@ -653,10 +690,13 @@ def ensure_video_db():
             conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=10.0)
             r  = conn.execute("SELECT value FROM meta WHERE key='source_mtime'").fetchone()
             r2 = conn.execute("SELECT value FROM meta WHERE key='blacklist_mtime'").fetchone()
+            r3 = conn.execute("SELECT value FROM meta WHERE key='mapping_mtime'").fetchone()
             conn.close()
             if not r or r[0] != src_m:
                 need = True
-            if not r2 or r2[0] != bl_m:   # ⭐ 黑名单变了也要重建
+            if not r2 or r2[0] != bl_m:
+                need = True
+            if not r3 or r3[0] != map_m:   # ⭐ mapping 变了也要重建
                 need = True
         except Exception:
             need = True
@@ -667,8 +707,10 @@ def ensure_video_db():
                 conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=10.0)
                 r  = conn.execute("SELECT value FROM meta WHERE key='source_mtime'").fetchone()
                 r2 = conn.execute("SELECT value FROM meta WHERE key='blacklist_mtime'").fetchone()
+                r3 = conn.execute("SELECT value FROM meta WHERE key='mapping_mtime'").fetchone()
                 conn.close()
-                if r and r[0] == src_m and r2 and r2[0] == bl_m:
+                if (r and r[0] == src_m and r2 and r2[0] == bl_m
+                        and r3 and r3[0] == map_m):
                     return
             except Exception:
                 pass

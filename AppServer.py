@@ -3225,7 +3225,8 @@ function openWishReply(id, content){
     <div style="text-align:left">
       <p style="margin-bottom:8px">用户想看：<strong style="color:#60a5fa">${content}</strong></p>
       <p style="font-size:12px;color:#94a3b8;margin-bottom:8px">
-        可填写回复留言（用户下次打开 App 会在首页收到；留空则仅标记“已处理”）：</p>
+        可填写回复留言（用户下次打开 App 会在首页收到；留空则仅标记“已处理”）。
+        <br>提示：按 <b style="color:#86efac">Shift + Enter</b> 可直接提交。</p>
       <textarea id="wishReplyInput" rows="3"
         style="width:100%;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:10px;font-size:14px;"
         placeholder="例如：视频已找到，请享用 / 该剧下月上线"></textarea>
@@ -3234,6 +3235,20 @@ function openWishReply(id, content){
   btn.innerText = "提交并标记已处理";
   btn.onclick = submitWishReply;
   document.getElementById('confirmModal').style.display = 'flex';
+  
+  // ⭐ 弹窗出现后：自动聚焦输入框 + 绑定 Shift+Enter 提交
+  setTimeout(() => {
+    const ta = document.getElementById('wishReplyInput');
+    if (ta) {
+      ta.focus();
+      ta.addEventListener('keydown', function(e){
+        if (e.key === 'Enter' && e.shiftKey) {
+          e.preventDefault();
+          submitWishReply();
+        }
+      });
+    }
+  }, 50);
 }
 
 async function submitWishReply(){
@@ -3296,7 +3311,8 @@ function openReportReply(epEnc, title){
     <div style="text-align:left">
       <p style="margin-bottom:8px">视频：<strong style="color:#60a5fa">${title}</strong></p>
       <p style="font-size:12px;color:#94a3b8;margin-bottom:8px">
-        可填写回复留言（举报该集的用户下次打开 App 会在首页收到；留空则仅标记"已处理"）：</p>
+        可填写回复留言（举报该集的用户下次打开 App 会在首页收到；留空则仅标记"已处理"）。
+        <br>提示：按 <b style="color:#86efac">Shift + Enter</b> 可直接提交。</p>
       <textarea id="reportReplyInput" rows="3"
         style="width:100%;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:10px;font-size:14px;"
         placeholder="例如：链接已修复，请重试 / 已更换播放源"></textarea>
@@ -3305,6 +3321,20 @@ function openReportReply(epEnc, title){
   btn.innerText = "提交并标记已处理";
   btn.onclick = submitReportReply;
   document.getElementById('confirmModal').style.display = 'flex';
+
+  // ⭐ 弹窗出现后：自动聚焦输入框 + 绑定 Shift+Enter 提交
+  setTimeout(() => {
+    const ta = document.getElementById('reportReplyInput');
+    if (ta) {
+      ta.focus();
+      ta.addEventListener('keydown', function(e){
+        if (e.key === 'Enter' && e.shiftKey) {
+          e.preventDefault();
+          submitReportReply();
+        }
+      });
+    }
+  }, 50);
 }
 
 async function submitReportReply(){

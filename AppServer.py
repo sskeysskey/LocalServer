@@ -38,6 +38,7 @@ ALLOWED_EVENT_TYPES = {'play', 'download_complete'}
 # 【修改】移除了 'read'，仅保留 view, listen
 ALLOWED_NEWS_EVENT_TYPES = {'view', 'listen'}
 ALLOWED_REPORT_TYPES = {'playback_failed', 'download_failed', 'media_error', 'content_mismatch', 'other'}
+ALLOWED_FINANCE_EVENT_TYPES = {'click'}
 report_last_time = {}  # 内存软限流: user_id -> 最近提交时间戳
 wish_last_time = {}   # 内存软限流: user_id -> 最近提交时间戳
 
@@ -186,19 +187,22 @@ def init_user_db():
     conn.close()
     print("用户数据库已准备就绪。")
 
-def get_video_free_quota():
-    """从 ONews/version.json 读取每日免费次数，关闭或异常时返回 0"""
+def get_video_quota_config():
+    """返回 (每日免费次数, 首次登录一次性赠送次数)。enabled=false 时都为 0。"""
     version_file_path = os.path.join(BASE_RESOURCES_DIR, 'ONews', 'version.json')
     try:
         with open(version_file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
             q = data.get('video_free_quota', {}) or {}
             if not q.get('enabled', False):
-                return 0
-            return int(q.get('daily_count', 0))
+                return 0, 0
+            return int(q.get('daily_count', 0)), int(q.get('first_login_bonus', 0))
     except Exception as e:
         print(f"读取免费次数配置失败: {e}")
-        return 0
+        return 0, 0
+
+def get_video_free_quota():
+    return get_video_quota_config()[0]
     
 def init_analytics_db():
     print(f"检查行为数据库: {ANALYTICS_DB_PATH}")
@@ -278,6 +282,21 @@ def init_analytics_db():
         )
     ''')
     c.execute('CREATE INDEX IF NOT EXISTS idx_unlock_user_date ON video_free_unlocks(user_id, unlock_date)')
+
+    # 【新增】一次性赠送点数表（新人首登发放，跨天保留，优先消耗）
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS video_bonus_quota (
+            user_id TEXT PRIMARY KEY,
+            bonus_total INTEGER NOT NULL,
+            bonus_remaining INTEGER NOT NULL,
+            granted_at TIMESTAMP NOT NULL
+        )
+    ''')
+    # 【新增】解锁记录标注来源：bonus=一次性赠送 / daily=每日免费（老库默认 daily）
+    try:
+        c.execute("ALTER TABLE video_free_unlocks ADD COLUMN source TEXT DEFAULT 'daily'")
+    except sqlite3.OperationalError:
+        pass
     
     # 【新增】给举报表补充回复字段（兼容老库）
     for ddl in [
@@ -355,6 +374,36 @@ def init_analytics_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_wish_status ON video_wish_requests(status)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_wish_reply ON video_wish_requests(user_id, reply_status)')
     
+    # 【新增】美股(Finance)点击统计：明细表(去重聚合) + 流水表
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS user_finance_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            user_type TEXT DEFAULT 'apple',
+            card_key TEXT NOT NULL,
+            card_name TEXT,
+            event_type TEXT DEFAULT 'click',
+            first_at TIMESTAMP NOT NULL,
+            last_at TIMESTAMP NOT NULL,
+            count INTEGER DEFAULT 1,
+            UNIQUE(user_id, card_key, event_type)
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS finance_event_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            user_type TEXT DEFAULT 'apple',
+            card_key TEXT NOT NULL,
+            card_name TEXT,
+            event_type TEXT DEFAULT 'click',
+            created_at TIMESTAMP NOT NULL
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_fin_logs_time ON finance_event_logs(created_at)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_fin_logs_card ON finance_event_logs(card_key)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_fin_logs_user ON finance_event_logs(user_id)')
+
     conn.commit()
     conn.close()
     print("行为数据库已就绪。")
@@ -1068,9 +1117,6 @@ def ovideo_list():
         it['category'] = r['category']
         items.append(it)
     return jsonify({"items": items, "has_more": has_more, "page": page})
-
-# 分割线
-# ==========================================
 
 @app.route('/api/OVideo/filter', methods=['GET'])
 def ovideo_filter():
@@ -1860,31 +1906,60 @@ def video_quota_status():
     user_id = request.args.get('user_id')
     if not user_id:
         return jsonify({"error": "Missing user_id"}), 400
-    # ⭐ 未登录(设备/游客)不享受免费次数
+
+    daily_quota, bonus_amount = get_video_quota_config()
+
+    # 未登录(设备/游客)不享受任何免费点数
     if not is_real_login_user(user_id):
         return jsonify({
-            "daily_quota": get_video_free_quota(),
-            "used_today": 0,
-            "remaining": 0,
-            "unlocked_episodes": []
+            "daily_quota": daily_quota, "used_today": 0,
+            "remaining": 0, "daily_remaining": 0,
+            "bonus_remaining": 0, "total_remaining": 0,
+            "bonus_just_granted": False, "unlocked_episodes": []
         })
-    maybe_cleanup_old_unlocks()   # ⭐ 每天首个请求触发一次清理
-    quota = get_video_free_quota()
-    today = today_str()                      # ⭐ 改为钉死北京时间
+
+    maybe_cleanup_old_unlocks()
+    today = today_str()
     conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
+    just_granted = False
     try:
-        c.execute("SELECT episode_key FROM video_free_unlocks WHERE user_id=? AND unlock_date=?",
-                  (user_id, today))
-        keys = [r['episode_key'] for r in c.fetchall()]
+        # 首次访问的真实登录用户 → 发放一次性赠送点数（幂等）
+        brow = c.execute("SELECT bonus_remaining FROM video_bonus_quota WHERE user_id=?",
+                         (user_id,)).fetchone()
+        if brow is None:
+            if bonus_amount > 0:
+                c.execute('''INSERT OR IGNORE INTO video_bonus_quota
+                             (user_id, bonus_total, bonus_remaining, granted_at)
+                             VALUES (?,?,?,?)''',
+                          (user_id, bonus_amount, bonus_amount, now_iso()))
+                conn.commit()
+                just_granted = True
+                bonus_remaining = bonus_amount
+            else:
+                bonus_remaining = 0
+        else:
+            bonus_remaining = brow['bonus_remaining']
+
+        rows = c.execute('''SELECT episode_key, COALESCE(source,'daily') AS source
+                            FROM video_free_unlocks WHERE user_id=? AND unlock_date=?''',
+                         (user_id, today)).fetchall()
+        keys = [r['episode_key'] for r in rows]
+        daily_used = sum(1 for r in rows if r['source'] == 'daily')
     finally:
         conn.close()
-    used = len(keys)
+
+    daily_remaining = max(0, daily_quota - daily_used)
+    total_remaining = bonus_remaining + daily_remaining
     return jsonify({
-        "daily_quota": quota,
-        "used_today": used,
-        "remaining": max(0, quota - used),
+        "daily_quota": daily_quota,
+        "used_today": daily_used,
+        "remaining": total_remaining,          # 兼容旧门禁：总剩余
+        "daily_remaining": daily_remaining,
+        "bonus_remaining": bonus_remaining,
+        "total_remaining": total_remaining,
+        "bonus_just_granted": just_granted,    # 新人礼包刚发放，供客户端弹欢迎提示
         "unlocked_episodes": keys
     })
 
@@ -1896,45 +1971,84 @@ def video_quota_unlock():
     episode_key = data.get('episode_key')
     if not user_id or not episode_key:
         return jsonify({"error": "Missing params"}), 400
-    # ⭐ 未登录用户不能解锁免费次数
     if not is_real_login_user(user_id):
-        return jsonify({"status": "quota_exceeded", "remaining": 0})
-    quota = get_video_free_quota()
-    today = today_str()                      # ⭐ 改为钉死北京时间
+        return jsonify({"status": "quota_exceeded", "remaining": 0,
+                        "bonus_remaining": 0, "daily_remaining": 0, "total_remaining": 0})
+
+    daily_quota, bonus_amount = get_video_quota_config()
+    today = today_str()
     now = now_iso()
 
-    # ⭐ isolation_level=None：关闭 Python 隐式事务管理，由我们手动控制
     conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     try:
-        # ⭐ 立即拿写锁，把"检查 + 插入"串行化，杜绝并发超额白嫖
         c.execute("BEGIN IMMEDIATE")
 
-        # 1) 本集今天是否已解锁 → 幂等，不再扣次数
-        c.execute("SELECT 1 FROM video_free_unlocks WHERE user_id=? AND episode_key=? AND unlock_date=?",
-                  (user_id, episode_key, today))
-        if c.fetchone():
-            c.execute("SELECT COUNT(*) AS n FROM video_free_unlocks WHERE user_id=? AND unlock_date=?",
-                      (user_id, today))
-            used = c.fetchone()['n']
-            c.execute("COMMIT")
-            return jsonify({"status": "already_unlocked", "remaining": max(0, quota - used)})
+        # 保证 bonus 行存在（幂等发放）
+        brow = c.execute("SELECT bonus_remaining FROM video_bonus_quota WHERE user_id=?",
+                         (user_id,)).fetchone()
+        if brow is None:
+            if bonus_amount > 0:
+                c.execute('''INSERT OR IGNORE INTO video_bonus_quota
+                             (user_id, bonus_total, bonus_remaining, granted_at)
+                             VALUES (?,?,?,?)''',
+                          (user_id, bonus_amount, bonus_amount, now))
+                bonus_remaining = bonus_amount
+            else:
+                bonus_remaining = 0
+        else:
+            bonus_remaining = brow['bonus_remaining']
 
-        # 2) 今天已用多少
-        c.execute("SELECT COUNT(*) AS n FROM video_free_unlocks WHERE user_id=? AND unlock_date=?",
-                  (user_id, today))
-        used = c.fetchone()['n']
-        if used >= quota:
-            c.execute("COMMIT")
-            return jsonify({"status": "quota_exceeded", "remaining": 0})
+        def daily_used_count():
+            return c.execute('''SELECT COUNT(*) AS n FROM video_free_unlocks
+                                WHERE user_id=? AND unlock_date=?
+                                AND COALESCE(source,'daily')='daily' ''',
+                             (user_id, today)).fetchone()['n']
 
-        # 3) 扣次数并绑定
-        c.execute('''INSERT INTO video_free_unlocks (user_id, episode_key, unlock_date, video_title, created_at)
-                     VALUES (?,?,?,?,?)''',
-                  (user_id, episode_key, today, data.get('video_title', ''), now))
+        # 1) 幂等：本集今天已解锁
+        if c.execute("SELECT 1 FROM video_free_unlocks WHERE user_id=? AND episode_key=? AND unlock_date=?",
+                     (user_id, episode_key, today)).fetchone():
+            daily_used = daily_used_count()
+            c.execute("COMMIT")
+            daily_remaining = max(0, daily_quota - daily_used)
+            total = bonus_remaining + daily_remaining
+            return jsonify({"status": "already_unlocked", "remaining": total,
+                            "bonus_remaining": bonus_remaining,
+                            "daily_remaining": daily_remaining, "total_remaining": total})
+
+        daily_used = daily_used_count()
+        daily_remaining = max(0, daily_quota - daily_used)
+
+        # 2) 决定消耗来源：优先赠送点数
+        if bonus_remaining > 0:
+            source = 'bonus'
+        elif daily_remaining > 0:
+            source = 'daily'
+        else:
+            c.execute("COMMIT")
+            return jsonify({"status": "quota_exceeded", "remaining": 0,
+                            "bonus_remaining": 0, "daily_remaining": 0, "total_remaining": 0})
+
+        # 3) 记录解锁 + 扣减
+        c.execute('''INSERT INTO video_free_unlocks
+                     (user_id, episode_key, unlock_date, video_title, created_at, source)
+                     VALUES (?,?,?,?,?,?)''',
+                  (user_id, episode_key, today, data.get('video_title', ''), now, source))
+
+        if source == 'bonus':
+            c.execute("UPDATE video_bonus_quota SET bonus_remaining = bonus_remaining - 1 WHERE user_id=?",
+                      (user_id,))
+            bonus_remaining -= 1
+        else:
+            daily_used += 1
+            daily_remaining = max(0, daily_quota - daily_used)
+
         c.execute("COMMIT")
-        return jsonify({"status": "success", "remaining": max(0, quota - used - 1)})
+        total = bonus_remaining + daily_remaining
+        return jsonify({"status": "success", "remaining": total,
+                        "bonus_remaining": bonus_remaining,
+                        "daily_remaining": daily_remaining, "total_remaining": total})
     except Exception as e:
         try:
             c.execute("ROLLBACK")
@@ -1944,37 +2058,6 @@ def video_quota_unlock():
         return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
-    
-
-# 分割线
-# ==========================================
-# # 4. 服务端搜索（可选，客户端也可以自己搜）
-# @app.route('/api/OVideo/search', methods=['GET'])
-# def search_ovideo():
-#     keyword = request.args.get('q', '').strip().lower()
-#     if not keyword:
-#         return jsonify({"results": []})
-#     video_file = os.path.join(OVIDEO_DIR, 'OVideos.json')
-#     if not os.path.exists(video_file):
-#         return jsonify({"results": []})
-#     try:
-#         with open(video_file, 'r', encoding='utf-8') as f:
-#             data = json.load(f)
-#         results = []
-#         for category_name, items in data.items():
-#             for item in items:
-#                 name = item.get('name', '').lower()
-#                 director = (item.get('导演') or '').lower()
-#                 cast = ' '.join(item.get('主演') or []).lower()
-#                 intro = (item.get('intro') or '').lower()
-#                 if (keyword in name or keyword in director
-#                         or keyword in cast or keyword in intro):
-#                     result_item = dict(item)
-#                     result_item['category'] = category_name
-#                     results.append(result_item)
-#         return jsonify({"results": results})
-#     except Exception as e:
-#         return jsonify({"error": str(e)}), 500
 
 # --- ONews API 路由 ---
 @app.route('/api/<app_name>/check_version', methods=['GET'])
@@ -2298,6 +2381,40 @@ def finance_status(): return handle_status_check('Finance')
 # 注册 Finance 的兑换路由！！！
 @app.route('/api/Finance/user/redeem', methods=['POST'])
 def finance_redeem(): return handle_redeem_invite('Finance')
+
+# Finance 点击行为上报
+@app.route('/api/Finance/track', methods=['POST'])
+def track_finance_event():
+    try:
+        data = request.get_json()
+        user_id    = data.get('user_id')
+        user_type  = data.get('user_type', 'apple')
+        card_key   = data.get('card_key')
+        card_name  = data.get('card_name', '')
+        event_type = data.get('event_type', 'click')
+        if not user_id or not card_key or event_type not in ALLOWED_FINANCE_EVENT_TYPES:
+            return jsonify({"error": "Invalid params"}), 400
+        now = now_iso()   # 北京时间
+        conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO user_finance_events
+                (user_id, user_type, card_key, card_name, event_type, first_at, last_at, count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(user_id, card_key, event_type)
+            DO UPDATE SET last_at = ?, count = count + 1
+        ''', (user_id, user_type, card_key, card_name, event_type, now, now, now))
+        c.execute('''
+            INSERT INTO finance_event_logs
+                (user_id, user_type, card_key, card_name, event_type, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, user_type, card_key, card_name, event_type, now))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 # 新增：Finance 数据查询 API (替代本地 SQL)
 
@@ -2694,6 +2811,92 @@ def _query_analytics(sql, params=()):
     return [dict(r) for r in rows]
 
 
+# ============================================
+
+# 美股 - 总览
+@app.route('/admin/api/finance/overview', methods=['GET'])
+@require_admin
+def admin_finance_overview():
+    today = today_str()
+    return jsonify({
+        "total_users":  _query_analytics("SELECT COUNT(DISTINCT user_id) c FROM finance_event_logs")[0]['c'],
+        "today_active": _query_analytics("SELECT COUNT(DISTINCT user_id) c FROM finance_event_logs WHERE date(created_at)=?", (today,))[0]['c'],
+        "today_clicks": _query_analytics("SELECT COUNT(*) c FROM finance_event_logs WHERE date(created_at)=?", (today,))[0]['c'],
+        "total_clicks": _query_analytics("SELECT COUNT(*) c FROM finance_event_logs")[0]['c'],
+    })
+
+# 美股 - 活跃用户榜
+@app.route('/admin/api/finance/top_users', methods=['GET'])
+@require_admin
+def admin_finance_top_users():
+    rows = _query_analytics('''
+        SELECT user_id,
+               MAX(user_type) AS user_type,
+               COUNT(DISTINCT card_key) AS unique_cards,
+               COUNT(*) AS total_clicks,
+               MAX(created_at) AS last_active
+        FROM finance_event_logs
+        GROUP BY user_id
+        ORDER BY total_clicks DESC
+        LIMIT 50
+    ''')
+    return jsonify(rows)
+
+# 美股 - 某用户点击明细(按卡片聚合，按最后时间排序)
+@app.route('/admin/api/finance/user_details', methods=['GET'])
+@require_admin
+def admin_finance_user_details():
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return jsonify({"error": "Missing user_id"}), 400
+    sql = '''
+        SELECT card_key, MAX(card_name) AS card_name,
+               MAX(created_at) AS last_time,
+               COUNT(*) AS click_count
+        FROM finance_event_logs
+        WHERE user_id = ?
+        GROUP BY card_key
+        ORDER BY last_time DESC
+    '''
+    return jsonify(_query_analytics(sql, (user_id,)))
+
+# 美股 - 30天趋势
+@app.route('/admin/api/finance/daily_trend', methods=['GET'])
+@require_admin
+def admin_finance_daily_trend():
+    rows = _query_analytics('''
+        SELECT date(created_at) AS day,
+               COUNT(*) AS cnt,
+               COUNT(DISTINCT user_id) AS uu
+        FROM finance_event_logs
+        WHERE created_at >= datetime('now', '+8 hours', '-30 days')
+        GROUP BY day
+        ORDER BY day ASC
+    ''')
+    return jsonify(rows)
+
+# 美股 - 模块热度榜
+@app.route('/admin/api/finance/top_cards', methods=['GET'])
+@require_admin
+def admin_finance_top_cards():
+    period = request.args.get('period', '7d')
+    where = ""
+    if period == 'today':
+        where = "AND date(created_at) = date('now', '+8 hours')"
+    elif period == '7d':
+        where = "AND created_at >= datetime('now', '+8 hours', '-7 days')"
+    sql = f'''
+        SELECT card_key, MAX(card_name) AS card_name,
+               COUNT(DISTINCT user_id) AS unique_users,
+               COUNT(*) AS total_count
+        FROM finance_event_logs
+        WHERE 1=1 {where}
+        GROUP BY card_key
+        ORDER BY total_count DESC
+        LIMIT 60
+    '''
+    return jsonify(_query_analytics(sql))
+
 # 今日 / 总览
 @app.route('/admin/api/news/overview', methods=['GET'])
 @require_admin
@@ -2841,7 +3044,9 @@ def admin_clear_db():
             c.execute("DELETE FROM user_news_events")
             c.execute("DELETE FROM news_event_logs")
             c.execute("DELETE FROM video_link_reports")
-            c.execute("DELETE FROM video_wish_requests")   # 【新增】
+            c.execute("DELETE FROM video_wish_requests")
+            c.execute("DELETE FROM user_finance_events")   # 【新增】
+            c.execute("DELETE FROM finance_event_logs")    # 【新增】
             conn.commit()
             conn.close()
             
@@ -2949,6 +3154,7 @@ ADMIN_HTML = r'''
     <div class="module-switch">
       <div class="module-tab active" id="tabVideo" onclick="switchModule('video')">🎬 视频模块</div>
       <div class="module-tab" id="tabNews" onclick="switchModule('news')">📰 新闻模块</div>
+      <div class="module-tab" id="tabFinance" onclick="switchModule('finance')">📈 美股模块</div>
     </div>
     <div>
       <span style="color:#94a3b8;font-size:13px;margin-right:12px" id="updateTime"></span>
@@ -3115,6 +3321,48 @@ ADMIN_HTML = r'''
           <tbody id="topArticlesBody"></tbody>
         </table>
       </div>
+    </div>
+  </div>
+
+  <!-- 美股模块 -->
+  <div class="module-section" id="moduleFinance">
+    <div class="stats" id="financeStatsBox"></div>
+
+    <div class="panel" style="margin-bottom:24px">
+      <h3>👥 美股 - 活跃用户榜 <span style="font-size:12px;color:#94a3b8;font-weight:normal;">(点击“点击”数字查看明细；点击表头可切换排序)</span></h3>
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>user id_apple</th>
+            <th>user id_device</th>
+            <th class="sortable" onclick="sortFinanceUsers('total_clicks')">点击 <span id="fsort_total_clicks">▼</span></th>
+            <th class="sortable" onclick="sortFinanceUsers('last_active')">最后活跃 <span id="fsort_last_active"></span></th>
+          </tr>
+        </thead>
+        <tbody id="financeUsersBody"></tbody>
+      </table>
+    </div>
+
+    <div class="row-full">
+      <div class="panel">
+        <h3>📈 美股 - 最近 30 天点击趋势</h3>
+        <canvas id="financeTrendChart"></canvas>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-bottom:24px">
+      <h3>🔥 模块热度榜
+        <span class="tabs">
+          <span class="tab" onclick="switchFinancePeriod(this,'today')">今日</span>
+          <span class="tab active" onclick="switchFinancePeriod(this,'7d')">7天</span>
+          <span class="tab" onclick="switchFinancePeriod(this,'all')">总计</span>
+        </span>
+      </h3>
+      <table>
+        <thead><tr><th>#</th><th>模块 / 卡片</th><th>用户数</th><th>点击次数</th></tr></thead>
+        <tbody id="financeTopCardsBody"></tbody>
+      </table>
     </div>
   </div>
 
@@ -3380,15 +3628,18 @@ function switchModule(name){
   currentModule = name;
   document.getElementById('tabVideo').classList.toggle('active', name==='video');
   document.getElementById('tabNews').classList.toggle('active', name==='news');
+  document.getElementById('tabFinance').classList.toggle('active', name==='finance');
   document.getElementById('moduleVideo').classList.toggle('active', name==='video');
   document.getElementById('moduleNews').classList.toggle('active', name==='news');
+  document.getElementById('moduleFinance').classList.toggle('active', name==='finance');
   loadCurrentModule();
 }
 
 function loadCurrentModule(){
   document.getElementById('updateTime').innerText = '更新于 '+new Date().toLocaleTimeString();
   if(currentModule==='video') loadVideoModule();
-  else loadNewsModule();
+  else if(currentModule==='news') loadNewsModule();
+  else loadFinanceModule();
 }
 
 // 视频模块 
@@ -3792,6 +4043,135 @@ function switchArticleType(el,t){
 function switchArticlePeriod(el,p){
   el.parentNode.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
   el.classList.add('active');articlePeriod=p;loadTopArticles(articleType,p);
+}
+
+//  美股模块 
+let financeTrendChart;
+let financePeriod = '7d';
+let cachedFinanceUsers = [];
+let financeUserSortField = 'total_clicks';
+let financeUserSortOrder = 'desc';
+
+async function loadFinanceModule(){
+  loadFinanceOverview();
+  loadFinanceTrend();
+  loadFinanceTopCards(financePeriod);
+  await loadFinanceUsers();
+}
+
+async function loadFinanceOverview(){
+  const d = await api('/admin/api/finance/overview');if(!d)return;
+  const items = [
+    ['总用户数', d.total_users],
+    ['今日活跃', d.today_active],
+    ['今日点击', d.today_clicks],
+    ['各模块总点击量', d.total_clicks],
+  ];
+  document.getElementById('financeStatsBox').innerHTML = items.map(([l,v])=>
+    `<div class="stat-card"><div class="label">${l}</div><div class="value">${v||0}</div></div>`).join('');
+}
+
+async function loadFinanceTrend(){
+  const data = await api('/admin/api/finance/daily_trend');if(!data)return;
+  const days = data.map(r=>r.day);
+  const clicks = data.map(r=>r.cnt);
+  const users = data.map(r=>r.uu);
+  if(financeTrendChart) financeTrendChart.destroy();
+  financeTrendChart = new Chart(document.getElementById('financeTrendChart'),{
+    type:'line',
+    data:{labels:days,datasets:[
+      {label:'点击量',data:clicks,borderColor:'#60a5fa',backgroundColor:'rgba(96,165,250,.15)',tension:.3,fill:true},
+      {label:'活跃用户',data:users,borderColor:'#34d399',backgroundColor:'rgba(52,211,153,.10)',tension:.3,fill:true},
+    ]},
+    options:{responsive:true,plugins:{legend:{labels:{color:'#cbd5e1'}}},scales:{x:{ticks:{color:'#94a3b8'}},y:{ticks:{color:'#94a3b8'}}}}
+  });
+}
+
+async function loadFinanceTopCards(period){
+  const data = await api(`/admin/api/finance/top_cards?period=${period}`);if(!data)return;
+  document.getElementById('financeTopCardsBody').innerHTML = data.length===0
+    ? '<tr><td colspan="4" style="text-align:center;color:#64748b">暂无数据</td></tr>'
+    : data.map((r,i)=>`<tr>
+        <td>${i+1}</td>
+        <td><strong>${r.card_name||r.card_key}</strong> <span style="font-size:11px;color:#64748b">${r.card_key}</span></td>
+        <td><span class="pill pill-green">${r.unique_users}</span></td>
+        <td>${r.total_count}</td>
+      </tr>`).join('');
+}
+
+function switchFinancePeriod(el,p){
+  el.parentNode.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  el.classList.add('active');financePeriod=p;loadFinanceTopCards(p);
+}
+
+async function loadFinanceUsers(){
+  const data = await api('/admin/api/finance/top_users');if(!data)return;
+  cachedFinanceUsers = data;
+  renderFinanceUsers();
+}
+
+function renderFinanceUsers(){
+  document.getElementById('fsort_total_clicks').innerText =
+    financeUserSortField === 'total_clicks' ? (financeUserSortOrder === 'desc' ? '▼' : '▲') : '';
+  document.getElementById('fsort_last_active').innerText =
+    financeUserSortField === 'last_active' ? (financeUserSortOrder === 'desc' ? '▼' : '▲') : '';
+
+  const sorted = [...cachedFinanceUsers].sort((a,b)=>{
+    let valA = a[financeUserSortField], valB = b[financeUserSortField];
+    if(financeUserSortField==='last_active'){ valA=valA||''; valB=valB||''; }
+    else { valA=Number(valA)||0; valB=Number(valB)||0; }
+    if(valA<valB) return financeUserSortOrder==='desc'?1:-1;
+    if(valA>valB) return financeUserSortOrder==='desc'?-1:1;
+    return 0;
+  });
+
+  document.getElementById('financeUsersBody').innerHTML = sorted.length===0
+    ? '<tr><td colspan="5" style="text-align:center;color:#64748b">暂无数据</td></tr>'
+    : sorted.map((r,i)=>{
+        const isDevice = (r.user_type==='device') || (r.user_id||'').startsWith('dev_');
+        const appleCell = !isDevice
+          ? `<span style="font-family:monospace;font-size:11px">${r.user_id.substring(0,24)}...</span>`
+          : '<span style="color:#475569">-</span>';
+        const deviceCell = isDevice
+          ? `<span style="font-family:monospace;font-size:11px">${r.user_id.substring(0,24)}...</span>`
+          : '<span style="color:#475569">-</span>';
+        return `<tr>
+          <td>${i+1}</td>
+          <td>${appleCell}</td>
+          <td>${deviceCell}</td>
+          <td><span class="clickable" style="font-weight:bold;" onclick="showFinanceUserDetails('${encodeURIComponent(r.user_id)}')">${r.total_clicks||0}</span></td>
+          <td style="color:#94a3b8;font-size:12px">${(r.last_active||'').replace('T',' ').substring(0,19)}</td>
+        </tr>`;
+      }).join('');
+}
+
+function sortFinanceUsers(field){
+  if(financeUserSortField===field){
+    financeUserSortOrder = financeUserSortOrder==='desc'?'asc':'desc';
+  } else {
+    financeUserSortField = field;
+    financeUserSortOrder = 'desc';
+  }
+  renderFinanceUsers();
+}
+
+async function showFinanceUserDetails(userIdEnc){
+  const userId = decodeURIComponent(userIdEnc);
+  const data = await api(`/admin/api/finance/user_details?user_id=${encodeURIComponent(userId)}`);
+  if(!data) return;
+  if(data.length===0){ showInfoModal('👤 用户点击明细','暂无记录'); return; }
+  let html = `<div style="text-align:left;max-height:60vh;overflow-y:auto;font-size:13px;color:#cbd5e1;"><ul style="list-style-type:none;padding-left:4px;">`;
+  data.forEach(item=>{
+    const countBadge = item.click_count>1
+      ? `<span class="pill pill-blue" style="margin-left:6px;font-size:10px;padding:1px 4px;">${item.click_count}次</span>`:'';
+    const timeStr = (item.last_time||'').replace('T',' ').substring(0,16);
+    html += `<li style="margin-bottom:10px;line-height:1.4;border-bottom:1px solid #334155;padding-bottom:6px;">
+      <strong>${item.card_name||item.card_key}</strong>${countBadge}
+      <span style="font-size:11px;color:#64748b">(${item.card_key})</span><br>
+      <span style="font-size:11px;color:#94a3b8;">🕐 ${timeStr}</span></li>`;
+  });
+  html += `</ul></div>`;
+  showInfoModal(`👤 用户 [${userId.substring(0,10)}...] 的点击历史 (${data.length} 个)`, html);
 }
 
 //  通用弹窗 

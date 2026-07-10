@@ -3260,9 +3260,9 @@ ADMIN_HTML = r'''
     <!-- 1. 统计卡片 -->
     <div class="stats" id="newsStatsBox"></div>
     
-    <!-- 2. 【位置上移】新闻 - 活跃读者榜 -->
+    <!-- 2. 【位置上移】新闻 - 活跃用户榜 -->
     <div class="panel" style="margin-bottom:24px">
-      <h3>👥 新闻 - 活跃读者榜 <span style="font-size:12px; color:#94a3b8; font-weight:normal;">(点击“所有文章”或“最后活跃”可切换排序)</span></h3>
+      <h3>👥 新闻 - 活跃用户榜 <span style="font-size:12px; color:#94a3b8; font-weight:normal;">(点击“所有文章”或“最后活跃”可切换排序)</span></h3>
       <table>
         <thead>
           <tr>

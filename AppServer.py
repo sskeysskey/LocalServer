@@ -33,6 +33,10 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(CURRENT_DIR)
 
 BASE_RESOURCES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Resources')
+
+# 活跃用户明细/流水仅保留最近 N 天（可配置）
+ANALYTICS_LOG_KEEP_DAYS = 7
+
 ALLOWED_APPS = ['ONews', 'Finance', 'Prediction', 'OVideo']
 ALLOWED_EVENT_TYPES = {'play', 'download_complete'}
 # 【修改】移除了 'read'，仅保留 view, listen
@@ -71,6 +75,28 @@ def is_real_login_user(user_id):
        dev_ 开头是设备标识(可被重置)，guest_user 是兜底，都不给。"""
     return bool(user_id) and not user_id.startswith('dev_') and user_id != 'guest_user'
 
+def analytics_cutoff_iso(days=ANALYTICS_LOG_KEEP_DAYS):
+    """返回北京时间 N 天前的 naive ISO 字符串，用于与 created_at 比较"""
+    return (datetime.now(APP_TZ) - timedelta(days=days)).replace(tzinfo=None).isoformat()
+
+def cleanup_old_event_logs(days_to_keep=ANALYTICS_LOG_KEEP_DAYS):
+    """删除 N 天前的三张流水表记录，防止明细弹窗数据过多卡顿"""
+    cutoff = analytics_cutoff_iso(days_to_keep)
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    try:
+        c = conn.cursor()
+        total = 0
+        for table in ('event_logs', 'news_event_logs', 'finance_event_logs'):
+            c.execute(f"DELETE FROM {table} WHERE created_at < ?", (cutoff,))
+            total += c.rowcount
+        conn.commit()
+        if total:
+            print(f"[cleanup] 已清理 {total} 条过期流水 (< {cutoff})")
+    except Exception as e:
+        print(f"[cleanup] 流水清理失败: {e}")
+    finally:
+        conn.close()
+
 def cleanup_old_unlocks(days_to_keep=7):
     """删除 days_to_keep 天前的解锁记录，保持表轻量。"""
     cutoff = (datetime.now(APP_TZ) - timedelta(days=days_to_keep)).strftime('%Y-%m-%d')
@@ -95,6 +121,7 @@ def maybe_cleanup_old_unlocks():
         return
     _last_unlock_cleanup_date = today
     cleanup_old_unlocks(days_to_keep=7)
+    cleanup_old_event_logs(days_to_keep=ANALYTICS_LOG_KEEP_DAYS)   # 【新增】
 
 def today_str():
     """统一的"自然日"字符串，永远按北京时间 00:00 切分"""
@@ -1701,25 +1728,25 @@ def track_event():
 @app.route('/admin/api/video/user_details', methods=['GET'])
 @require_admin
 def admin_video_user_details():
+    maybe_cleanup_old_unlocks()                      # 【新增】触发清理
     user_id = request.args.get('user_id')
     event_type = request.args.get('type')
-    suffix = request.args.get('suffix', '')  # 在线/离线过滤
-    
+    suffix = request.args.get('suffix', '')
     if not user_id or not event_type:
         return jsonify({"error": "Missing parameters"}), 400
-        
+    cutoff = analytics_cutoff_iso()                  # 【新增】
     sql = f'''
         SELECT video_url, video_title,
                MAX(created_at) AS last_time,
                COUNT(*) AS click_count,
-               GROUP_CONCAT(DISTINCT source) AS sources   -- ⭐ 新增：聚合所有来源
+               GROUP_CONCAT(DISTINCT source) AS sources
         FROM event_logs
-        WHERE user_id = ? AND event_type = ?
-        {suffix}  -- 在线/离线过滤
+        WHERE user_id = ? AND event_type = ? AND created_at >= ?
+        {suffix}
         GROUP BY video_url
         ORDER BY last_time DESC
     '''
-    rows = _query_analytics(sql, (user_id, event_type))
+    rows = _query_analytics(sql, (user_id, event_type, cutoff))
     return jsonify(rows)
 
 # 概览：今日 / 总计
@@ -2842,23 +2869,25 @@ def admin_finance_top_users():
     ''')
     return jsonify(rows)
 
-# 美股 - 某用户点击明细(按卡片聚合，按最后时间排序)
+# 美股 - 某用户点击明细
 @app.route('/admin/api/finance/user_details', methods=['GET'])
 @require_admin
 def admin_finance_user_details():
+    maybe_cleanup_old_unlocks()                      # 【新增】
     user_id = request.args.get('user_id')
     if not user_id:
         return jsonify({"error": "Missing user_id"}), 400
+    cutoff = analytics_cutoff_iso()                  # 【新增】
     sql = '''
         SELECT card_key, MAX(card_name) AS card_name,
                MAX(created_at) AS last_time,
                COUNT(*) AS click_count
         FROM finance_event_logs
-        WHERE user_id = ?
+        WHERE user_id = ? AND created_at >= ?
         GROUP BY card_key
         ORDER BY last_time DESC
     '''
-    return jsonify(_query_analytics(sql, (user_id,)))
+    return jsonify(_query_analytics(sql, (user_id, cutoff)))
 
 # 美股 - 30天趋势
 @app.route('/admin/api/finance/daily_trend', methods=['GET'])
@@ -3009,20 +3038,20 @@ def admin_news_article_users():
 @app.route('/admin/api/news/user_details', methods=['GET'])
 @require_admin
 def admin_news_user_details():
+    maybe_cleanup_old_unlocks()                      # 【新增】
     user_id = request.args.get('user_id')
-    event_type = request.args.get('type') # listen 或 view
+    event_type = request.args.get('type')
     if not user_id or not event_type:
         return jsonify({"error": "Missing parameters"}), 400
-        
-    # 查询该用户该事件的所有流水，按日期和文章去重，按流水时间降序
+    cutoff = analytics_cutoff_iso()                  # 【新增】
     sql = '''
         SELECT article_date, article_topic, source_id, MAX(created_at) as last_time, COUNT(*) as click_count
         FROM news_event_logs
-        WHERE user_id = ? AND event_type = ?
+        WHERE user_id = ? AND event_type = ? AND created_at >= ?
         GROUP BY article_date, article_key
         ORDER BY article_date DESC, last_time DESC
     '''
-    rows = _query_analytics(sql, (user_id, event_type))
+    rows = _query_analytics(sql, (user_id, event_type, cutoff))
     return jsonify(rows)
 
 # 【新增】一键清除数据库 API

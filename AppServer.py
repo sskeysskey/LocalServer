@@ -2,6 +2,7 @@ import os
 import re
 import threading
 import json
+import string
 import sqlite3
 import traceback
 from difflib import SequenceMatcher
@@ -62,13 +63,100 @@ VALID_INVITE_CODES = {
     "VIP_FRIEND_888": "Friend Access",
     "DEV_TEST_KEY": "Developer Key"
 }
+
 # 视频模块黑名单：这些用户即使是永久 VIP 也看不到视频模块
 VIDEO_MODULE_BLOCKED_USERS = {
     "001356.cdec6d350edb4646b0130f9363b6d37e.2149",
 }
+
 # Featured 首页「按上映日期」排序时:
 # Drama 分类改用 (更新日期 − N 天) 作为排序键,N 可在此调整
 FEATURED_DRAMA_DATE_OFFSET_DAYS = 2
+
+# 邀请码字母表：去掉 0/O/1/I/L 等易混字符
+INVITE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+def get_finance_config():
+    """读取 Finance/version.json 中与点数/邀请相关的配置"""
+    path = os.path.join(BASE_RESOURCES_DIR, 'Finance', 'version.json')
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return {
+            'daily_free_limit': int(data.get('daily_free_limit', 25)),
+            'bonus_points': int(data.get('bonus_points', 0)),
+            'invite_reward_days': int(data.get('invite_reward_days', 30)),
+            'cost_config': data.get('cost_config', {}) or {},
+            'sector_cost_overrides': data.get('sector_cost_overrides', {}) or {},
+        }
+    except Exception as e:
+        print(f"读取 Finance 配置失败: {e}")
+        return {'daily_free_limit': 25, 'bonus_points': 0, 'invite_reward_days': 30,
+                'cost_config': {}, 'sector_cost_overrides': {}}
+
+# 使用分组独立扣点的动作
+_SECTOR_OVERRIDE_ACTIONS = {'open_sector', 'open_special_list', 'view_big_orders'}
+
+def finance_calc_cost(cfg, action, item_key):
+    """服务器权威地计算单次扣点"""
+    if item_key and action in _SECTOR_OVERRIDE_ACTIONS:
+        ov = cfg['sector_cost_overrides'].get(item_key)
+        if ov is not None:
+            return int(ov)
+    return int(cfg['cost_config'].get(action, 1))
+
+def _gen_invite_code(cursor, length=6):
+    for _ in range(30):
+        code = ''.join(secrets.choice(INVITE_ALPHABET) for _ in range(length))
+        if not cursor.execute("SELECT 1 FROM finance_points WHERE invite_code=?", (code,)).fetchone():
+            return code
+    return ''.join(secrets.choice(INVITE_ALPHABET) for _ in range(length + 2))
+
+def _ensure_finance_points(c, user_id):
+    """确保该用户有点数行；不存在则创建并发放一次性赠送点数；跨天则重置每日额度。"""
+    cfg = get_finance_config()
+    today = today_str()
+    row = c.execute("SELECT * FROM finance_points WHERE user_id=?", (user_id,)).fetchone()
+    if row is None:
+        code = _gen_invite_code(c)
+        bonus = cfg['bonus_points']
+        c.execute('''INSERT INTO finance_points
+            (user_id, invite_code, bonus_remaining, bonus_total, daily_used,
+             last_date, invited_by_code, invite_reward_count, created_at)
+            VALUES (?,?,?,?,0,?,NULL,0,?)''',
+            (user_id, code, bonus, bonus, today, now_iso()))
+        row = c.execute("SELECT * FROM finance_points WHERE user_id=?", (user_id,)).fetchone()
+    elif row['last_date'] != today:
+        c.execute("UPDATE finance_points SET daily_used=0, last_date=? WHERE user_id=?", (today, user_id))
+        row = c.execute("SELECT * FROM finance_points WHERE user_id=?", (user_id,)).fetchone()
+    return row, cfg
+
+def _grant_finance_days(c, user_id, days):
+    """给某用户 finance 会员叠加 N 天（在现有到期时间基础上顺延）"""
+    now = datetime.utcnow()
+    row = c.execute("SELECT finance_expire_at FROM users WHERE apple_user_id=?", (user_id,)).fetchone()
+    base = now
+    if row and row['finance_expire_at']:
+        try:
+            cur = datetime.fromisoformat(str(row['finance_expire_at']))
+            if cur > now:
+                base = cur
+        except Exception:
+            base = now
+    new_expire = (base + timedelta(days=days)).isoformat()
+    c.execute("UPDATE users SET finance_expire_at=? WHERE apple_user_id=?", (new_expire, user_id))
+    return new_expire
+
+def _log_finance_invite(inviter_id, code, invitee_id, days):
+    try:
+        conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+        conn.execute('''INSERT INTO finance_invite_logs
+            (inviter_id, inviter_code, invitee_id, reward_days, created_at)
+            VALUES (?,?,?,?,?)''', (inviter_id, code, invitee_id, days, now_iso()))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"记录邀请日志失败: {e}")
 
 def is_real_login_user(user_id):
     """只有 Apple 登录用户(稳定 Apple ID)才享受免费次数。
@@ -210,6 +298,33 @@ def init_user_db():
         c.execute('ALTER TABLE users ADD COLUMN prediction_is_permanent INTEGER DEFAULT 0')
     except sqlite3.OperationalError:
         pass
+
+    # 【新增】Finance 点数账本（服务器权威，绑定 Apple ID）
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS finance_points (
+            user_id TEXT PRIMARY KEY,
+            invite_code TEXT UNIQUE,
+            bonus_remaining INTEGER DEFAULT 0,
+            bonus_total INTEGER DEFAULT 0,
+            daily_used INTEGER DEFAULT 0,
+            last_date TEXT,
+            invited_by_code TEXT,
+            invite_reward_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP
+        )
+    ''')
+    # 【新增】Finance 当日已解锁项（同一项当天再次访问免费，与旧客户端逻辑一致）
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS finance_daily_unlocks (
+            user_id TEXT NOT NULL,
+            item_key TEXT NOT NULL,
+            unlock_date TEXT NOT NULL,
+            created_at TIMESTAMP,
+            PRIMARY KEY (user_id, item_key, unlock_date)
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_fin_unlock ON finance_daily_unlocks(user_id, unlock_date)')
+
     conn.commit()
     conn.close()
     print("用户数据库已准备就绪。")
@@ -431,6 +546,20 @@ def init_analytics_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_fin_logs_card ON finance_event_logs(card_key)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_fin_logs_user ON finance_event_logs(user_id)')
 
+    # 【新增】Finance 邀请拉新流水
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS finance_invite_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            inviter_id TEXT NOT NULL,
+            inviter_code TEXT,
+            invitee_id TEXT NOT NULL,
+            reward_days INTEGER,
+            created_at TIMESTAMP NOT NULL
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_fin_invite_inviter ON finance_invite_logs(inviter_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_fin_invite_time ON finance_invite_logs(created_at)')
+    
     conn.commit()
     conn.close()
     print("行为数据库已就绪。")
@@ -2409,6 +2538,168 @@ def finance_status(): return handle_status_check('Finance')
 @app.route('/api/Finance/user/redeem', methods=['POST'])
 def finance_redeem(): return handle_redeem_invite('Finance')
 
+# ============ Finance 点数账本（服务器权威）============
+
+@app.route('/api/Finance/quota/status', methods=['GET'])
+def finance_quota_status():
+    user_id = request.args.get('user_id')
+    cfg = get_finance_config()
+    if not is_real_login_user(user_id):
+        return jsonify({
+            "logged_in": False,
+            "daily_limit": cfg['daily_free_limit'],
+            "daily_used": 0, "bonus_remaining": 0, "remaining_total": 0,
+            "invite_code": None, "invite_reward_count": 0,
+            "has_redeemed_invite": False, "unlocked_keys": []
+        })
+    conn = sqlite3.connect(USER_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        row, cfg = _ensure_finance_points(c, user_id)
+        today = today_str()
+        keys = [r['item_key'] for r in c.execute(
+            "SELECT item_key FROM finance_daily_unlocks WHERE user_id=? AND unlock_date=?",
+            (user_id, today)).fetchall()]
+        conn.commit()
+        daily_remaining = max(0, cfg['daily_free_limit'] - row['daily_used'])
+        total = row['bonus_remaining'] + daily_remaining
+        return jsonify({
+            "logged_in": True,
+            "daily_limit": cfg['daily_free_limit'],
+            "daily_used": row['daily_used'],
+            "bonus_remaining": row['bonus_remaining'],
+            "remaining_total": total,
+            "invite_code": row['invite_code'],
+            "invite_reward_count": row['invite_reward_count'],
+            "has_redeemed_invite": bool(row['invited_by_code']),
+            "unlocked_keys": keys
+        })
+    finally:
+        conn.close()
+
+@app.route('/api/Finance/quota/consume', methods=['POST'])
+def finance_quota_consume():
+    data = request.get_json() or {}
+    user_id = data.get('user_id')
+    action = data.get('action', '') or ''
+    item_key = data.get('item_key', '') or ''
+    if not is_real_login_user(user_id):
+        return jsonify({"status": "not_logged_in", "remaining_total": 0,
+                        "bonus_remaining": 0, "daily_used": 0})
+    cfg = get_finance_config()
+    cost = finance_calc_cost(cfg, action, item_key)
+    unlock_key = f"{action}|{item_key.upper()}" if item_key else action
+    today = today_str()
+
+    conn = sqlite3.connect(USER_DB_PATH, timeout=30.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row, cfg = _ensure_finance_points(c, user_id)
+        exists = c.execute("SELECT 1 FROM finance_daily_unlocks WHERE user_id=? AND item_key=? AND unlock_date=?",
+                           (user_id, unlock_key, today)).fetchone()
+        daily_remaining = max(0, cfg['daily_free_limit'] - row['daily_used'])
+        total = row['bonus_remaining'] + daily_remaining
+
+        if exists or cost <= 0:
+            c.execute("COMMIT")
+            return jsonify({"status": "already_unlocked" if exists else "free",
+                            "cost": cost, "remaining_total": total,
+                            "bonus_remaining": row['bonus_remaining'],
+                            "daily_used": row['daily_used'],
+                            "daily_limit": cfg['daily_free_limit']})
+
+        if total < cost:
+            c.execute("COMMIT")
+            return jsonify({"status": "insufficient", "cost": cost, "remaining_total": total,
+                            "bonus_remaining": row['bonus_remaining'],
+                            "daily_used": row['daily_used'],
+                            "daily_limit": cfg['daily_free_limit']})
+
+        remaining_cost = cost
+        bonus = row['bonus_remaining']
+        use_bonus = min(bonus, remaining_cost)
+        bonus -= use_bonus
+        remaining_cost -= use_bonus
+        daily_used = row['daily_used'] + remaining_cost
+
+        c.execute("UPDATE finance_points SET bonus_remaining=?, daily_used=?, last_date=? WHERE user_id=?",
+                  (bonus, daily_used, today, user_id))
+        c.execute('''INSERT OR IGNORE INTO finance_daily_unlocks (user_id, item_key, unlock_date, created_at)
+                     VALUES (?,?,?,?)''', (user_id, unlock_key, today, now_iso()))
+        c.execute("COMMIT")
+
+        daily_remaining = max(0, cfg['daily_free_limit'] - daily_used)
+        total = bonus + daily_remaining
+        return jsonify({"status": "success", "cost": cost, "remaining_total": total,
+                        "bonus_remaining": bonus, "daily_used": daily_used,
+                        "daily_limit": cfg['daily_free_limit']})
+    except Exception as e:
+        try: c.execute("ROLLBACK")
+        except Exception: pass
+        traceback.print_exc()
+        return jsonify({"status": "error", "error": str(e)}), 500
+    finally:
+        conn.close()
+
+# ============ Finance 邀请拉新 ============
+
+@app.route('/api/Finance/invite/redeem', methods=['POST'])
+def finance_invite_redeem():
+    data = request.get_json() or {}
+    invitee_id = data.get('user_id')
+    code = (data.get('invite_code') or '').strip().upper()
+    if not is_real_login_user(invitee_id):
+        return jsonify({"error": "请先登录后再使用邀请码"}), 401
+    if not code:
+        return jsonify({"error": "请输入邀请码"}), 400
+
+    cfg = get_finance_config()
+    reward_days = cfg['invite_reward_days']
+
+    conn = sqlite3.connect(USER_DB_PATH, timeout=30.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    inviter_id = None
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        invitee_row, _ = _ensure_finance_points(c, invitee_id)
+        if invitee_row['invited_by_code']:
+            c.execute("COMMIT")
+            return jsonify({"error": "您已经使用过邀请码了，每位用户仅限使用一次"}), 403
+
+        inviter = c.execute("SELECT * FROM finance_points WHERE invite_code=?", (code,)).fetchone()
+        if not inviter:
+            c.execute("COMMIT")
+            return jsonify({"error": "邀请码无效，请检查后重试"}), 404
+        inviter_id = inviter['user_id']
+        if inviter_id == invitee_id:
+            c.execute("COMMIT")
+            return jsonify({"error": "不能使用自己的邀请码哦"}), 400
+
+        b_expire = _grant_finance_days(c, invitee_id, reward_days)
+        _grant_finance_days(c, inviter_id, reward_days)
+        c.execute("UPDATE finance_points SET invited_by_code=? WHERE user_id=?", (code, invitee_id))
+        c.execute("UPDATE finance_points SET invite_reward_count=invite_reward_count+1 WHERE user_id=?", (inviter_id,))
+        c.execute("COMMIT")
+    except Exception as e:
+        try: c.execute("ROLLBACK")
+        except Exception: pass
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+    _log_finance_invite(inviter_id, code, invitee_id, reward_days)
+    return jsonify({
+        "status": "success",
+        "reward_days": reward_days,
+        "is_subscribed": True,
+        "subscription_expires_at": b_expire
+    })
+
 # Finance 点击行为上报
 @app.route('/api/Finance/track', methods=['POST'])
 def track_finance_event():
@@ -2926,6 +3217,36 @@ def admin_finance_top_cards():
     '''
     return jsonify(_query_analytics(sql))
 
+@app.route('/admin/api/finance/invite_overview', methods=['GET'])
+@require_admin
+def admin_finance_invite_overview():
+    today = today_str()
+    return jsonify({
+        "total_invites":   _query_analytics("SELECT COUNT(*) c FROM finance_invite_logs")[0]['c'],
+        "today_invites":   _query_analytics("SELECT COUNT(*) c FROM finance_invite_logs WHERE date(created_at)=?", (today,))[0]['c'],
+        "unique_inviters": _query_analytics("SELECT COUNT(DISTINCT inviter_id) c FROM finance_invite_logs")[0]['c'],
+        "total_reward_days": _query_analytics("SELECT COALESCE(SUM(reward_days),0) c FROM finance_invite_logs")[0]['c'],
+    })
+
+@app.route('/admin/api/finance/top_inviters', methods=['GET'])
+@require_admin
+def admin_finance_top_inviters():
+    return jsonify(_query_analytics('''
+        SELECT inviter_id, MAX(inviter_code) AS inviter_code,
+               COUNT(*) AS invite_count, SUM(reward_days) AS total_days,
+               MAX(created_at) AS last_time
+        FROM finance_invite_logs
+        GROUP BY inviter_id ORDER BY invite_count DESC LIMIT 50
+    '''))
+
+@app.route('/admin/api/finance/invite_logs', methods=['GET'])
+@require_admin
+def admin_finance_invite_logs():
+    return jsonify(_query_analytics('''
+        SELECT inviter_id, inviter_code, invitee_id, reward_days, created_at
+        FROM finance_invite_logs ORDER BY created_at DESC LIMIT 100
+    '''))
+
 # 今日 / 总览
 @app.route('/admin/api/news/overview', methods=['GET'])
 @require_admin
@@ -3074,6 +3395,7 @@ def admin_clear_db():
             c.execute("DELETE FROM news_event_logs")
             c.execute("DELETE FROM video_link_reports")
             c.execute("DELETE FROM video_wish_requests")
+            c.execute("DELETE FROM finance_invite_logs")
             c.execute("DELETE FROM user_finance_events")   # 【新增】
             c.execute("DELETE FROM finance_event_logs")    # 【新增】
             conn.commit()
@@ -3084,6 +3406,8 @@ def admin_clear_db():
             conn = sqlite3.connect(USER_DB_PATH, timeout=30.0)
             c = conn.cursor()
             c.execute("DELETE FROM users")
+            c.execute("DELETE FROM finance_points")
+            c.execute("DELETE FROM finance_daily_unlocks")
             conn.commit()
             conn.close()
         return jsonify({"status": "success", "message": f"成功清空了 {clear_type} 相关的数据。"})
@@ -3394,6 +3718,22 @@ ADMIN_HTML = r'''
       </table>
     </div>
   </div>
+
+  <div class="stats" id="financeInviteStatsBox" style="margin-top:8px"></div>
+    <div class="panel" style="margin-bottom:24px">
+      <h3>🎁 美股 - 邀请拉新排行</h3>
+      <table>
+        <thead><tr><th>#</th><th>邀请人</th><th>邀请码</th><th>成功邀请</th><th>累计赠送天数</th><th>最近</th></tr></thead>
+        <tbody id="financeTopInvitersBody"></tbody>
+      </table>
+    </div>
+    <div class="panel" style="margin-bottom:24px">
+      <h3>📜 美股 - 最近邀请记录</h3>
+      <table>
+        <thead><tr><th>#</th><th>邀请人</th><th>邀请码</th><th>被邀请人</th><th>奖励</th><th>时间</th></tr></thead>
+        <tbody id="financeInviteLogsBody"></tbody>
+      </table>
+    </div>
 
   <!-- 危险区 -->
   <div class="panel danger-zone" style="margin-bottom:24px">
@@ -4086,6 +4426,7 @@ async function loadFinanceModule(){
   loadFinanceTrend();
   loadFinanceTopCards(financePeriod);
   await loadFinanceUsers();
+  loadFinanceInvites();
 }
 
 async function loadFinanceOverview(){
@@ -4137,6 +4478,46 @@ async function loadFinanceUsers(){
   const data = await api('/admin/api/finance/top_users');if(!data)return;
   cachedFinanceUsers = data;
   renderFinanceUsers();
+}
+
+async function loadFinanceInvites(){
+  const o = await api('/admin/api/finance/invite_overview');
+  if(o){
+    const items = [
+      ['累计邀请成功', o.total_invites],
+      ['今日邀请', o.today_invites],
+      ['参与邀请人数', o.unique_inviters],
+      ['累计赠送天数', o.total_reward_days],
+    ];
+    document.getElementById('financeInviteStatsBox').innerHTML = items.map(([l,v])=>
+      `<div class="stat-card"><div class="label">${l}</div><div class="value">${v||0}</div></div>`).join('');
+  }
+  const top = await api('/admin/api/finance/top_inviters');
+  if(top){
+    document.getElementById('financeTopInvitersBody').innerHTML = top.length===0
+      ? '<tr><td colspan="6" style="text-align:center;color:#64748b">暂无数据</td></tr>'
+      : top.map((r,i)=>`<tr>
+          <td>${i+1}</td>
+          <td><span style="font-family:monospace;font-size:11px">${(r.inviter_id||'').substring(0,20)}...</span></td>
+          <td><span class="pill pill-purple">${r.inviter_code||'-'}</span></td>
+          <td><span class="pill pill-green">${r.invite_count}</span></td>
+          <td>${r.total_days||0} 天</td>
+          <td style="color:#94a3b8;font-size:12px">${(r.last_time||'').replace('T',' ').substring(0,16)}</td>
+        </tr>`).join('');
+  }
+  const logs = await api('/admin/api/finance/invite_logs');
+  if(logs){
+    document.getElementById('financeInviteLogsBody').innerHTML = logs.length===0
+      ? '<tr><td colspan="6" style="text-align:center;color:#64748b">暂无记录</td></tr>'
+      : logs.map((r,i)=>`<tr>
+          <td>${i+1}</td>
+          <td><span style="font-family:monospace;font-size:10px">${(r.inviter_id||'').substring(0,16)}...</span></td>
+          <td><span class="pill pill-purple">${r.inviter_code||'-'}</span></td>
+          <td><span style="font-family:monospace;font-size:10px">${(r.invitee_id||'').substring(0,16)}...</span></td>
+          <td><span class="pill pill-green">+${r.reward_days}天</span></td>
+          <td style="color:#94a3b8;font-size:12px">${(r.created_at||'').replace('T',' ').substring(0,16)}</td>
+        </tr>`).join('');
+  }
 }
 
 function renderFinanceUsers(){

@@ -2,7 +2,6 @@ import os
 import re
 import threading
 import json
-import string
 import sqlite3
 import traceback
 from difflib import SequenceMatcher
@@ -10,7 +9,6 @@ from flask import Flask, jsonify, send_from_directory, request, g
 from flask_cors import CORS
 from flask_compress import Compress
 from werkzeug.utils import safe_join
-from datetime import datetime, timedelta
 import secrets, hashlib
 from functools import wraps
 from datetime import datetime, timedelta, timezone
@@ -85,13 +83,13 @@ def get_finance_config():
         return {
             'daily_free_limit': int(data.get('daily_free_limit', 25)),
             'bonus_points': int(data.get('bonus_points', 0)),
-            'invite_reward_days': int(data.get('invite_reward_days', 30)),
+            'invite_reward_points': int(data.get('invite_reward_points', 300)),
             'cost_config': data.get('cost_config', {}) or {},
             'sector_cost_overrides': data.get('sector_cost_overrides', {}) or {},
         }
     except Exception as e:
         print(f"读取 Finance 配置失败: {e}")
-        return {'daily_free_limit': 25, 'bonus_points': 0, 'invite_reward_days': 30,
+        return {'daily_free_limit': 25, 'bonus_points': 0, 'invite_reward_points': 300,
                 'cost_config': {}, 'sector_cost_overrides': {}}
 
 # 使用分组独立扣点的动作
@@ -131,28 +129,20 @@ def _ensure_finance_points(c, user_id):
         row = c.execute("SELECT * FROM finance_points WHERE user_id=?", (user_id,)).fetchone()
     return row, cfg
 
-def _grant_finance_days(c, user_id, days):
-    """给某用户 finance 会员叠加 N 天（在现有到期时间基础上顺延）"""
-    now = datetime.utcnow()
-    row = c.execute("SELECT finance_expire_at FROM users WHERE apple_user_id=?", (user_id,)).fetchone()
-    base = now
-    if row and row['finance_expire_at']:
-        try:
-            cur = datetime.fromisoformat(str(row['finance_expire_at']))
-            if cur > now:
-                base = cur
-        except Exception:
-            base = now
-    new_expire = (base + timedelta(days=days)).isoformat()
-    c.execute("UPDATE users SET finance_expire_at=? WHERE apple_user_id=?", (new_expire, user_id))
-    return new_expire
+def _grant_finance_bonus(c, user_id, points):
+    """给某用户一次性发放赠送点数（bonus_remaining 与 bonus_total 同步累加）"""
+    _ensure_finance_points(c, user_id)   # 确保点数行存在
+    c.execute("""UPDATE finance_points
+                 SET bonus_remaining = bonus_remaining + ?,
+                     bonus_total     = bonus_total + ?
+                 WHERE user_id=?""", (points, points, user_id))
 
-def _log_finance_invite(inviter_id, code, invitee_id, days):
+def _log_finance_invite(inviter_id, code, invitee_id, points):
     try:
         conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
         conn.execute('''INSERT INTO finance_invite_logs
             (inviter_id, inviter_code, invitee_id, reward_days, created_at)
-            VALUES (?,?,?,?,?)''', (inviter_id, code, invitee_id, days, now_iso()))
+            VALUES (?,?,?,?,?)''', (inviter_id, code, invitee_id, points, now_iso()))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -2538,8 +2528,7 @@ def finance_status(): return handle_status_check('Finance')
 @app.route('/api/Finance/user/redeem', methods=['POST'])
 def finance_redeem(): return handle_redeem_invite('Finance')
 
-# ============ Finance 点数账本（服务器权威）============
-
+# Finance 点数账本（服务器权威）
 @app.route('/api/Finance/quota/status', methods=['GET'])
 def finance_quota_status():
     user_id = request.args.get('user_id')
@@ -2550,7 +2539,8 @@ def finance_quota_status():
             "daily_limit": cfg['daily_free_limit'],
             "daily_used": 0, "bonus_remaining": 0, "remaining_total": 0,
             "invite_code": None, "invite_reward_count": 0,
-            "has_redeemed_invite": False, "unlocked_keys": []
+            "has_redeemed_invite": False, "unlocked_keys": [],
+            "invite_reward_points": cfg['invite_reward_points']
         })
     conn = sqlite3.connect(USER_DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
@@ -2573,7 +2563,8 @@ def finance_quota_status():
             "invite_code": row['invite_code'],
             "invite_reward_count": row['invite_reward_count'],
             "has_redeemed_invite": bool(row['invited_by_code']),
-            "unlocked_keys": keys
+            "unlocked_keys": keys,
+            "invite_reward_points": cfg['invite_reward_points']
         })
     finally:
         conn.close()
@@ -2644,8 +2635,7 @@ def finance_quota_consume():
     finally:
         conn.close()
 
-# ============ Finance 邀请拉新 ============
-
+# Finance 邀请拉新
 @app.route('/api/Finance/invite/redeem', methods=['POST'])
 def finance_invite_redeem():
     data = request.get_json() or {}
@@ -2657,15 +2647,17 @@ def finance_invite_redeem():
         return jsonify({"error": "请输入邀请码"}), 400
 
     cfg = get_finance_config()
-    reward_days = cfg['invite_reward_days']
+    reward_points = cfg['invite_reward_points']
 
     conn = sqlite3.connect(USER_DB_PATH, timeout=30.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     inviter_id = None
+    invitee_bonus = 0
+    invitee_total = 0
     try:
         c.execute("BEGIN IMMEDIATE")
-        invitee_row, _ = _ensure_finance_points(c, invitee_id)
+        invitee_row, cfg = _ensure_finance_points(c, invitee_id)
         if invitee_row['invited_by_code']:
             c.execute("COMMIT")
             return jsonify({"error": "您已经使用过邀请码了，每位用户仅限使用一次"}), 403
@@ -2679,10 +2671,26 @@ def finance_invite_redeem():
             c.execute("COMMIT")
             return jsonify({"error": "不能使用自己的邀请码哦"}), 400
 
-        b_expire = _grant_finance_days(c, invitee_id, reward_days)
-        _grant_finance_days(c, inviter_id, reward_days)
+        # 【新增】互邀检测：如果对方（inviter）之前正是用「我」的邀请码兑换过，
+        # 说明这对好友已经领过一次奖励，禁止反向再领
+        if inviter['invited_by_code'] and invitee_row['invite_code'] \
+           and inviter['invited_by_code'] == invitee_row['invite_code']:
+            c.execute("COMMIT")
+            return jsonify({"error": "你们已经互相邀请过啦，每对好友仅能领取一次奖励"}), 403
+        
+        # 双方各一次性发放 reward_points 赠送点数
+        _grant_finance_bonus(c, invitee_id, reward_points)
+        _grant_finance_bonus(c, inviter_id, reward_points)
         c.execute("UPDATE finance_points SET invited_by_code=? WHERE user_id=?", (code, invitee_id))
         c.execute("UPDATE finance_points SET invite_reward_count=invite_reward_count+1 WHERE user_id=?", (inviter_id,))
+
+        # 读取被邀请人最新点数，用于返回给客户端即时显示
+        inv_row = c.execute("SELECT bonus_remaining, daily_used FROM finance_points WHERE user_id=?",
+                            (invitee_id,)).fetchone()
+        invitee_bonus = inv_row['bonus_remaining']
+        daily_remaining = max(0, cfg['daily_free_limit'] - inv_row['daily_used'])
+        invitee_total = invitee_bonus + daily_remaining
+
         c.execute("COMMIT")
     except Exception as e:
         try: c.execute("ROLLBACK")
@@ -2692,12 +2700,12 @@ def finance_invite_redeem():
     finally:
         conn.close()
 
-    _log_finance_invite(inviter_id, code, invitee_id, reward_days)
+    _log_finance_invite(inviter_id, code, invitee_id, reward_points)
     return jsonify({
         "status": "success",
-        "reward_days": reward_days,
-        "is_subscribed": True,
-        "subscription_expires_at": b_expire
+        "reward_points": reward_points,
+        "bonus_remaining": invitee_bonus,
+        "remaining_total": invitee_total
     })
 
 # Finance 点击行为上报
@@ -3723,7 +3731,7 @@ ADMIN_HTML = r'''
     <div class="panel" style="margin-bottom:24px">
       <h3>🎁 美股 - 邀请拉新排行</h3>
       <table>
-        <thead><tr><th>#</th><th>邀请人</th><th>邀请码</th><th>成功邀请</th><th>累计赠送天数</th><th>最近</th></tr></thead>
+        <thead><tr><th>#</th><th>邀请人</th><th>邀请码</th><th>成功邀请</th><th>累计赠送点数</th><th>最近</th></tr></thead>
         <tbody id="financeTopInvitersBody"></tbody>
       </table>
     </div>
@@ -4487,7 +4495,7 @@ async function loadFinanceInvites(){
       ['累计邀请成功', o.total_invites],
       ['今日邀请', o.today_invites],
       ['参与邀请人数', o.unique_inviters],
-      ['累计赠送天数', o.total_reward_days],
+      ['累计赠送点数', o.total_reward_days],
     ];
     document.getElementById('financeInviteStatsBox').innerHTML = items.map(([l,v])=>
       `<div class="stat-card"><div class="label">${l}</div><div class="value">${v||0}</div></div>`).join('');
@@ -4501,7 +4509,7 @@ async function loadFinanceInvites(){
           <td><span style="font-family:monospace;font-size:11px">${(r.inviter_id||'').substring(0,20)}...</span></td>
           <td><span class="pill pill-purple">${r.inviter_code||'-'}</span></td>
           <td><span class="pill pill-green">${r.invite_count}</span></td>
-          <td>${r.total_days||0} 天</td>
+          <td>${r.total_days||0} 点</td>
           <td style="color:#94a3b8;font-size:12px">${(r.last_time||'').replace('T',' ').substring(0,16)}</td>
         </tr>`).join('');
   }
@@ -4514,7 +4522,7 @@ async function loadFinanceInvites(){
           <td><span style="font-family:monospace;font-size:10px">${(r.inviter_id||'').substring(0,16)}...</span></td>
           <td><span class="pill pill-purple">${r.inviter_code||'-'}</span></td>
           <td><span style="font-family:monospace;font-size:10px">${(r.invitee_id||'').substring(0,16)}...</span></td>
-          <td><span class="pill pill-green">+${r.reward_days}天</span></td>
+          +${r.reward_days}点
           <td style="color:#94a3b8;font-size:12px">${(r.created_at||'').replace('T',' ').substring(0,16)}</td>
         </tr>`).join('');
   }

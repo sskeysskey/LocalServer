@@ -335,6 +335,105 @@ def get_video_quota_config():
 
 def get_video_free_quota():
     return get_video_quota_config()[0]
+
+def get_video_points_config():
+    version_file = os.path.join(BASE_RESOURCES_DIR, 'ONews', 'version.json')
+    try:
+        with open(version_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        q = data.get('video_free_quota', {}) or {}
+        enabled = bool(q.get('enabled', False))
+        return {
+            'daily_quota': int(q.get('daily_count', 0)) if enabled else 0,
+            'first_login_bonus': int(q.get('first_login_bonus', 0)) if enabled else 0,
+            'invite_reward_points': int(data.get('video_invite_reward_points', 8)),
+        }
+    except Exception as e:
+        print(f"读取视频点数配置失败: {e}")
+        return {'daily_quota': 0, 'first_login_bonus': 0, 'invite_reward_points': 8}
+
+def get_news_points_config():
+    version_file = os.path.join(BASE_RESOURCES_DIR, 'ONews', 'version.json')
+    try:
+        with open(version_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        q = data.get('news_free_quota', {}) or {}
+        enabled = bool(q.get('enabled', True))
+        return {
+            'daily_quota': int(q.get('daily_count', 5)) if enabled else 0,
+            'first_login_bonus': int(q.get('first_login_bonus', 18)) if enabled else 0,
+            'invite_reward_points': int(data.get('news_invite_reward_points', 28)),
+        }
+    except Exception as e:
+        print(f"读取新闻点数配置失败: {e}")
+        return {'daily_quota': 5, 'first_login_bonus': 18, 'invite_reward_points': 28}
+
+def _gen_points_code(cursor, table, length=6):
+    for _ in range(30):
+        code = ''.join(secrets.choice(INVITE_ALPHABET) for _ in range(length))
+        if not cursor.execute(f"SELECT 1 FROM {table} WHERE invite_code=?", (code,)).fetchone():
+            return code
+    return ''.join(secrets.choice(INVITE_ALPHABET) for _ in range(length + 2))
+
+def _ensure_points(c, table, user_id, cfg, migrate_from=None):
+    """确保点数行存在；返回 (row, just_granted)。
+       news_points 首次创建时可从旧 onews_points 迁移，避免老用户丢失/重复发放。"""
+    row = c.execute(f"SELECT * FROM {table} WHERE user_id=?", (user_id,)).fetchone()
+    just_granted = False
+    if row is None:
+        code = _gen_points_code(c, table)
+        migrated = None
+        if migrate_from:
+            migrated = c.execute(
+                f"SELECT invite_code, bonus_remaining, bonus_total, invited_by_code, invite_reward_count "
+                f"FROM {migrate_from} WHERE user_id=?", (user_id,)).fetchone()
+        if migrated:
+            old_code = migrated['invite_code']
+            if old_code and not c.execute(f"SELECT 1 FROM {table} WHERE invite_code=?", (old_code,)).fetchone():
+                code = old_code
+            c.execute(f'''INSERT INTO {table}
+                (user_id, invite_code, bonus_remaining, bonus_total, invited_by_code,
+                 invite_reward_count, first_login_bonus_granted, created_at)
+                VALUES (?,?,?,?,?,?,1,?)''',
+                (user_id, code, migrated['bonus_remaining'], migrated['bonus_total'],
+                 migrated['invited_by_code'], migrated['invite_reward_count'], now_iso()))
+        else:
+            bonus = cfg['first_login_bonus']
+            granted = 1 if bonus > 0 else 0
+            just_granted = bonus > 0
+            c.execute(f'''INSERT INTO {table}
+                (user_id, invite_code, bonus_remaining, bonus_total, invited_by_code,
+                 invite_reward_count, first_login_bonus_granted, created_at)
+                VALUES (?,?,?,?,NULL,0,?,?)''',
+                (user_id, code, bonus, bonus, granted, now_iso()))
+        row = c.execute(f"SELECT * FROM {table} WHERE user_id=?", (user_id,)).fetchone()
+    return row, just_granted
+
+def _grant_points_bonus(c, table, user_id, points, cfg):
+    migrate = 'onews_points' if table == 'news_points' else None
+    _ensure_points(c, table, user_id, cfg, migrate_from=migrate)
+    c.execute(f"UPDATE {table} SET bonus_remaining=bonus_remaining+?, bonus_total=bonus_total+? WHERE user_id=?",
+              (points, points, user_id))
+
+def _news_daily_used(c, user_id, today):
+    return c.execute('''SELECT COUNT(*) AS n FROM news_free_unlocks
+                        WHERE user_id=? AND unlock_date=? AND COALESCE(source,'daily')='daily' ''',
+                     (user_id, today)).fetchone()['n']
+
+def _video_daily_used(c, user_id, today):
+    return c.execute('''SELECT COUNT(*) AS n FROM video_free_unlocks
+                        WHERE user_id=? AND unlock_date=? AND COALESCE(source,'daily')='daily' ''',
+                     (user_id, today)).fetchone()['n']
+
+def _log_onews_invite(inviter_id, code, invitee_id, points):
+    try:
+        conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+        conn.execute('''INSERT INTO onews_invite_logs
+            (inviter_id, inviter_code, invitee_id, reward_points, created_at)
+            VALUES (?,?,?,?,?)''', (inviter_id, code, invitee_id, points, now_iso()))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"记录ONews邀请日志失败: {e}")
     
 def init_analytics_db():
     print(f"检查行为数据库: {ANALYTICS_DB_PATH}")
@@ -549,6 +648,68 @@ def init_analytics_db():
     ''')
     c.execute('CREATE INDEX IF NOT EXISTS idx_fin_invite_inviter ON finance_invite_logs(inviter_id)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_fin_invite_time ON finance_invite_logs(created_at)')
+    
+    # 【新增】ONews/Video 共用点数账本（服务器权威，绑定 Apple ID）
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS onews_points (
+            user_id TEXT PRIMARY KEY,
+            invite_code TEXT UNIQUE,
+            bonus_remaining INTEGER DEFAULT 0,
+            bonus_total INTEGER DEFAULT 0,
+            invited_by_code TEXT,
+            invite_reward_count INTEGER DEFAULT 0,
+            first_login_bonus_granted INTEGER DEFAULT 0,
+            created_at TIMESTAMP
+        )
+    ''')
+    # 【新增】新闻解锁表（永久解锁：同一篇解锁后永久免费；每日消耗按 unlock_date 计）
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS news_free_unlocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            article_key TEXT NOT NULL,
+            unlock_date TEXT NOT NULL,
+            article_topic TEXT,
+            source TEXT DEFAULT 'daily',
+            created_at TIMESTAMP NOT NULL,
+            UNIQUE(user_id, article_key)
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_news_unlock_user ON news_free_unlocks(user_id, unlock_date)')
+    # 【新增】ONews/Video 邀请拉新流水
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS onews_invite_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            inviter_id TEXT NOT NULL,
+            inviter_code TEXT,
+            invitee_id TEXT NOT NULL,
+            reward_points INTEGER,
+            created_at TIMESTAMP NOT NULL
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_onews_invite_inviter ON onews_invite_logs(inviter_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_onews_invite_time ON onews_invite_logs(created_at)')
+
+    for tname in ('news_points', 'video_points'):
+        c.execute(f'''
+            CREATE TABLE IF NOT EXISTS {tname} (
+                user_id TEXT PRIMARY KEY,
+                invite_code TEXT UNIQUE,
+                bonus_remaining INTEGER DEFAULT 0,
+                bonus_total INTEGER DEFAULT 0,
+                invited_by_code TEXT,
+                invite_reward_count INTEGER DEFAULT 0,
+                first_login_bonus_granted INTEGER DEFAULT 0,
+                created_at TIMESTAMP
+            )
+        ''')
+
+    # 【需求4】给三张流水表补充 app_version（兼容老库）
+    for tbl in ('event_logs', 'news_event_logs', 'finance_event_logs'):
+        try:
+            c.execute(f"ALTER TABLE {tbl} ADD COLUMN app_version TEXT")
+        except sqlite3.OperationalError:
+            pass
     
     conn.commit()
     conn.close()
@@ -1816,6 +1977,7 @@ def track_event():
         video_title = data.get('video_title', '')
         event_type  = data.get('event_type')
         source      = data.get('source')          # ⭐ 新增：播放来源(仅在线播放会带)
+        app_version = data.get('app_version', '')       # 【新增】
         if not user_id or not video_url or event_type not in ALLOWED_EVENT_TYPES:
             return jsonify({"error": "Invalid params"}), 400
         now = now_iso()        # ⭐ 北京时间(无时区后缀)
@@ -1832,9 +1994,9 @@ def track_event():
         # 流水表：每次都插，额外记录 source
         c.execute('''
             INSERT INTO event_logs
-                (user_id, user_type, video_url, video_title, event_type, created_at, source)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, user_type, video_url, video_title, event_type, now, source))
+                (user_id, user_type, video_url, video_title, event_type, created_at, source, app_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, user_type, video_url, video_title, event_type, now, source, app_version))
 
         conn.commit()
         conn.close()
@@ -1847,26 +2009,26 @@ def track_event():
 @app.route('/admin/api/video/user_details', methods=['GET'])
 @require_admin
 def admin_video_user_details():
-    maybe_cleanup_old_unlocks()                      # 【新增】触发清理
+    maybe_cleanup_old_unlocks()
     user_id = request.args.get('user_id')
     event_type = request.args.get('type')
     suffix = request.args.get('suffix', '')
     if not user_id or not event_type:
         return jsonify({"error": "Missing parameters"}), 400
-    cutoff = analytics_cutoff_iso()                  # 【新增】
+    cutoff = analytics_cutoff_iso()
     sql = f'''
-        SELECT video_url, video_title,
+        SELECT date(created_at) AS day, video_url, video_title,
                MAX(created_at) AS last_time,
                COUNT(*) AS click_count,
-               GROUP_CONCAT(DISTINCT source) AS sources
+               GROUP_CONCAT(DISTINCT source) AS sources,
+               GROUP_CONCAT(DISTINCT NULLIF(app_version,'')) AS versions
         FROM event_logs
         WHERE user_id = ? AND event_type = ? AND created_at >= ?
         {suffix}
-        GROUP BY video_url
-        ORDER BY last_time DESC
+        GROUP BY day, video_url
+        ORDER BY day DESC, last_time DESC
     '''
-    rows = _query_analytics(sql, (user_id, event_type, cutoff))
-    return jsonify(rows)
+    return jsonify(_query_analytics(sql, (user_id, event_type, cutoff)))
 
 # 概览：今日 / 总计
 @app.route('/admin/api/overview', methods=['GET'])
@@ -2052,64 +2214,51 @@ def video_quota_status():
     user_id = request.args.get('user_id')
     if not user_id:
         return jsonify({"error": "Missing user_id"}), 400
-
-    daily_quota, bonus_amount = get_video_quota_config()
-
-    # 未登录(设备/游客)不享受任何免费点数
+    cfg = get_video_points_config()
+    daily_quota = cfg['daily_quota']
     if not is_real_login_user(user_id):
         return jsonify({
             "daily_quota": daily_quota, "used_today": 0,
             "remaining": 0, "daily_remaining": 0,
             "bonus_remaining": 0, "total_remaining": 0,
-            "bonus_just_granted": False, "unlocked_episodes": []
+            "bonus_just_granted": False,
+            "unlocked_episodes": [], "unlocked_news": [],
+            "invite_code": None, "invite_reward_count": 0,
+            "has_redeemed_invite": False,
+            "invite_reward_points": cfg['invite_reward_points'],
+            "logged_in": False
         })
-
     maybe_cleanup_old_unlocks()
     today = today_str()
     conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    just_granted = False
     try:
-        # 首次访问的真实登录用户 → 发放一次性赠送点数（幂等）
-        brow = c.execute("SELECT bonus_remaining FROM video_bonus_quota WHERE user_id=?",
-                         (user_id,)).fetchone()
-        if brow is None:
-            if bonus_amount > 0:
-                c.execute('''INSERT OR IGNORE INTO video_bonus_quota
-                             (user_id, bonus_total, bonus_remaining, granted_at)
-                             VALUES (?,?,?,?)''',
-                          (user_id, bonus_amount, bonus_amount, now_iso()))
-                conn.commit()
-                just_granted = True
-                bonus_remaining = bonus_amount
-            else:
-                bonus_remaining = 0
-        else:
-            bonus_remaining = brow['bonus_remaining']
-
-        rows = c.execute('''SELECT episode_key, COALESCE(source,'daily') AS source
-                            FROM video_free_unlocks WHERE user_id=? AND unlock_date=?''',
-                         (user_id, today)).fetchall()
-        keys = [r['episode_key'] for r in rows]
-        daily_used = sum(1 for r in rows if r['source'] == 'daily')
+        row, just_granted = _ensure_points(c, 'video_points', user_id, cfg)
+        conn.commit()
+        bonus_remaining = row['bonus_remaining']
+        episodes = [r['episode_key'] for r in c.execute(
+            "SELECT episode_key FROM video_free_unlocks WHERE user_id=? AND unlock_date=?",
+            (user_id, today)).fetchall()]
+        daily_used = _video_daily_used(c, user_id, today)
+        invite_code = row['invite_code']
+        invite_reward_count = row['invite_reward_count']
+        has_redeemed = bool(row['invited_by_code'])
     finally:
         conn.close()
-
     daily_remaining = max(0, daily_quota - daily_used)
-    total_remaining = bonus_remaining + daily_remaining
+    total = bonus_remaining + daily_remaining
     return jsonify({
-        "daily_quota": daily_quota,
-        "used_today": daily_used,
-        "remaining": total_remaining,          # 兼容旧门禁：总剩余
-        "daily_remaining": daily_remaining,
-        "bonus_remaining": bonus_remaining,
-        "total_remaining": total_remaining,
-        "bonus_just_granted": just_granted,    # 新人礼包刚发放，供客户端弹欢迎提示
-        "unlocked_episodes": keys
+        "daily_quota": daily_quota, "used_today": daily_used,
+        "remaining": total, "daily_remaining": daily_remaining,
+        "bonus_remaining": bonus_remaining, "total_remaining": total,
+        "bonus_just_granted": just_granted,
+        "unlocked_episodes": episodes, "unlocked_news": [],
+        "invite_code": invite_code, "invite_reward_count": invite_reward_count,
+        "has_redeemed_invite": has_redeemed,
+        "invite_reward_points": cfg['invite_reward_points'], "logged_in": True
     })
 
-# 消耗一次免费次数解锁某剧集（幂等 + 并发安全）
 @app.route('/api/OVideo/quota/unlock', methods=['POST'])
 def video_quota_unlock():
     data = request.get_json() or {}
@@ -2120,86 +2269,49 @@ def video_quota_unlock():
     if not is_real_login_user(user_id):
         return jsonify({"status": "quota_exceeded", "remaining": 0,
                         "bonus_remaining": 0, "daily_remaining": 0, "total_remaining": 0})
-
-    daily_quota, bonus_amount = get_video_quota_config()
-    today = today_str()
-    now = now_iso()
-
+    cfg = get_video_points_config()
+    daily_quota = cfg['daily_quota']
+    today = today_str(); now = now_iso()
     conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     try:
         c.execute("BEGIN IMMEDIATE")
-
-        # 保证 bonus 行存在（幂等发放）
-        brow = c.execute("SELECT bonus_remaining FROM video_bonus_quota WHERE user_id=?",
-                         (user_id,)).fetchone()
-        if brow is None:
-            if bonus_amount > 0:
-                c.execute('''INSERT OR IGNORE INTO video_bonus_quota
-                             (user_id, bonus_total, bonus_remaining, granted_at)
-                             VALUES (?,?,?,?)''',
-                          (user_id, bonus_amount, bonus_amount, now))
-                bonus_remaining = bonus_amount
-            else:
-                bonus_remaining = 0
-        else:
-            bonus_remaining = brow['bonus_remaining']
-
-        def daily_used_count():
-            return c.execute('''SELECT COUNT(*) AS n FROM video_free_unlocks
-                                WHERE user_id=? AND unlock_date=?
-                                AND COALESCE(source,'daily')='daily' ''',
-                             (user_id, today)).fetchone()['n']
-
-        # 1) 幂等：本集今天已解锁
+        row, _ = _ensure_points(c, 'video_points', user_id, cfg)
+        bonus_remaining = row['bonus_remaining']
         if c.execute("SELECT 1 FROM video_free_unlocks WHERE user_id=? AND episode_key=? AND unlock_date=?",
                      (user_id, episode_key, today)).fetchone():
-            daily_used = daily_used_count()
+            du = _video_daily_used(c, user_id, today)
             c.execute("COMMIT")
-            daily_remaining = max(0, daily_quota - daily_used)
-            total = bonus_remaining + daily_remaining
+            dr = max(0, daily_quota - du); total = bonus_remaining + dr
             return jsonify({"status": "already_unlocked", "remaining": total,
                             "bonus_remaining": bonus_remaining,
-                            "daily_remaining": daily_remaining, "total_remaining": total})
-
-        daily_used = daily_used_count()
-        daily_remaining = max(0, daily_quota - daily_used)
-
-        # 2) 决定消耗来源：优先赠送点数
-        if bonus_remaining > 0:
-            source = 'bonus'
-        elif daily_remaining > 0:
-            source = 'daily'
+                            "daily_remaining": dr, "total_remaining": total})
+        du = _video_daily_used(c, user_id, today)
+        dr = max(0, daily_quota - du)
+        if bonus_remaining > 0: source = 'bonus'
+        elif dr > 0:            source = 'daily'
         else:
             c.execute("COMMIT")
             return jsonify({"status": "quota_exceeded", "remaining": 0,
                             "bonus_remaining": 0, "daily_remaining": 0, "total_remaining": 0})
-
-        # 3) 记录解锁 + 扣减
         c.execute('''INSERT INTO video_free_unlocks
                      (user_id, episode_key, unlock_date, video_title, created_at, source)
                      VALUES (?,?,?,?,?,?)''',
                   (user_id, episode_key, today, data.get('video_title', ''), now, source))
-
         if source == 'bonus':
-            c.execute("UPDATE video_bonus_quota SET bonus_remaining = bonus_remaining - 1 WHERE user_id=?",
-                      (user_id,))
+            c.execute("UPDATE video_points SET bonus_remaining=bonus_remaining-1 WHERE user_id=?", (user_id,))
             bonus_remaining -= 1
         else:
-            daily_used += 1
-            daily_remaining = max(0, daily_quota - daily_used)
-
+            dr = max(0, dr - 1)
         c.execute("COMMIT")
-        total = bonus_remaining + daily_remaining
+        total = bonus_remaining + dr
         return jsonify({"status": "success", "remaining": total,
                         "bonus_remaining": bonus_remaining,
-                        "daily_remaining": daily_remaining, "total_remaining": total})
+                        "daily_remaining": dr, "total_remaining": total})
     except Exception as e:
-        try:
-            c.execute("ROLLBACK")
-        except Exception:
-            pass
+        try: c.execute("ROLLBACK")
+        except Exception: pass
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
     finally:
@@ -2481,6 +2593,264 @@ def handle_payment(app_name):
     finally:
         conn.close()
 
+# Onews 新闻类接口
+@app.route('/api/ONews/track', methods=['POST'])
+def track_news_event():
+    try:
+        data = request.get_json()
+        user_id       = data.get('user_id')
+        user_type     = data.get('user_type', 'apple')
+        article_key   = data.get('article_key')
+        article_topic = data.get('article_topic', '')
+        source_id     = data.get('source_id', '')
+        article_date  = data.get('article_date', '')
+        event_type    = data.get('event_type')
+        app_version = data.get('app_version', '') 
+        if not user_id or not article_key or event_type not in ALLOWED_NEWS_EVENT_TYPES:
+            return jsonify({"error": "Invalid params"}), 400
+        now = now_iso()        # ⭐ 北京时间(无时区后缀)
+        conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO user_news_events
+                (user_id, user_type, article_key, article_topic, source_id,
+                 article_date, event_type, first_at, last_at, count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(user_id, article_key, event_type)
+            DO UPDATE SET last_at = ?, count = count + 1
+        ''', (user_id, user_type, article_key, article_topic, source_id,
+              article_date, event_type, now, now, now))
+        c.execute('''
+            INSERT INTO news_event_logs
+                (user_id, user_type, article_key, article_topic, source_id,
+                 article_date, event_type, created_at, app_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, user_type, article_key, article_topic, source_id,
+              article_date, event_type, now, app_version))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    
+@app.route('/admin/login', methods=['POST'])
+def admin_login():
+    pwd = request.get_json().get('password', '')
+    if hashlib.sha256(pwd.encode()).hexdigest() == ADMIN_PASSWORD_HASH:
+        token = secrets.token_urlsafe(32)
+        ADMIN_TOKENS.add(token)
+        return jsonify({"token": token})
+    return jsonify({"error": "密码错误"}), 401
+
+def _query_analytics(sql, params=()):
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+@app.route('/api/ONews/quota/status', methods=['GET'])
+def news_quota_status():
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return jsonify({"error": "Missing user_id"}), 400
+    cfg = get_news_points_config()
+    daily_quota = cfg['daily_quota']
+    if not is_real_login_user(user_id):
+        return jsonify({
+            "daily_quota": daily_quota, "used_today": 0,
+            "remaining": 0, "daily_remaining": 0,
+            "bonus_remaining": 0, "total_remaining": 0,
+            "bonus_just_granted": False,
+            "unlocked_episodes": [], "unlocked_news": [],
+            "invite_code": None, "invite_reward_count": 0,
+            "has_redeemed_invite": False,
+            "invite_reward_points": cfg['invite_reward_points'],
+            "logged_in": False
+        })
+    maybe_cleanup_old_unlocks()
+    today = today_str()
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        row, just_granted = _ensure_points(c, 'news_points', user_id, cfg, migrate_from='onews_points')
+        conn.commit()
+        bonus_remaining = row['bonus_remaining']
+        news_keys = [r['article_key'] for r in c.execute(
+            "SELECT article_key FROM news_free_unlocks WHERE user_id=?", (user_id,)).fetchall()]
+        daily_used = _news_daily_used(c, user_id, today)
+        invite_code = row['invite_code']
+        invite_reward_count = row['invite_reward_count']
+        has_redeemed = bool(row['invited_by_code'])
+    finally:
+        conn.close()
+    daily_remaining = max(0, daily_quota - daily_used)
+    total = bonus_remaining + daily_remaining
+    return jsonify({
+        "daily_quota": daily_quota, "used_today": daily_used,
+        "remaining": total, "daily_remaining": daily_remaining,
+        "bonus_remaining": bonus_remaining, "total_remaining": total,
+        "bonus_just_granted": just_granted,
+        "unlocked_episodes": [], "unlocked_news": news_keys,
+        "invite_code": invite_code, "invite_reward_count": invite_reward_count,
+        "has_redeemed_invite": has_redeemed,
+        "invite_reward_points": cfg['invite_reward_points'], "logged_in": True
+    })
+
+@app.route('/api/ONews/quota/unlock', methods=['POST'])
+def news_quota_unlock():
+    data = request.get_json() or {}
+    user_id = data.get('user_id')
+    article_key = data.get('article_key')
+    if not user_id or not article_key:
+        return jsonify({"error": "Missing params"}), 400
+    if not is_real_login_user(user_id):
+        return jsonify({"status": "quota_exceeded", "remaining": 0,
+                        "bonus_remaining": 0, "daily_remaining": 0, "total_remaining": 0})
+    cfg = get_news_points_config()
+    daily_quota = cfg['daily_quota']
+    today = today_str(); now = now_iso()
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row, _ = _ensure_points(c, 'news_points', user_id, cfg, migrate_from='onews_points')
+        bonus_remaining = row['bonus_remaining']
+        if c.execute("SELECT 1 FROM news_free_unlocks WHERE user_id=? AND article_key=?",
+                     (user_id, article_key)).fetchone():
+            du = _news_daily_used(c, user_id, today)
+            c.execute("COMMIT")
+            dr = max(0, daily_quota - du); total = bonus_remaining + dr
+            return jsonify({"status": "already_unlocked", "remaining": total,
+                            "bonus_remaining": bonus_remaining,
+                            "daily_remaining": dr, "total_remaining": total})
+        du = _news_daily_used(c, user_id, today)
+        dr = max(0, daily_quota - du)
+        if bonus_remaining > 0: source = 'bonus'
+        elif dr > 0:            source = 'daily'
+        else:
+            c.execute("COMMIT")
+            return jsonify({"status": "quota_exceeded", "remaining": 0,
+                            "bonus_remaining": 0, "daily_remaining": 0, "total_remaining": 0})
+        c.execute('''INSERT OR IGNORE INTO news_free_unlocks
+                     (user_id, article_key, unlock_date, article_topic, source, created_at)
+                     VALUES (?,?,?,?,?,?)''',
+                  (user_id, article_key, today, data.get('article_topic', ''), source, now))
+        if source == 'bonus':
+            c.execute("UPDATE news_points SET bonus_remaining=bonus_remaining-1 WHERE user_id=?", (user_id,))
+            bonus_remaining -= 1
+        else:
+            dr = max(0, dr - 1)
+        c.execute("COMMIT")
+        total = bonus_remaining + dr
+        return jsonify({"status": "success", "remaining": total,
+                        "bonus_remaining": bonus_remaining,
+                        "daily_remaining": dr, "total_remaining": total})
+    except Exception as e:
+        try: c.execute("ROLLBACK")
+        except Exception: pass
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+def _do_invite_redeem(table, cfg_getter):
+    data = request.get_json() or {}
+    invitee_id = data.get('user_id')
+    code = (data.get('invite_code') or '').strip().upper()
+    if not is_real_login_user(invitee_id):
+        return jsonify({"error": "请先登录后再使用邀请码"}), 401
+    if not code:
+        return jsonify({"error": "请输入邀请码"}), 400
+    cfg = cfg_getter(); reward = cfg['invite_reward_points']
+    migrate = 'onews_points' if table == 'news_points' else None
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    inviter_id = None; invitee_bonus = 0; invitee_total = 0
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        invitee_row, _ = _ensure_points(c, table, invitee_id, cfg, migrate_from=migrate)
+        if invitee_row['invited_by_code']:
+            c.execute("COMMIT")
+            return jsonify({"error": "您已经使用过邀请码了，每位用户仅限使用一次"}), 403
+        inviter = c.execute(f"SELECT * FROM {table} WHERE invite_code=?", (code,)).fetchone()
+        if not inviter:
+            c.execute("COMMIT")
+            return jsonify({"error": "视频和新闻的邀请码不能混用或您输入了错误的邀请码，请检查后重试"}), 404
+        inviter_id = inviter['user_id']
+        if inviter_id == invitee_id:
+            c.execute("COMMIT")
+            return jsonify({"error": "不能使用自己的邀请码哦"}), 400
+        if inviter['invited_by_code'] and invitee_row['invite_code'] \
+           and inviter['invited_by_code'] == invitee_row['invite_code']:
+            c.execute("COMMIT")
+            return jsonify({"error": "你们已经互相邀请过啦，每对好友仅能领取一次奖励"}), 403
+
+        _grant_points_bonus(c, table, invitee_id, reward, cfg)
+        _grant_points_bonus(c, table, inviter_id, reward, cfg)
+        c.execute(f"UPDATE {table} SET invited_by_code=? WHERE user_id=?", (code, invitee_id))
+        c.execute(f"UPDATE {table} SET invite_reward_count=invite_reward_count+1 WHERE user_id=?", (inviter_id,))
+
+        inv_row = c.execute(f"SELECT bonus_remaining FROM {table} WHERE user_id=?", (invitee_id,)).fetchone()
+        invitee_bonus = inv_row['bonus_remaining']
+        today = today_str()
+        du = _news_daily_used(c, invitee_id, today) if table == 'news_points' else _video_daily_used(c, invitee_id, today)
+        dr = max(0, cfg['daily_quota'] - du)
+        invitee_total = invitee_bonus + dr
+        c.execute("COMMIT")
+    except Exception as e:
+        try: c.execute("ROLLBACK")
+        except Exception: pass
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+    _log_onews_invite(inviter_id, code, invitee_id, reward)
+    return jsonify({"status": "success", "reward_points": reward,
+                    "bonus_remaining": invitee_bonus, "remaining_total": invitee_total})
+
+@app.route('/api/ONews/invite/redeem', methods=['POST'])
+def onews_invite_redeem():
+    return _do_invite_redeem('news_points', get_news_points_config)
+
+@app.route('/api/OVideo/invite/redeem', methods=['POST'])
+def ovideo_invite_redeem():
+    return _do_invite_redeem('video_points', get_video_points_config)
+
+@app.route('/admin/api/onews/invite_overview', methods=['GET'])
+@require_admin
+def admin_onews_invite_overview():
+    today = today_str()
+    return jsonify({
+        "total_invites":   _query_analytics("SELECT COUNT(*) c FROM onews_invite_logs")[0]['c'],
+        "today_invites":   _query_analytics("SELECT COUNT(*) c FROM onews_invite_logs WHERE date(created_at)=?", (today,))[0]['c'],
+        "unique_inviters": _query_analytics("SELECT COUNT(DISTINCT inviter_id) c FROM onews_invite_logs")[0]['c'],
+        "total_reward_points": _query_analytics("SELECT COALESCE(SUM(reward_points),0) c FROM onews_invite_logs")[0]['c'],
+    })
+
+@app.route('/admin/api/onews/top_inviters', methods=['GET'])
+@require_admin
+def admin_onews_top_inviters():
+    return jsonify(_query_analytics('''
+        SELECT inviter_id, MAX(inviter_code) AS inviter_code,
+               COUNT(*) AS invite_count, SUM(reward_points) AS total_points,
+               MAX(created_at) AS last_time
+        FROM onews_invite_logs GROUP BY inviter_id
+        ORDER BY invite_count DESC LIMIT 50
+    '''))
+
+@app.route('/admin/api/onews/invite_logs', methods=['GET'])
+@require_admin
+def admin_onews_invite_logs():
+    return jsonify(_query_analytics('''
+        SELECT inviter_id, inviter_code, invitee_id, reward_points, created_at
+        FROM onews_invite_logs ORDER BY created_at DESC LIMIT 100
+    '''))
+
 # --- ONews 路由 (保持兼容) ---
 @app.route('/api/ONews/auth/apple', methods=['POST'])
 def onews_auth(): return handle_auth('ONews')
@@ -2718,6 +3088,7 @@ def track_finance_event():
         card_key   = data.get('card_key')
         card_name  = data.get('card_name', '')
         event_type = data.get('event_type', 'click')
+        app_version = data.get('app_version', '')       # 【新增】
         if not user_id or not card_key or event_type not in ALLOWED_FINANCE_EVENT_TYPES:
             return jsonify({"error": "Invalid params"}), 400
         now = now_iso()   # 北京时间
@@ -2732,9 +3103,9 @@ def track_finance_event():
         ''', (user_id, user_type, card_key, card_name, event_type, now, now, now))
         c.execute('''
             INSERT INTO finance_event_logs
-                (user_id, user_type, card_key, card_name, event_type, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (user_id, user_type, card_key, card_name, event_type, now))
+                (user_id, user_type, card_key, card_name, event_type, created_at, app_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, user_type, card_key, card_name, event_type, now, app_version))
         conn.commit()
         conn.close()
         return jsonify({"status": "ok"}), 200
@@ -3080,63 +3451,6 @@ def query_options_rank():
         print(f"Error querying options rank: {e}")
         return jsonify({"error": str(e)}), 500
 
-# Onews 新闻类接口
-@app.route('/api/ONews/track', methods=['POST'])
-def track_news_event():
-    try:
-        data = request.get_json()
-        user_id       = data.get('user_id')
-        user_type     = data.get('user_type', 'apple')
-        article_key   = data.get('article_key')
-        article_topic = data.get('article_topic', '')
-        source_id     = data.get('source_id', '')
-        article_date  = data.get('article_date', '')
-        event_type    = data.get('event_type')
-        if not user_id or not article_key or event_type not in ALLOWED_NEWS_EVENT_TYPES:
-            return jsonify({"error": "Invalid params"}), 400
-        now = now_iso()        # ⭐ 北京时间(无时区后缀)
-        conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
-        c = conn.cursor()
-        c.execute('''
-            INSERT INTO user_news_events
-                (user_id, user_type, article_key, article_topic, source_id,
-                 article_date, event_type, first_at, last_at, count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-            ON CONFLICT(user_id, article_key, event_type)
-            DO UPDATE SET last_at = ?, count = count + 1
-        ''', (user_id, user_type, article_key, article_topic, source_id,
-              article_date, event_type, now, now, now))
-        c.execute('''
-            INSERT INTO news_event_logs
-                (user_id, user_type, article_key, article_topic, source_id,
-                 article_date, event_type, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, user_type, article_key, article_topic, source_id,
-              article_date, event_type, now))
-        conn.commit()
-        conn.close()
-        return jsonify({"status": "ok"}), 200
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-    
-@app.route('/admin/login', methods=['POST'])
-def admin_login():
-    pwd = request.get_json().get('password', '')
-    if hashlib.sha256(pwd.encode()).hexdigest() == ADMIN_PASSWORD_HASH:
-        token = secrets.token_urlsafe(32)
-        ADMIN_TOKENS.add(token)
-        return jsonify({"token": token})
-    return jsonify({"error": "密码错误"}), 401
-
-def _query_analytics(sql, params=()):
-    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
 # ============================================
 
 # 美股 - 总览
@@ -3180,7 +3494,8 @@ def admin_finance_user_details():
     sql = '''
         SELECT card_key, MAX(card_name) AS card_name,
                MAX(created_at) AS last_time,
-               COUNT(*) AS click_count
+               COUNT(*) AS click_count,
+               GROUP_CONCAT(DISTINCT NULLIF(app_version,'')) AS versions
         FROM finance_event_logs
         WHERE user_id = ? AND created_at >= ?
         GROUP BY card_key
@@ -3374,7 +3689,9 @@ def admin_news_user_details():
         return jsonify({"error": "Missing parameters"}), 400
     cutoff = analytics_cutoff_iso()                  # 【新增】
     sql = '''
-        SELECT article_date, article_topic, source_id, MAX(created_at) as last_time, COUNT(*) as click_count
+        SELECT article_date, article_topic, source_id,
+               MAX(created_at) as last_time, COUNT(*) as click_count,
+               GROUP_CONCAT(DISTINCT NULLIF(app_version,'')) AS versions
         FROM news_event_logs
         WHERE user_id = ? AND event_type = ? AND created_at >= ?
         GROUP BY article_date, article_key
@@ -3406,6 +3723,13 @@ def admin_clear_db():
             c.execute("DELETE FROM finance_invite_logs")
             c.execute("DELETE FROM user_finance_events")   # 【新增】
             c.execute("DELETE FROM finance_event_logs")    # 【新增】
+            c.execute("DELETE FROM onews_points")
+            c.execute("DELETE FROM news_points")
+            c.execute("DELETE FROM video_points")
+            c.execute("DELETE FROM news_free_unlocks")
+            c.execute("DELETE FROM onews_invite_logs")
+            c.execute("DELETE FROM video_bonus_quota")
+            c.execute("DELETE FROM video_free_unlocks")
             conn.commit()
             conn.close()
             
@@ -3614,6 +3938,21 @@ ADMIN_HTML = r'''
         </table>
       </div>
     </div>
+    <div class="stats" id="onewsInviteStatsBox" style="margin-top:8px"></div>
+    <div class="panel" style="margin-bottom:24px">
+      <h3>🎁 新闻/视频 - 邀请拉新排行</h3>
+      <table>
+        <thead><tr><th>#</th><th>邀请人</th><th>邀请码</th><th>成功邀请</th><th>累计赠送点数</th><th>最近</th></tr></thead>
+        <tbody id="onewsTopInvitersBody"></tbody>
+      </table>
+    </div>
+    <div class="panel" style="margin-bottom:24px">
+      <h3>📜 新闻/视频 - 最近邀请记录</h3>
+      <table>
+        <thead><tr><th>#</th><th>邀请人</th><th>邀请码</th><th>被邀请人</th><th>奖励</th><th>时间</th></tr></thead>
+        <tbody id="onewsInviteLogsBody"></tbody>
+      </table>
+    </div>
   </div>
 
   <!-- 新闻模块 -->
@@ -3725,9 +4064,8 @@ ADMIN_HTML = r'''
         <tbody id="financeTopCardsBody"></tbody>
       </table>
     </div>
-  </div>
 
-  <div class="stats" id="financeInviteStatsBox" style="margin-top:8px"></div>
+    <div class="stats" id="financeInviteStatsBox" style="margin-top:8px"></div>
     <div class="panel" style="margin-bottom:24px">
       <h3>🎁 美股 - 邀请拉新排行</h3>
       <table>
@@ -3742,6 +4080,7 @@ ADMIN_HTML = r'''
         <tbody id="financeInviteLogsBody"></tbody>
       </table>
     </div>
+  </div>
 
   <!-- 危险区 -->
   <div class="panel danger-zone" style="margin-bottom:24px">
@@ -3801,6 +4140,46 @@ let videoUserSortOrder = 'desc';
 let wishStatus = 'pending';
 let pendingWishId = null;
 let pendingReportEpisodeUrl = null;
+
+async function loadOnewsInvites(){
+  const o = await api('/admin/api/onews/invite_overview');
+  if(o){
+    const items = [
+      ['累计邀请成功', o.total_invites],
+      ['今日邀请', o.today_invites],
+      ['参与邀请人数', o.unique_inviters],
+      ['累计赠送点数', o.total_reward_points],
+    ];
+    document.getElementById('onewsInviteStatsBox').innerHTML = items.map(([l,v])=>
+      `<div class="stat-card"><div class="label">${l}</div><div class="value">${v||0}</div></div>`).join('');
+  }
+  const top = await api('/admin/api/onews/top_inviters');
+  if(top){
+    document.getElementById('onewsTopInvitersBody').innerHTML = top.length===0
+      ? '<tr><td colspan="6" style="text-align:center;color:#64748b">暂无数据</td></tr>'
+      : top.map((r,i)=>`<tr>
+          <td>${i+1}</td>
+          <td><span style="font-family:monospace;font-size:11px">${(r.inviter_id||'').substring(0,20)}...</span></td>
+          <td><span class="pill pill-purple">${r.inviter_code||'-'}</span></td>
+          <td><span class="pill pill-green">${r.invite_count}</span></td>
+          <td>${r.total_points||0} 点</td>
+          <td style="color:#94a3b8;font-size:12px;white-space:nowrap">${(r.last_time||'').replace('T',' ').substring(0,16)}</td>
+        </tr>`).join('');
+  }
+  const logs = await api('/admin/api/onews/invite_logs');
+  if(logs){
+    document.getElementById('onewsInviteLogsBody').innerHTML = logs.length===0
+      ? '<tr><td colspan="6" style="text-align:center;color:#64748b">暂无记录</td></tr>'
+      : logs.map((r,i)=>`<tr>
+          <td>${i+1}</td>
+          <td><span style="font-family:monospace;font-size:10px">${(r.inviter_id||'').substring(0,16)}...</span></td>
+          <td><span class="pill pill-purple">${r.inviter_code||'-'}</span></td>
+          <td><span style="font-family:monospace;font-size:10px">${(r.invitee_id||'').substring(0,16)}...</span></td>
+          <td><span class="pill pill-green">+${r.reward_points}点</span></td>
+          <td style="color:#94a3b8;font-size:12px;white-space:nowrap">${(r.created_at||'').replace('T',' ').substring(0,16)}</td>
+        </tr>`).join('');
+  }
+}
 
 async function loadVideoWishes(){
   const data = await api(`/admin/api/video_wishes?status=${wishStatus}`);
@@ -4028,6 +4407,7 @@ async function loadVideoModule(){
   loadTopUsers();
   loadVideoReports();
   loadVideoWishes();          // 【新增】
+  loadOnewsInvites();
 }
 
 async function loadVideoOverview(){
@@ -4139,56 +4519,43 @@ function sortVideoUsers(field){
 // 点击观看数/下载数 → 弹出该用户的视频历史
 async function showUserVideoDetails(userIdEnc, type){
   const userId = decodeURIComponent(userIdEnc);
-  let typeText = '';
-  let sqlType = 'play';
-  let suffixFilter = '';
-  let showSource = false;            // ⭐ 仅在线播放展示来源
-
-  if (type === 'online') {
-    typeText = '在线播放';
-    suffixFilter = "AND video_url NOT LIKE '%.m3u8'";
-    showSource = true;               // ⭐ 在线播放才有来源意义
-  } else if (type === 'offline') {
-    typeText = '离线播放';
-    suffixFilter = "AND video_url LIKE '%.m3u8'";
-  } else {
-    typeText = type === 'play' ? '播放' : '下载';
-    sqlType = type;
-  }
+  let typeText='', sqlType='play', suffixFilter='', showSource=false;
+  if (type === 'online') { typeText='在线播放'; suffixFilter="AND video_url NOT LIKE '%.m3u8'"; showSource=true; }
+  else if (type === 'offline') { typeText='离线播放'; suffixFilter="AND video_url LIKE '%.m3u8'"; }
+  else { typeText = type==='play' ? '播放' : '下载'; sqlType = type; }
 
   const data = await api(`/admin/api/video/user_details?user_id=${encodeURIComponent(userId)}&type=${sqlType}&suffix=${encodeURIComponent(suffixFilter)}`);
   if(!data) return;
-  if(data.length === 0){
-    showInfoModal(`👤 用户${typeText}明细`, '暂无记录');
-    return;
-  }
+  if(data.length === 0){ showInfoModal(`👤 用户${typeText}明细`, '暂无记录'); return; }
+
+  const groups = {};
+  data.forEach(item => { const d = item.day || '未知日期'; (groups[d] = groups[d] || []).push(item); });
 
   let html = `<div style="text-align:left;max-height:60vh;overflow-y:auto;font-size:13px;color:#cbd5e1;">`;
-  html += `<ul style="list-style-type:none;padding-left:4px;">`;
-  data.forEach(item => {
-    const countBadge = item.click_count > 1
-      ? `<span class="pill pill-blue" style="margin-left:6px;font-size:10px;padding:1px 4px;">${item.click_count}次</span>` : '';
-    const timeStr = (item.last_time || '').replace('T',' ').substring(0,16);
-
-    // ⭐ 来源徽标（可能有多个来源，用 / 拼接）
-    let sourceLine = '';
-    if (showSource && item.sources) {
-      const labels = item.sources.split(',')
-        .map(s => PLAY_SOURCE_MAP[s] || (s || '未知来源'))
-        .join(' / ');
-      sourceLine = `<br><span class="pill pill-purple" style="font-size:10px;padding:1px 6px;margin-top:3px;display:inline-block;">📍 来源: ${labels}</span>`;
-    }
-
-    html += `<li style="margin-bottom:10px;line-height:1.4;border-bottom:1px solid #334155;padding-bottom:6px;">`;
-    html += `  <strong>${item.video_title || '无标题'}</strong>${countBadge}<br>`;
-    html += `  <span style="font-size:11px;color:#64748b;word-break:break-all;">${item.video_url || ''}</span>`;
-    html += `  ${sourceLine}<br>`;
-    html += `  <span style="font-size:11px;color:#94a3b8;">🕐 ${timeStr}</span>`;
-    html += `</li>`;
+  const days = Object.keys(groups).sort((a,b)=>b.localeCompare(a));
+  days.forEach(day => {
+    const dayVers = [...new Set(groups[day].flatMap(x => (x.versions||'').split(',')).filter(Boolean))];
+    const verBadge = dayVers.length ? ` <span class="pill pill-purple" style="font-size:10px;">v${dayVers.join(' / v')}</span>` : '';
+    html += `<div style="margin-bottom:14px;border-bottom:1px solid #334155;padding-bottom:8px;">`;
+    html += `<div style="font-weight:bold;color:#60a5fa;font-size:14px;margin-bottom:6px;">📅 ${day}${verBadge}</div>`;
+    html += `<ul style="list-style:none;padding-left:4px;">`;
+    groups[day].forEach(item => {
+      const countBadge = item.click_count > 1 ? `<span class="pill pill-blue" style="margin-left:6px;font-size:10px;">${item.click_count}次</span>` : '';
+      const timeStr = (item.last_time || '').replace('T',' ').substring(11,16);
+      let sourceLine = '';
+      if (showSource && item.sources) {
+        const labels = item.sources.split(',').map(s => PLAY_SOURCE_MAP[s] || (s||'未知来源')).join(' / ');
+        sourceLine = `<br><span class="pill pill-purple" style="font-size:10px;">📍 ${labels}</span>`;
+      }
+      html += `<li style="margin-bottom:8px;line-height:1.4;">
+        <strong>${item.video_title || '无标题'}</strong>${countBadge}<br>
+        <span style="font-size:11px;color:#64748b;word-break:break-all;">${item.video_url || ''}</span>${sourceLine}<br>
+        <span style="font-size:11px;color:#94a3b8;">🕐 ${timeStr}</span></li>`;
+    });
+    html += `</ul></div>`;
   });
-  html += `</ul></div>`;
-
-  showInfoModal(`👤 用户 [${userId.substring(0,10)}...] 的${typeText}历史 (${data.length} 个视频)`, html);
+  html += `</div>`;
+  showInfoModal(`👤 用户 [${userId.substring(0,10)}...] 的${typeText}历史`, html);
 }
 
 async function showVideoUsers(urlEnc, type){
@@ -4395,8 +4762,9 @@ async function showUserNewsDetails(userIdEnc, type){
     groups[date].forEach(art => {
       const sourceBadge = art.source_id ? `<span class="pill pill-orange" style="margin-right:6px; font-size:10px; padding:1px 4px;">${art.source_id}</span>` : '';
       const countBadge = art.click_count > 1 ? `<span class="pill pill-blue" style="margin-left:6px; font-size:10px; padding:1px 4px;">${art.click_count}次</span>` : '';
+      const verBadge = art.versions ? `<span class="pill pill-purple" style="margin-left:6px;font-size:10px;">v${art.versions.split(',').join(' / v')}</span>` : '';
       html += `    <li style="margin-bottom: 6px; line-height: 1.4;">`;
-      html += `      ${sourceBadge}<strong>${art.article_topic || '无标题'}</strong>${countBadge}`;
+      html += `      ${sourceBadge}<strong>${art.article_topic || '无标题'}</strong>${countBadge}${verBadge}`;
       html += `    </li>`;
     });
     
@@ -4522,8 +4890,8 @@ async function loadFinanceInvites(){
           <td><span style="font-family:monospace;font-size:10px">${(r.inviter_id||'').substring(0,16)}...</span></td>
           <td><span class="pill pill-purple">${r.inviter_code||'-'}</span></td>
           <td><span style="font-family:monospace;font-size:10px">${(r.invitee_id||'').substring(0,16)}...</span></td>
-          +${r.reward_days}点
-          <td style="color:#94a3b8;font-size:12px">${(r.created_at||'').replace('T',' ').substring(0,16)}</td>
+          <td><span class="pill pill-green">+${r.reward_days}点</span></td>
+          <td style="color:#94a3b8;font-size:12px;white-space:nowrap">${(r.created_at||'').replace('T',' ').substring(0,16)}</td>
         </tr>`).join('');
   }
 }
@@ -4583,8 +4951,9 @@ async function showFinanceUserDetails(userIdEnc){
     const countBadge = item.click_count>1
       ? `<span class="pill pill-blue" style="margin-left:6px;font-size:10px;padding:1px 4px;">${item.click_count}次</span>`:'';
     const timeStr = (item.last_time||'').replace('T',' ').substring(0,16);
+    const verBadge = item.versions ? `<span class="pill pill-purple" style="margin-left:6px;font-size:10px;">v${item.versions.split(',').join(' / v')}</span>` : '';
     html += `<li style="margin-bottom:10px;line-height:1.4;border-bottom:1px solid #334155;padding-bottom:6px;">
-      <strong>${item.card_name||item.card_key}</strong>${countBadge}
+      <strong>${item.card_name||item.card_key}</strong>${countBadge}${verBadge}
       <span style="font-size:11px;color:#64748b">(${item.card_key})</span><br>
       <span style="font-size:11px;color:#94a3b8;">🕐 ${timeStr}</span></li>`;
   });

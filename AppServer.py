@@ -244,6 +244,9 @@ def init_user_db():
     os.makedirs(os.path.dirname(USER_DB_PATH), exist_ok=True)
     conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
     c = conn.cursor()
+    # 【关键修复】同样开启 WAL，避免额度/登录写入阻塞读取
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
     
     # 【核心修改】新的表结构, ，添加了 device_id
     # finance_expire_at: Finance 付费过期时间
@@ -439,6 +442,9 @@ def init_analytics_db():
     print(f"检查行为数据库: {ANALYTICS_DB_PATH}")
     conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=60.0)
     c = conn.cursor()
+    # 【关键修复】开启 WAL：读写互不阻塞，彻底解决“活跃用户榜”被客户端写入拖死的问题
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
     c.execute('''
         CREATE TABLE IF NOT EXISTS user_video_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -710,7 +716,12 @@ def init_analytics_db():
             c.execute(f"ALTER TABLE {tbl} ADD COLUMN app_version TEXT")
         except sqlite3.OperationalError:
             pass
-    
+
+    # 【新增】活跃用户榜是按 user_id 全表分组，加索引避免临时排序、加快聚合
+    c.execute('CREATE INDEX IF NOT EXISTS idx_logs_user ON event_logs(user_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_news_logs_user ON news_event_logs(user_id)')
+    # finance_event_logs 已有 idx_fin_logs_user
+
     conn.commit()
     conn.close()
     print("行为数据库已就绪。")
@@ -2644,11 +2655,20 @@ def admin_login():
     return jsonify({"error": "密码错误"}), 401
 
 def _query_analytics(sql, params=()):
-    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    import time
+    last_err = None
+    for _ in range(3):                     # 撞锁时最多重试 3 次
+        conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
+        except sqlite3.OperationalError as e:
+            last_err = e
+            time.sleep(0.2)
+        finally:
+            conn.close()
+    raise last_err
 
 @app.route('/api/ONews/quota/status', methods=['GET'])
 def news_quota_status():
@@ -5035,4 +5055,4 @@ if __name__ == '__main__':
     port = 5001
     print("请确保您的手机和电脑连接到同一个Wi-Fi网络")
     print(f"在iOS App中请使用 http://{host_ip}:{port}/api/ONews/... 访问")
-    app.run(host=host_ip, port=port, debug=False)
+    app.run(host=host_ip, port=port, debug=False, threaded=True)

@@ -74,6 +74,32 @@ FEATURED_DRAMA_DATE_OFFSET_DAYS = 2
 # 邀请码字母表：去掉 0/O/1/I/L 等易混字符
 INVITE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
+# 美股节假日（必须与客户端 TradingDateHelper.holidays 保持一致）
+US_MARKET_HOLIDAYS = {
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03",
+    "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
+    "2026-11-26", "2026-12-25",
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26",
+    "2027-05-31", "2027-06-18", "2027-07-05", "2027-09-06",
+    "2027-11-25", "2027-12-24",
+    "2028-01-17", "2028-02-21", "2028-04-14", "2028-05-29",
+    "2028-06-19", "2028-07-04", "2028-09-04", "2028-11-23",
+    "2028-12-25",
+    "2029-01-01", "2029-01-15", "2029-02-19", "2029-03-30",
+    "2029-05-28", "2029-06-19", "2029-07-04", "2029-09-03",
+    "2029-11-22", "2029-12-25",
+}
+
+def is_free_access_day():
+    """服务器权威判断：北京时间今天是否为免点数日。
+       逻辑与客户端一致：北京今天往前推 1 天，若该日为周末或美股节假日 → 免点。"""
+    ref = datetime.now(APP_TZ) - timedelta(days=1)
+    ref_str = ref.strftime('%Y-%m-%d')
+    weekday = ref.weekday()          # Monday=0 ... Saturday=5, Sunday=6
+    is_weekend = weekday >= 5
+    is_holiday = ref_str in US_MARKET_HOLIDAYS
+    return is_weekend or is_holiday
+
 def get_finance_config():
     """读取 Finance/version.json 中与点数/邀请相关的配置"""
     path = os.path.join(BASE_RESOURCES_DIR, 'Finance', 'version.json')
@@ -2336,7 +2362,7 @@ def check_version(app_name):
         return jsonify({"error": "无效的应用名称"}), 404
     
     # 获取服务器当前的日期，格式与你的 json 文件一致 (yyMMdd)
-    server_now = datetime.now()
+    server_now = datetime.now(APP_TZ)
     server_date_str = server_now.strftime('%y%m%d')
     
     # 获取原始的 version.json 内容
@@ -2347,6 +2373,8 @@ def check_version(app_name):
         
         # 【关键】动态注入服务器当前日期
         data['server_date'] = server_date_str
+        # 【新增】服务器权威判断的免点数日标志，防止客户端改设备日期白嫖
+        data['is_free_access_day'] = is_free_access_day()
         return jsonify(data)
     else:
         return jsonify({"error": "Version file not found"}), 404
@@ -2984,7 +3012,7 @@ def finance_quota_consume():
         daily_remaining = max(0, cfg['daily_free_limit'] - row['daily_used'])
         total = row['bonus_remaining'] + daily_remaining
 
-        if exists or cost <= 0:
+        if exists or cost <= 0 or is_free_access_day():
             c.execute("COMMIT")
             return jsonify({"status": "already_unlocked" if exists else "free",
                             "cost": cost, "remaining_total": total,

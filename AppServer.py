@@ -34,7 +34,7 @@ PARENT_DIR = os.path.dirname(CURRENT_DIR)
 BASE_RESOURCES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Resources')
 
 # 活跃用户明细/流水仅保留最近 N 天（可配置）
-ANALYTICS_LOG_KEEP_DAYS = 7
+ANALYTICS_LOG_KEEP_DAYS = 15
 
 ALLOWED_APPS = ['ONews', 'Finance', 'Prediction', 'OVideo']
 ALLOWED_EVENT_TYPES = {'play', 'download_complete'}
@@ -1419,7 +1419,7 @@ def ovideo_list():
     where, params = [], []
 
     if category == 'Featured':
-        pass
+        where.append("category != ?"); params.append('Show')
     elif category == 'Documentary':
         where.append("has_documentary=1")
     else:

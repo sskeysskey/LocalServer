@@ -2415,6 +2415,17 @@ def download_file(app_name):
     if not filename:
         return jsonify({"error": "缺少文件名参数"}), 400
 
+    # 【新增】离线数据库仅限已登录用户下载，防止整库被匿名拖走
+    if app_name == 'Finance' and filename == 'Finance.db':
+        uid = request.args.get('user_id', '')
+        if not is_real_login_user(uid):
+            return jsonify({"error": "请先登录后再下载离线数据库"}), 401
+        conn = sqlite3.connect(USER_DB_PATH, timeout=10.0)
+        exists = conn.execute("SELECT 1 FROM users WHERE apple_user_id=?", (uid,)).fetchone()
+        conn.close()
+        if not exists:
+            return jsonify({"error": "用户不存在"}), 401
+
     # --- 核心修改：使用 werkzeug.utils.safe_join 来构建安全路径 ---
     # safe_join 是 Flask/Werkzeug 推荐的、更安全的方式来防止目录遍历攻击
     try:
@@ -3139,6 +3150,13 @@ def track_finance_event():
         app_version = data.get('app_version', '')       # 【新增】
         if not user_id or not card_key or event_type not in ALLOWED_FINANCE_EVENT_TYPES:
             return jsonify({"error": "Invalid params"}), 400
+
+        # 【新增】未登录用户的点击一律标记，方便后台识别绕过/拦截
+        if not is_real_login_user(user_id):
+            user_type = 'device'
+            if not card_key.startswith('GUEST_'):
+                card_key = 'GUEST_' + card_key
+
         now = now_iso()   # 北京时间
         conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
         c = conn.cursor()
@@ -3162,9 +3180,31 @@ def track_finance_event():
         return jsonify({"error": str(e)}), 500
 
 # 新增：Finance 数据查询 API (替代本地 SQL)
+def require_finance_user(f):
+    """Finance 数据查询接口：必须携带已登录的 Apple user_id"""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        uid = request.args.get('user_id')
+        if not uid:
+            body = request.get_json(silent=True) or {}
+            uid = body.get('user_id')
+        if not is_real_login_user(uid):
+            return jsonify({"error": "login_required"}), 401
+        try:
+            conn = sqlite3.connect(USER_DB_PATH, timeout=10.0)
+            exists = conn.execute(
+                "SELECT 1 FROM users WHERE apple_user_id=?", (uid,)).fetchone()
+            conn.close()
+        except Exception:
+            return jsonify({"error": "auth_check_failed"}), 500
+        if not exists:
+            return jsonify({"error": "login_required"}), 401
+        return f(*args, **kwargs)
+    return wrapper
 
 # 1. 获取所有市值数据
 @app.route('/api/Finance/query/market_cap', methods=['GET'])
+@require_finance_user
 def query_market_cap():
     db = get_finance_db()
     if not db: return jsonify({"error": "Database not found"}), 500
@@ -3186,6 +3226,7 @@ def query_market_cap():
 
 # 2. 获取历史价格数据
 @app.route('/api/Finance/query/historical', methods=['GET'])
+@require_finance_user
 def query_historical():
     symbol = request.args.get('symbol')
     table_name = request.args.get('table')
@@ -3248,6 +3289,7 @@ def query_historical():
 
 # 3. 获取财报数据
 @app.route('/api/Finance/query/earning', methods=['GET'])
+@require_finance_user
 def query_earning():
     symbol = request.args.get('symbol')
     if not symbol: return jsonify({"error": "Missing symbol"}), 400
@@ -3265,6 +3307,7 @@ def query_earning():
 
 # 4. 获取单日收盘价
 @app.route('/api/Finance/query/closing_price', methods=['GET'])
+@require_finance_user
 def query_closing_price():
     symbol = request.args.get('symbol')
     date = request.args.get('date')
@@ -3286,6 +3329,7 @@ def query_closing_price():
 
 # 5. 获取最新成交量
 @app.route('/api/Finance/query/latest_volume', methods=['GET'])
+@require_finance_user
 def query_latest_volume():
     symbol = request.args.get('symbol')
     table_name = request.args.get('table')
@@ -3310,6 +3354,7 @@ def query_latest_volume():
     
 # 6. 获取期权 Call/Put 汇总数据 (修改版：支持单体 symbol 或 批量 symbols)
 @app.route('/api/Finance/query/options_summary', methods=['GET'])
+@require_finance_user
 def query_options_summary():
     # 允许传单个 'symbol' 或 逗号分隔的 'symbols'
     symbol_param = request.args.get('symbol')
@@ -3377,6 +3422,7 @@ def query_options_summary():
     
 # 7. 获取期权历史价格走势 (新增)
 @app.route('/api/Finance/query/options_price_history', methods=['GET'])
+@require_finance_user
 def query_options_price_history():
     symbol = request.args.get('symbol')
     
@@ -3405,6 +3451,7 @@ def query_options_price_history():
 # 8. 获取期权榜单 (修改 - Options Rank)
 # 逻辑：利用数据库 change 字段，移除 Self-Join，极大提高性能
 @app.route('/api/Finance/query/options_rank', methods=['GET'])
+@require_finance_user
 def query_options_rank():
     # 获取客户端传来的市值阀值，如果没有传则默认 500亿
     limit = request.args.get('limit', default=50000000000, type=float)

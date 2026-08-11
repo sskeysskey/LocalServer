@@ -759,6 +759,7 @@ OVIDEO_COVER_DIR = os.path.join(OVIDEO_DIR, 'cover_image')
 
 #  OVideo SQLite 化 
 OVIDEO_DB_PATH = os.path.join(OVIDEO_DIR, 'OVideo.db')
+OVIDEO_SCHEMA_VERSION = "2"   # 【新增】表结构变更时 +1，触发自动重建
 _video_db_lock = threading.Lock()
 _url_mapping_cache = {"mtime": 0.0, "valid": set()}
 # —— 模糊搜索候选缓存:全表预处理，仅在 OVideo.db 变更时重建 ——
@@ -851,6 +852,58 @@ _R_AM    = {"加拿大","墨西哥","哥伦比亚","巴西","智利","厄瓜多�
             "USA","乌拉圭","古巴","委内瑞拉","牙买加","特立尼达和多巴哥"}
 _R_AF    = {"南非","乍得","埃塞俄比亚","塞内加尔","摩洛哥","阿尔及利亚","阿尔巴尼亚"}
 _CHINESE_RE = re.compile(r'[\u4e00-\u9fa5·]+')
+
+# ================== 【新增】追剧：有效集数解析 ==================
+# 说明：判断"有效更新"的核心。规则见函数内注释。
+_SEASON_EP_RE = re.compile(r'[Ss](\d{1,2})[\s._\-]*[Ee](\d{1,3})')
+_EP_LABEL_RE  = re.compile(r'第\s*(\d{1,4})\s*[集期话話幕]')
+_PURE_NUM_RE  = re.compile(r'^\s*(\d{1,4})\s*$')
+_ANY_NUM_RE   = re.compile(r'(\d{1,4})')
+
+def _episode_index(name):
+    """从单个 episode 名解析集号；无法解析返回 None（例如 'HD'、'20241019'）"""
+    n = (name or '').strip()
+    if not n:
+        return None
+    digits = re.sub(r'\D', '', n)
+    # 形如 20241019 / 2024-10-19 的日期型 → 不能当集号
+    if len(digits) >= 6 and digits[:2] in ('19', '20'):
+        return None
+    m = _EP_LABEL_RE.search(n)          # 第01集 / 第3期 / 第1期上
+    if m:
+        return int(m.group(1))
+    m = _PURE_NUM_RE.match(n)           # "1" / "01"
+    if m:
+        return int(m.group(1))
+    m = _ANY_NUM_RE.search(n)           # 兜底抓第一个 1~4 位数字
+    if m:
+        v = int(m.group(1))
+        if 0 < v <= 2000:
+            return v
+    return None
+
+def _channel_progress(ep_names):
+    """单个渠道的"有效集数"。
+       1) 若存在 SxxExx：只取最大季内的集数（xb6v 常见两季混排）
+       2) 否则按 第N集/第N期/纯数字 取最大集号
+       3) 否则（日期型 / HD 等）用可播放集数的数量"""
+    names = [n for n in ep_names if (n or '').strip()]
+    if not names:
+        return 0
+    seasons = {}
+    for n in names:
+        m = _SEASON_EP_RE.search(n)
+        if m:
+            seasons.setdefault(int(m.group(1)), set()).add(int(m.group(2)))
+    if seasons:
+        top = max(seasons.keys())
+        return max(max(seasons[top]), len(seasons[top]))
+    idx = [_episode_index(n) for n in names]
+    valid = [v for v in idx if v is not None]
+    # 至少一半能解析出集号才认为是"按集编号"的渠道
+    if valid and len(valid) * 2 >= len(names):
+        return max(valid)
+    return len(names)
 
 def _normalize_region(region):
     if not region or not region.strip():
@@ -960,7 +1013,8 @@ def build_video_db():
             director_lower TEXT, cast_lower TEXT, intro_lower TEXT,
             name_norm TEXT, alias_norm TEXT, director_norm TEXT, cast_norm TEXT,
             item_json TEXT, playlist_json TEXT,
-            hide_blacklisted INTEGER DEFAULT 0
+            hide_blacklisted INTEGER DEFAULT 0,
+            latest_ep_count INTEGER DEFAULT 0
         )
     ''')
     c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
@@ -1023,6 +1077,19 @@ def build_video_db():
                         if hide:
                             hide_blacklisted = 1
 
+            # 【新增】追剧：计算该剧当前"有效集数"（只统计可播放且不在黑名单的 episode）
+            latest_ep_count = 0
+            if category != 'Movie':
+                per_channel = []
+                for ch in playlist:
+                    eps = ch.get('episodes') or {}
+                    names = [n for n, u in eps.items()
+                             if _is_playable(u) and u not in blacklist_set]
+                    if names:
+                        per_channel.append(_channel_progress(names))
+                if per_channel:
+                    latest_ep_count = max(per_channel)
+
             rows.append((
                 url, category, name,
                 region, _normalize_region(region),
@@ -1039,10 +1106,12 @@ def build_video_db():
                 json.dumps(item_nolist, ensure_ascii=False),
                 json.dumps(playlist, ensure_ascii=False),
                 hide_blacklisted,
+                latest_ep_count,      # ⭐ 新增（第 26 列）
             ))
 
-    # ⭐ 列数从 24 改为 25
-    c.executemany("INSERT OR REPLACE INTO videos VALUES (%s)" % ",".join("?"*25), rows)
+    # ⭐ 列数从 25 改为 26
+    c.executemany("INSERT OR REPLACE INTO videos VALUES (%s)" % ",".join("?"*26), rows)
+    c.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)", (OVIDEO_SCHEMA_VERSION,))
     c.execute("CREATE INDEX idx_cat_update  ON videos(category, update_sort_key)")
     c.execute("CREATE INDEX idx_cat_release ON videos(category, release_sort_key)")
     c.execute("CREATE INDEX idx_cat_rating  ON videos(category, best_rating)")
@@ -1062,7 +1131,7 @@ def build_video_db():
     print(f"[OVideo] 构建完成，共 {len(rows)} 条。")
 
 def ensure_video_db():
-    """JSON / 黑名单 / url_mapping 变更时自动重建（加锁，避免并发重复构建）"""
+    """JSON / 黑名单 / url_mapping / 表结构 变更时自动重建"""
     video_file = os.path.join(OVIDEO_DIR, 'OVideos.json')
     if not os.path.exists(video_file):
         return
@@ -1075,35 +1144,34 @@ def ensure_video_db():
     mapping_file = os.path.join(OVIDEO_DIR, 'url_mapping.json')
     map_m = str(os.path.getmtime(mapping_file)) if os.path.exists(mapping_file) else "0"
 
+    def _read_meta():
+        conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=10.0)
+        try:
+            def g(k):
+                r = conn.execute("SELECT value FROM meta WHERE key=?", (k,)).fetchone()
+                return r[0] if r else None
+            return g('source_mtime'), g('blacklist_mtime'), g('mapping_mtime'), g('schema_version')
+        finally:
+            conn.close()
+
     need = False
     if not os.path.exists(OVIDEO_DB_PATH):
         need = True
     else:
         try:
-            conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=10.0)
-            r  = conn.execute("SELECT value FROM meta WHERE key='source_mtime'").fetchone()
-            r2 = conn.execute("SELECT value FROM meta WHERE key='blacklist_mtime'").fetchone()
-            r3 = conn.execute("SELECT value FROM meta WHERE key='mapping_mtime'").fetchone()
-            conn.close()
-            if not r or r[0] != src_m:
-                need = True
-            if not r2 or r2[0] != bl_m:
-                need = True
-            if not r3 or r3[0] != map_m:   # ⭐ mapping 变了也要重建
+            a, b, cc, sv = _read_meta()
+            if a != src_m or b != bl_m or cc != map_m or sv != OVIDEO_SCHEMA_VERSION:
                 need = True
         except Exception:
             need = True
+
     if need:
         with _video_db_lock:
             # 双重检查
             try:
-                conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=10.0)
-                r  = conn.execute("SELECT value FROM meta WHERE key='source_mtime'").fetchone()
-                r2 = conn.execute("SELECT value FROM meta WHERE key='blacklist_mtime'").fetchone()
-                r3 = conn.execute("SELECT value FROM meta WHERE key='mapping_mtime'").fetchone()
-                conn.close()
-                if (r and r[0] == src_m and r2 and r2[0] == bl_m
-                        and r3 and r3[0] == map_m):
+                a, b, cc, sv = _read_meta()
+                if (a == src_m and b == bl_m and cc == map_m
+                        and sv == OVIDEO_SCHEMA_VERSION):
                     return
             except Exception:
                 pass
@@ -1326,6 +1394,66 @@ def ovideo_playlist():
             nc['episode_order'] = order
             filtered.append(nc)
     return jsonify({"playlist": filtered})
+
+# ================== 【新增】追剧相关接口 ==================
+@app.route('/api/OVideo/track_series/status', methods=['POST'])
+def ovideo_track_series_status():
+    """批量查询一组剧的当前有效集数 / 更新时间，供客户端判断'有效更新'"""
+    ensure_video_db()
+    data = request.get_json(silent=True) or {}
+    urls = data.get('urls') or []
+    if not isinstance(urls, list):
+        return jsonify({"items": []})
+    urls = [u for u in urls if isinstance(u, str) and u][:400]
+    if not urls:
+        return jsonify({"items": []})
+
+    conn = _get_video_conn()
+    out = []
+    CHUNK = 200
+    try:
+        for i in range(0, len(urls), CHUNK):
+            chunk = urls[i:i + CHUNK]
+            ph = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT url, category, name, update_sort_key, latest_ep_count, "
+                f"hide_blacklisted, item_json FROM videos WHERE url IN ({ph})", chunk
+            ).fetchall()
+            for r in rows:
+                try:
+                    it = json.loads(r['item_json'] or '{}')
+                except Exception:
+                    it = {}
+                out.append({
+                    "url": r['url'],
+                    "category": r['category'],
+                    "name": r['name'],
+                    "image": it.get('image'),
+                    "info": it.get('info'),
+                    "update": r['update_sort_key'] or '',
+                    "episode_count": int(r['latest_ep_count'] or 0),
+                    "unavailable": bool(r['hide_blacklisted'] or 0),
+                })
+    finally:
+        conn.close()
+    return jsonify({"items": out})
+
+
+@app.route('/api/OVideo/detail', methods=['GET'])
+def ovideo_detail():
+    """按 url 取单条完整剧集信息（追剧列表点击后跳详情页用）"""
+    ensure_video_db()
+    url = request.args.get('url')
+    if not url:
+        return jsonify({"error": "Missing url"}), 400
+    conn = _get_video_conn()
+    row = conn.execute("SELECT category, item_json FROM videos WHERE url=?", (url,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Not found"}), 404
+    it = json.loads(row['item_json'] or '{}')
+    it['category'] = row['category']
+    return jsonify({"item": it})
 
 # 2. 获取封面图片
 @app.route('/api/OVideo/cover/<path:filename>', methods=['GET'])

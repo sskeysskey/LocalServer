@@ -1566,14 +1566,15 @@ def ovideo_list():
         except Exception:
             pass
 
-    # ⭐ 新增:Featured 页按上映日期排序时,Drama 改用 (update − N 天)
-    if category == 'Featured' and sort == 'date':
-        n = int(FEATURED_DRAMA_DATE_OFFSET_DAYS)   # 取自可信常量,无注入风险
-        order = (f"CASE WHEN category='Drama' "
-                 f"THEN date(update_sort_key, '-{n} days') "
-                 f"ELSE release_sort_key END DESC")
-    else:
-        order = _order_clause(sort)
+    # # ⭐ 新增:Featured 页按上映日期排序时,Drama 改用 (update − N 天)
+    # if category == 'Featured' and sort == 'date':
+    #     n = int(FEATURED_DRAMA_DATE_OFFSET_DAYS)   # 取自可信常量,无注入风险
+    #     order = (f"CASE WHEN category='Drama' "
+    #              f"THEN date(update_sort_key, '-{n} days') "
+    #              f"ELSE release_sort_key END DESC")
+    # else:
+    #     order = _order_clause(sort)
+    order = _order_clause(sort)
 
     sql = (f"SELECT category, item_json FROM videos WHERE {' AND '.join(where)} "
            f"ORDER BY {order} LIMIT ? OFFSET ?")

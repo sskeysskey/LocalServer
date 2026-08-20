@@ -44,6 +44,8 @@ ALLOWED_REPORT_TYPES = {'playback_failed', 'download_failed', 'media_error', 'co
 ALLOWED_FINANCE_EVENT_TYPES = {'click'}
 report_last_time = {}  # 内存软限流: user_id -> 最近提交时间戳
 wish_last_time = {}   # 内存软限流: user_id -> 最近提交时间戳
+support_last_time = {}   # 在线客服软限流: user_id -> 最近提交时间戳
+SUPPORT_APPS = {'ONews', 'Finance'}
 
 # 【新增】用户数据库路径
 USER_DB_PATH = os.path.join(PARENT_DIR, 'user_data.db')
@@ -752,6 +754,409 @@ def init_analytics_db():
     conn.close()
     print("行为数据库已就绪。")
 
+# ==================== 【新增】统一客服/会话体系 ====================
+def init_support_db():
+    print("检查客服会话表 ...")
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=60.0)
+    c = conn.cursor()
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS support_threads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            app TEXT NOT NULL DEFAULT 'ONews',
+            thread_key TEXT NOT NULL UNIQUE,
+            thread_type TEXT NOT NULL,          -- wish / report / support
+            user_id TEXT NOT NULL,
+            user_type TEXT DEFAULT 'apple',     -- apple / device / guest
+            title TEXT,
+            subtitle TEXT,
+            ref_id TEXT,
+            status TEXT DEFAULT 'pending',      -- pending / replied / resolved
+            last_sender TEXT,
+            last_message TEXT,
+            unread_user INTEGER DEFAULT 0,
+            unread_admin INTEGER DEFAULT 0,
+            app_version TEXT,
+            created_at TIMESTAMP,
+            updated_at TIMESTAMP
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_st_user ON support_threads(app, user_id, updated_at)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_st_admin ON support_threads(app, thread_type, status, updated_at)')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS support_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_key TEXT NOT NULL,
+            app TEXT NOT NULL DEFAULT 'ONews',
+            sender TEXT NOT NULL,               -- user / admin
+            content TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            read_user INTEGER DEFAULT 0,
+            read_admin INTEGER DEFAULT 0
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_sm_thread ON support_messages(thread_key, id)')
+    c.execute("CREATE TABLE IF NOT EXISTS support_meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.commit()
+    conn.close()
+    print("客服会话表已就绪。")
+
+
+def _norm_user_type(user_id, user_type=None):
+    if not user_id:
+        return 'guest'
+    if user_id.startswith('dev_'):
+        return 'device'
+    if user_id == 'guest_user':
+        return 'guest'
+    return user_type if user_type in ('apple', 'device') else 'apple'
+
+
+def support_thread_key(app_name, ttype, *parts):
+    return "|".join([app_name, ttype] + [str(p) for p in parts])
+
+
+def support_upsert_thread(c, app_name, thread_key, thread_type, user_id, user_type=None,
+                          title=None, subtitle=None, ref_id=None, app_version=None):
+    """创建或更新会话头。c 为 sqlite cursor(row_factory=Row)"""
+    now = now_iso()
+    ut = _norm_user_type(user_id, user_type)
+    row = c.execute("SELECT id FROM support_threads WHERE thread_key=?", (thread_key,)).fetchone()
+    if row is None:
+        c.execute('''INSERT INTO support_threads
+            (app, thread_key, thread_type, user_id, user_type, title, subtitle, ref_id,
+             status, last_sender, last_message, unread_user, unread_admin,
+             app_version, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,'pending',NULL,NULL,0,0,?,?,?)''',
+            (app_name, thread_key, thread_type, user_id, ut, title or '', subtitle or '',
+             str(ref_id or ''), app_version or '', now, now))
+    else:
+        sets, params = ["updated_at=?", "user_type=?"], [now, ut]
+        if title:
+            sets.append("title=?"); params.append(title)
+        if subtitle:
+            sets.append("subtitle=?"); params.append(subtitle)
+        if app_version:
+            sets.append("app_version=?"); params.append(app_version)
+        params.append(thread_key)
+        c.execute(f"UPDATE support_threads SET {','.join(sets)} WHERE thread_key=?", params)
+
+
+def support_add_message(c, app_name, thread_key, sender, content, created_at=None):
+    now = created_at or now_iso()
+    c.execute('''INSERT INTO support_messages
+        (thread_key, app, sender, content, created_at, read_user, read_admin)
+        VALUES (?,?,?,?,?,?,?)''',
+        (thread_key, app_name, sender, content, now,
+         1 if sender == 'user' else 0, 1 if sender == 'admin' else 0))
+    if sender == 'user':
+        c.execute('''UPDATE support_threads
+                     SET last_sender='user', last_message=?, updated_at=?,
+                         unread_admin=unread_admin+1, status='pending'
+                     WHERE thread_key=?''', (content[:200], now, thread_key))
+    else:
+        c.execute('''UPDATE support_threads
+                     SET last_sender='admin', last_message=?, updated_at=?,
+                         unread_user=unread_user+1, status='replied'
+                     WHERE thread_key=?''', (content[:200], now, thread_key))
+
+
+def migrate_support_threads_once():
+    """把已有的寻片/举报数据，一次性搬成会话+消息（保证历史记录不丢）"""
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=60.0)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        if c.execute("SELECT value FROM support_meta WHERE key='migrated_v1'").fetchone():
+            return
+        # ---- 寻片 ----
+        wishes = c.execute('''SELECT id, user_id, user_type, keyword, wish_content, app_version,
+                                     first_at, last_at, status, admin_reply, reply_status, replied_at
+                              FROM video_wish_requests''').fetchall()
+        for w in wishes:
+            tk = support_thread_key('ONews', 'wish', w['id'])
+            support_upsert_thread(c, 'ONews', tk, 'wish', w['user_id'], w['user_type'],
+                                  title=w['wish_content'],
+                                  subtitle=(f"搜索词: {w['keyword']}" if w['keyword'] else ''),
+                                  ref_id=w['id'], app_version=w['app_version'])
+            c.execute('''INSERT INTO support_messages
+                (thread_key, app, sender, content, created_at, read_user, read_admin)
+                VALUES (?,?,'user',?,?,1,1)''',
+                (tk, 'ONews', f"我想看：{w['wish_content']}", w['first_at']))
+            if w['admin_reply']:
+                unread = 1 if w['reply_status'] == 'unread' else 0
+                c.execute('''INSERT INTO support_messages
+                    (thread_key, app, sender, content, created_at, read_user, read_admin)
+                    VALUES (?,?,'admin',?,?,?,1)''',
+                    (tk, 'ONews', w['admin_reply'], w['replied_at'] or w['last_at'],
+                     0 if unread else 1))
+                c.execute('''UPDATE support_threads
+                             SET unread_user=?, last_sender='admin', last_message=?, status=?, updated_at=?
+                             WHERE thread_key=?''',
+                          (unread, w['admin_reply'][:200],
+                           'resolved' if w['status'] == 'resolved' else 'replied',
+                           w['replied_at'] or w['last_at'], tk))
+            else:
+                c.execute('''UPDATE support_threads
+                             SET last_sender='user', last_message=?, unread_admin=1, updated_at=?
+                             WHERE thread_key=?''',
+                          ((w['wish_content'] or '')[:200], w['last_at'], tk))
+        # ---- 坏链接举报 ----
+        reports = c.execute('''SELECT user_id, video_title, episode_url, channel_name, episode_name,
+                                      report_type, note, app_version, first_at, last_at, status,
+                                      admin_reply, reply_status, replied_at
+                               FROM video_link_reports''').fetchall()
+        for r in reports:
+            tk = support_thread_key('ONews', 'report', r['user_id'], r['episode_url'])
+            title = r['video_title'] or '(未知影片)'
+            sub = " · ".join([x for x in [r['channel_name'], r['episode_name']] if x])
+            support_upsert_thread(c, 'ONews', tk, 'report', r['user_id'], None,
+                                  title=title, subtitle=sub, ref_id=r['episode_url'],
+                                  app_version=r['app_version'])
+            type_name = {'playback_failed': '无法播放', 'download_failed': '无法缓存',
+                         'media_error': '画面/声音异常', 'content_mismatch': '内容不符',
+                         'other': '其他问题'}.get(r['report_type'], r['report_type'])
+            body = f"报错反馈：{type_name}"
+            if r['note']:
+                body += f"\n补充说明：{r['note']}"
+            c.execute('''INSERT INTO support_messages
+                (thread_key, app, sender, content, created_at, read_user, read_admin)
+                VALUES (?,?,'user',?,?,1,1)''', (tk, 'ONews', body, r['first_at']))
+            if r['admin_reply']:
+                unread = 1 if r['reply_status'] == 'unread' else 0
+                c.execute('''INSERT INTO support_messages
+                    (thread_key, app, sender, content, created_at, read_user, read_admin)
+                    VALUES (?,?,'admin',?,?,?,1)''',
+                    (tk, 'ONews', r['admin_reply'], r['replied_at'] or r['last_at'],
+                     0 if unread else 1))
+                c.execute('''UPDATE support_threads
+                             SET unread_user=?, last_sender='admin', last_message=?, status=?, updated_at=?
+                             WHERE thread_key=?''',
+                          (unread, r['admin_reply'][:200],
+                           'resolved' if r['status'] == 'resolved' else 'replied',
+                           r['replied_at'] or r['last_at'], tk))
+            else:
+                c.execute('''UPDATE support_threads
+                             SET last_sender='user', last_message=?, unread_admin=1, updated_at=?
+                             WHERE thread_key=?''', (body[:200], r['last_at'], tk))
+
+        c.execute("INSERT OR REPLACE INTO support_meta VALUES ('migrated_v1','1')")
+        conn.commit()
+        print(f"[support] 已迁移 {len(wishes)} 条寻片 / {len(reports)} 条举报为会话记录。")
+    except Exception as e:
+        traceback.print_exc()
+    finally:
+        conn.close()
+
+
+# ==================== 【新增】客户端在线客服 API ====================
+@app.route('/api/support/threads', methods=['GET'])
+def api_support_threads():
+    app_name = request.args.get('app', 'ONews')
+    user_id = request.args.get('user_id')
+    if app_name not in SUPPORT_APPS or not user_id:
+        return jsonify({"threads": [], "unread_total": 0})
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute('''SELECT thread_key, thread_type, title, subtitle, status,
+                                      last_sender, last_message, unread_user, updated_at
+                               FROM support_threads
+                               WHERE app=? AND user_id=?
+                               ORDER BY updated_at DESC LIMIT 100''',
+                            (app_name, user_id)).fetchall()
+        threads = [dict(r) for r in rows]
+        total = sum(int(r['unread_user'] or 0) for r in rows)
+        return jsonify({"threads": threads, "unread_total": total})
+    finally:
+        conn.close()
+
+
+@app.route('/api/support/messages', methods=['GET'])
+def api_support_messages():
+    app_name = request.args.get('app', 'ONews')
+    user_id = request.args.get('user_id')
+    thread_key = request.args.get('thread_key')
+    if not user_id or not thread_key:
+        return jsonify({"messages": []})
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        t = c.execute("SELECT * FROM support_threads WHERE thread_key=? AND app=?",
+                      (thread_key, app_name)).fetchone()
+        if not t or t['user_id'] != user_id:
+            return jsonify({"messages": []})
+        rows = c.execute('''SELECT id, sender, content, created_at FROM support_messages
+                            WHERE thread_key=? ORDER BY id ASC''', (thread_key,)).fetchall()
+        # 已读处理
+        c.execute("UPDATE support_messages SET read_user=1 WHERE thread_key=? AND sender='admin'",
+                  (thread_key,))
+        c.execute("UPDATE support_threads SET unread_user=0 WHERE thread_key=?", (thread_key,))
+        # 同步把老横幅标记为已读，避免首页重复提醒
+        if t['thread_type'] == 'wish' and t['ref_id']:
+            c.execute("UPDATE video_wish_requests SET reply_status='read' WHERE id=? AND user_id=?",
+                      (t['ref_id'], user_id))
+        elif t['thread_type'] == 'report' and t['ref_id']:
+            c.execute('''UPDATE video_link_reports SET reply_status='read'
+                         WHERE user_id=? AND episode_url=?''', (user_id, t['ref_id']))
+        return jsonify({"messages": [dict(r) for r in rows], "thread": dict(t)})
+    finally:
+        conn.close()
+
+
+@app.route('/api/support/send', methods=['POST'])
+def api_support_send():
+    import time
+    data = request.get_json() or {}
+    app_name = data.get('app', 'ONews')
+    user_id = data.get('user_id')
+    content = (data.get('content') or '').strip()[:1000]
+    if app_name not in SUPPORT_APPS or not user_id or not content:
+        return jsonify({"error": "Invalid params"}), 400
+
+    now_ts = time.time()
+    if now_ts - support_last_time.get(user_id, 0) < 2:
+        return jsonify({"error": "Too frequent"}), 429
+    support_last_time[user_id] = now_ts
+
+    general_key = support_thread_key(app_name, 'support', user_id)
+    thread_key = data.get('thread_key') or general_key
+    app_version = data.get('app_version', '')
+
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        t = c.execute("SELECT * FROM support_threads WHERE thread_key=?", (thread_key,)).fetchone()
+        if t is None:
+            if thread_key != general_key:
+                c.execute("COMMIT")
+                return jsonify({"error": "Thread not found"}), 404
+            support_upsert_thread(c, app_name, general_key, 'support', user_id,
+                                  data.get('user_type'),
+                                  title=(data.get('title') or content)[:60],
+                                  subtitle='', ref_id='', app_version=app_version)
+        elif t['user_id'] != user_id:
+            c.execute("COMMIT")
+            return jsonify({"error": "Forbidden"}), 403
+
+        support_add_message(c, app_name, thread_key, 'user', content)
+
+        # 追问也要让后台的寻片/举报列表重新变成"待处理"
+        t2 = c.execute("SELECT thread_type, ref_id FROM support_threads WHERE thread_key=?",
+                       (thread_key,)).fetchone()
+        if t2:
+            if t2['thread_type'] == 'wish' and t2['ref_id']:
+                c.execute("UPDATE video_wish_requests SET status='pending', last_at=? WHERE id=?",
+                          (now_iso(), t2['ref_id']))
+            elif t2['thread_type'] == 'report' and t2['ref_id']:
+                c.execute('''UPDATE video_link_reports SET status='pending', last_at=?
+                             WHERE user_id=? AND episode_url=?''',
+                          (now_iso(), user_id, t2['ref_id']))
+        c.execute("COMMIT")
+        return jsonify({"status": "ok", "thread_key": thread_key})
+    except Exception as e:
+        try: c.execute("ROLLBACK")
+        except Exception: pass
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+# ==================== 【新增】后台在线客服 API ====================
+@app.route('/admin/api/support/threads', methods=['GET'])
+@require_admin
+def admin_support_threads():
+    app_name = request.args.get('app', 'ONews')
+    status = request.args.get('status', 'open')
+    where = "app=? AND thread_type='support'"
+    params = [app_name]
+    if status == 'open':
+        where += " AND status!='resolved'"
+    sql = f'''SELECT thread_key, user_id, user_type, title, status, last_sender, last_message,
+                     unread_admin, app_version, created_at, updated_at,
+                     (SELECT COUNT(*) FROM support_messages m WHERE m.thread_key=support_threads.thread_key) AS msg_count
+              FROM support_threads WHERE {where}
+              ORDER BY (unread_admin>0) DESC, updated_at DESC LIMIT 200'''
+    return jsonify(_query_analytics(sql, params))
+
+
+@app.route('/admin/api/support/messages', methods=['GET'])
+@require_admin
+def admin_support_messages():
+    thread_key = request.args.get('thread_key')
+    if not thread_key:
+        return jsonify({"messages": [], "thread": None})
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        t = c.execute("SELECT * FROM support_threads WHERE thread_key=?", (thread_key,)).fetchone()
+        rows = c.execute('''SELECT id, sender, content, created_at FROM support_messages
+                            WHERE thread_key=? ORDER BY id ASC''', (thread_key,)).fetchall()
+        c.execute("UPDATE support_messages SET read_admin=1 WHERE thread_key=? AND sender='user'",
+                  (thread_key,))
+        c.execute("UPDATE support_threads SET unread_admin=0 WHERE thread_key=?", (thread_key,))
+        return jsonify({"thread": dict(t) if t else None,
+                        "messages": [dict(r) for r in rows]})
+    finally:
+        conn.close()
+
+
+@app.route('/admin/api/support/reply', methods=['POST'])
+@require_admin
+def admin_support_reply():
+    data = request.get_json() or {}
+    thread_key = data.get('thread_key')
+    reply = (data.get('reply') or '').strip()[:1000]
+    if not thread_key or not reply:
+        return jsonify({"error": "Missing params"}), 400
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        t = c.execute("SELECT * FROM support_threads WHERE thread_key=?", (thread_key,)).fetchone()
+        if not t:
+            c.execute("COMMIT")
+            return jsonify({"error": "Thread not found"}), 404
+        support_add_message(c, t['app'], thread_key, 'admin', reply)
+        now = now_iso()
+        # 同步老表，让客户端首页横幅照旧生效
+        if t['thread_type'] == 'wish' and t['ref_id']:
+            c.execute('''UPDATE video_wish_requests
+                         SET status='resolved', admin_reply=?, reply_status='unread', replied_at=?
+                         WHERE id=?''', (reply, now, t['ref_id']))
+        elif t['thread_type'] == 'report' and t['ref_id']:
+            c.execute('''UPDATE video_link_reports
+                         SET status='resolved', admin_reply=?, reply_status='unread', replied_at=?
+                         WHERE user_id=? AND episode_url=?''',
+                      (reply, now, t['user_id'], t['ref_id']))
+        c.execute("COMMIT")
+        return jsonify({"status": "success"})
+    except Exception as e:
+        try: c.execute("ROLLBACK")
+        except Exception: pass
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/admin/api/support/resolve', methods=['POST'])
+@require_admin
+def admin_support_resolve():
+    data = request.get_json() or {}
+    thread_key = data.get('thread_key')
+    if not thread_key:
+        return jsonify({"error": "Missing thread_key"}), 400
+    conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    conn.execute("UPDATE support_threads SET status='resolved' WHERE thread_key=?", (thread_key,))
+    conn.commit(); conn.close()
+    return jsonify({"status": "success"})
 
 # OVideo 视频模块 API
 OVIDEO_DIR = os.path.join(BASE_RESOURCES_DIR, 'OVideo')
@@ -1985,7 +2390,6 @@ def report_video_link():
         if report_type not in ALLOWED_REPORT_TYPES:
             report_type = 'other'
 
-        # 服务端软限流:同一用户 10 秒内不可重复提交
         now_ts = time.time()
         if now_ts - report_last_time.get(user_id, 0) < 10:
             return jsonify({"error": "Too frequent"}), 429
@@ -1997,9 +2401,10 @@ def report_video_link():
         real_url     = data.get('real_url', '')
         note         = (data.get('note', '') or '')[:500]
         app_version  = data.get('app_version', '')
-        now = now_iso()        # ⭐ 北京时间(无时区后缀)
+        now = now_iso()
 
         conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+        conn.row_factory = sqlite3.Row
         c = conn.cursor()
         c.execute('''
             INSERT INTO video_link_reports
@@ -2012,6 +2417,21 @@ def report_video_link():
         ''', (user_id, video_title, source_url, episode_url, channel_name,
               episode_name, real_url, report_type, note, app_version,
               now, now, now))
+
+        # 【新增】写入统一会话
+        tk = support_thread_key('ONews', 'report', user_id, episode_url)
+        sub = " · ".join([x for x in [channel_name, episode_name] if x])
+        support_upsert_thread(c, 'ONews', tk, 'report', user_id, data.get('user_type'),
+                              title=(video_title or '(未知影片)'), subtitle=sub,
+                              ref_id=episode_url, app_version=app_version)
+        type_name = {'playback_failed': '无法播放', 'download_failed': '无法缓存',
+                     'media_error': '画面/声音异常', 'content_mismatch': '内容不符',
+                     'other': '其他问题'}.get(report_type, report_type)
+        body = f"报错反馈：{type_name}"
+        if sub:  body += f"（{sub}）"
+        if note: body += f"\n补充说明：{note}"
+        support_add_message(c, 'ONews', tk, 'user', body)
+
         conn.commit()
         conn.close()
         return jsonify({"status": "ok"}), 200
@@ -2029,18 +2449,18 @@ def submit_video_wish():
         if not user_id or not wish_content:
             return jsonify({"error": "Invalid params"}), 400
 
-        # 软限流：同一用户 10 秒内不可重复提交
         now_ts = time.time()
         if now_ts - wish_last_time.get(user_id, 0) < 10:
             return jsonify({"error": "Too frequent"}), 429
         wish_last_time[user_id] = now_ts
 
-        user_type   = data.get('user_type', 'apple')
+        user_type   = _norm_user_type(user_id, data.get('user_type'))
         keyword     = (data.get('keyword', '') or '')[:100]
         app_version = data.get('app_version', '')
         now = now_iso()
 
         conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+        conn.row_factory = sqlite3.Row
         c = conn.cursor()
         c.execute('''
             INSERT INTO video_wish_requests
@@ -2051,6 +2471,17 @@ def submit_video_wish():
             DO UPDATE SET last_at=?, count=count+1, status='pending',
                           keyword=excluded.keyword
         ''', (user_id, user_type, keyword, wish_content, app_version, now, now, now))
+
+        # 【新增】写入统一会话，形成历史记录
+        row = c.execute("SELECT id FROM video_wish_requests WHERE user_id=? AND wish_content=?",
+                        (user_id, wish_content)).fetchone()
+        if row:
+            tk = support_thread_key('ONews', 'wish', row['id'])
+            support_upsert_thread(c, 'ONews', tk, 'wish', user_id, user_type,
+                                  title=wish_content,
+                                  subtitle=(f"搜索词: {keyword}" if keyword else ''),
+                                  ref_id=row['id'], app_version=app_version)
+            support_add_message(c, 'ONews', tk, 'user', f"我想看：{wish_content}")
         conn.commit()
         conn.close()
         return jsonify({"status": "ok"}), 200
@@ -2280,6 +2711,7 @@ def admin_video_reports():
                report_type,
                MAX(real_url) AS real_url,
                COUNT(DISTINCT user_id) AS unique_users,
+               GROUP_CONCAT(DISTINCT user_id) AS user_ids,
                SUM(count) AS total_count,
                MAX(last_at) AS last_at,
                GROUP_CONCAT(DISTINCT NULLIF(note,'')) AS notes,
@@ -2299,16 +2731,29 @@ def admin_video_reports():
 def admin_resolve_report():
     data = request.get_json() or {}
     episode_url = data.get('episode_url')
-    reply = (data.get('reply', '') or '').strip()[:500]
+    reply = (data.get('reply', '') or '').strip()[:1000]
     if not episode_url:
         return jsonify({"error": "Missing episode_url"}), 400
     conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
     c = conn.cursor()
     now = now_iso()
     if reply:
         c.execute('''UPDATE video_link_reports
                      SET status='resolved', admin_reply=?, reply_status='unread', replied_at=?
                      WHERE episode_url=?''', (reply, now, episode_url))
+        # 【新增】给每个举报过该集的用户，各自的会话里追加一条回复（历史记录）
+        users = c.execute('''SELECT DISTINCT user_id, MAX(video_title) AS vt,
+                                    MAX(channel_name) AS cn, MAX(episode_name) AS en
+                             FROM video_link_reports WHERE episode_url=? GROUP BY user_id''',
+                          (episode_url,)).fetchall()
+        for u in users:
+            tk = support_thread_key('ONews', 'report', u['user_id'], episode_url)
+            sub = " · ".join([x for x in [u['cn'], u['en']] if x])
+            support_upsert_thread(c, 'ONews', tk, 'report', u['user_id'], None,
+                                  title=(u['vt'] or '(未知影片)'), subtitle=sub,
+                                  ref_id=episode_url)
+            support_add_message(c, 'ONews', tk, 'admin', reply)
     else:
         c.execute("UPDATE video_link_reports SET status='resolved' WHERE episode_url=?", (episode_url,))
     conn.commit()
@@ -2338,16 +2783,25 @@ def admin_video_wishes():
 def admin_resolve_wish():
     data = request.get_json() or {}
     wish_id = data.get('id')
-    reply   = (data.get('reply', '') or '').strip()[:500]
+    reply   = (data.get('reply', '') or '').strip()[:1000]
     if not wish_id:
         return jsonify({"error": "Missing id"}), 400
     conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
     c = conn.cursor()
     now = now_iso()
     if reply:
         c.execute('''UPDATE video_wish_requests
                      SET status='resolved', admin_reply=?, reply_status='unread', replied_at=?
                      WHERE id=?''', (reply, now, wish_id))
+        w = c.execute("SELECT * FROM video_wish_requests WHERE id=?", (wish_id,)).fetchone()
+        if w:
+            tk = support_thread_key('ONews', 'wish', w['id'])
+            support_upsert_thread(c, 'ONews', tk, 'wish', w['user_id'], w['user_type'],
+                                  title=w['wish_content'],
+                                  subtitle=(f"搜索词: {w['keyword']}" if w['keyword'] else ''),
+                                  ref_id=w['id'])
+            support_add_message(c, 'ONews', tk, 'admin', reply)
     else:
         c.execute("UPDATE video_wish_requests SET status='resolved' WHERE id=?", (wish_id,))
     conn.commit()
@@ -3954,6 +4408,9 @@ def admin_clear_db():
             c.execute("DELETE FROM onews_invite_logs")
             c.execute("DELETE FROM video_bonus_quota")
             c.execute("DELETE FROM video_free_unlocks")
+            c.execute("DELETE FROM support_messages")
+            c.execute("DELETE FROM support_threads")
+            c.execute("DELETE FROM support_meta")
             conn.commit()
             conn.close()
             
@@ -4046,6 +4503,25 @@ ADMIN_HTML = r'''
   /* 排序指示样式 */
   .sortable { cursor: pointer; user-select: none; }
   .sortable:hover { color: #60a5fa; }
+  /* 【需求 a】暂时隐藏三个模块的第一行总览卡片 */
+  #statsBox, #newsStatsBox, #financeStatsBox { display:none !important; }
+
+  /* 【需求 b】鼠标悬浮明细卡 */
+  .hover-card{position:fixed;z-index:2000;width:420px;max-height:60vh;overflow:auto;
+    background:#0b1220;border:1px solid #3b82f6;border-radius:12px;padding:14px;
+    box-shadow:0 20px 50px rgba(0,0,0,.6);font-size:12.5px;color:#cbd5e1;pointer-events:none}
+  .hover-card .hover-title{font-size:13px;font-weight:700;color:#60a5fa;margin-bottom:8px}
+
+  /* 在线客服聊天气泡 */
+  .chat-wrap{max-height:46vh;overflow-y:auto;background:#0f172a;border:1px solid #334155;
+    border-radius:12px;padding:12px;margin-bottom:12px}
+  .msg{display:flex;margin-bottom:10px}
+  .msg.user{justify-content:flex-start}
+  .msg.admin{justify-content:flex-end}
+  .bubble{max-width:78%;padding:8px 12px;border-radius:12px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+  .msg.user .bubble{background:#1e293b;border:1px solid #334155;color:#e2e8f0;border-top-left-radius:4px}
+  .msg.admin .bubble{background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:#fff;border-top-right-radius:4px}
+  .msg .time{font-size:10px;color:#64748b;margin:0 8px;align-self:flex-end}
 </style>
 </head>
 <body>
@@ -4095,11 +4571,21 @@ ADMIN_HTML = r'''
       </table>
     </div>
 
-    <div class="row-full">
-      <div class="panel">
-        <h3>📈 视频 - 最近 30 天趋势</h3>
-        <canvas id="trendChart"></canvas>
-      </div>
+    <!-- 【新增】在线客服（ONews / 视频+新闻 客户端） -->
+    <div class="panel" style="margin-bottom:24px">
+      <h3>💬 在线客服 · 用户咨询（ONews）
+        <span class="tabs">
+          <span class="tab active" onclick="switchSupportStatus(this,'open','ONews')">待处理</span>
+          <span class="tab" onclick="switchSupportStatus(this,'all','ONews')">全部</span>
+        </span>
+      </h3>
+      <table>
+        <thead><tr>
+          <th>#</th><th>最近消息</th><th>user id_apple</th><th>user id_device</th>
+          <th>消息数</th><th>版本</th><th>更新时间</th><th>状态</th><th>操作</th>
+        </tr></thead>
+        <tbody id="supportBodyONews"></tbody>
+      </table>
     </div>
     <div class="panel danger-zone" style="margin-bottom:24px">
       <h3>🚨 错误链接举报
@@ -4162,6 +4648,14 @@ ADMIN_HTML = r'''
         </table>
       </div>
     </div>
+
+    <div class="row-full">
+      <div class="panel">
+        <h3>📈 视频 - 最近 30 天趋势</h3>
+        <canvas id="trendChart"></canvas>
+      </div>
+    </div>
+
     <div class="stats" id="onewsInviteStatsBox" style="margin-top:8px"></div>
     <div class="panel" style="margin-bottom:24px">
       <h3>🎁 新闻/视频 - 邀请拉新排行</h3>
@@ -4268,6 +4762,23 @@ ADMIN_HTML = r'''
       </table>
     </div>
 
+    <!-- 【新增】在线客服（美股精灵） -->
+    <div class="panel" style="margin-bottom:24px">
+      <h3>💬 在线客服 · 用户咨询（美股精灵）
+        <span class="tabs">
+          <span class="tab active" onclick="switchSupportStatus(this,'open','Finance')">待处理</span>
+          <span class="tab" onclick="switchSupportStatus(this,'all','Finance')">全部</span>
+        </span>
+      </h3>
+      <table>
+        <thead><tr>
+          <th>#</th><th>最近消息</th><th>user id_apple</th><th>user id_device</th>
+          <th>消息数</th><th>版本</th><th>更新时间</th><th>状态</th><th>操作</th>
+        </tr></thead>
+        <tbody id="supportBodyFinance"></tbody>
+      </table>
+    </div>
+
     <div class="row-full">
       <div class="panel">
         <h3>📈 美股 - 最近 30 天点击趋势</h3>
@@ -4352,6 +4863,10 @@ const PLAY_SOURCE_MAP = {
   unknown: '❓ 未知来源'
 };
 
+// ================= 【新增】悬浮明细卡 =================
+const detailCache = {};
+let hoverTimer = null, hoverKey = null;
+
 // 缓存新闻用户数据，用于前端快速排序
 let cachedNewsUsers = [];
 let newsUserSortField = 'unique_articles'; // 默认按文章数排序
@@ -4364,6 +4879,170 @@ let videoUserSortOrder = 'desc';
 let wishStatus = 'pending';
 let pendingWishId = null;
 let pendingReportEpisodeUrl = null;
+
+function ensureHoverCard(){
+  let c = document.getElementById('hoverCard');
+  if(!c){
+    c = document.createElement('div');
+    c.id = 'hoverCard'; c.className = 'hover-card'; c.style.display = 'none';
+    document.body.appendChild(c);
+  }
+  return c;
+}
+function moveHoverCard(e){
+  const c = document.getElementById('hoverCard');
+  if(!c || c.style.display === 'none') return;
+  const pad = 16, w = 420, h = Math.min(window.innerHeight*0.6, 460);
+  let x = e.clientX + pad, y = e.clientY + pad;
+  if(x + w > window.innerWidth)  x = Math.max(pad, e.clientX - w - pad);
+  if(y + h > window.innerHeight) y = Math.max(pad, window.innerHeight - h - pad);
+  c.style.left = x + 'px'; c.style.top = y + 'px';
+}
+function hideHoverCard(){
+  if(hoverTimer){ clearTimeout(hoverTimer); hoverTimer = null; }
+  hoverKey = null;
+  const c = document.getElementById('hoverCard');
+  if(c) c.style.display = 'none';
+}
+function hoverShow(e, key, loader){
+  const c = ensureHoverCard();
+  hoverKey = key;
+  c.style.display = 'block';
+  moveHoverCard(e);
+  if(detailCache[key]){
+    c.innerHTML = `<div class="hover-title">${detailCache[key].title}</div>${detailCache[key].html}`;
+    return;
+  }
+  c.innerHTML = '<div class="hover-title">加载中…</div>';
+  hoverTimer = setTimeout(async ()=>{
+    const res = await loader();
+    if(hoverKey !== key) return;
+    detailCache[key] = res;
+    c.innerHTML = `<div class="hover-title">${res.title}</div>${res.html}`;
+  }, 120);
+}
+function hoverAttrs(key, call){
+  return `onmouseenter="hoverShow(event,'${key}',()=>${call})" onmousemove="moveHoverCard(event)" onmouseleave="hideHoverCard()"`;
+}
+
+// ================= 【新增】在线客服 =================
+const supportStatus = { ONews:'open', Finance:'open' };
+let pendingSupportThread = null;
+
+function switchSupportStatus(el, s, appName){
+  el.parentNode.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  el.classList.add('active');
+  supportStatus[appName] = s;
+  loadSupportThreads(appName);
+}
+
+async function loadSupportThreads(appName){
+  const body = document.getElementById('supportBody' + appName);
+  if(!body) return;
+  const data = await api(`/admin/api/support/threads?app=${appName}&status=${supportStatus[appName]}`);
+  if(!data) return;
+  body.innerHTML = data.length === 0
+    ? '<tr><td colspan="9" style="text-align:center;color:#64748b">暂无咨询</td></tr>'
+    : data.map((r,i)=>{
+        const isDevice = (r.user_type==='device') || (r.user_id||'').startsWith('dev_');
+        const appleCell = !isDevice
+          ? `<span style="font-family:monospace;font-size:11px">${(r.user_id||'').substring(0,24)}...</span>`
+          : '<span style="color:#475569">-</span>';
+        const deviceCell = isDevice
+          ? `<span style="font-family:monospace;font-size:11px">${(r.user_id||'').substring(0,24)}...</span>`
+          : '<span style="color:#475569">-</span>';
+        let badge;
+        if(r.unread_admin > 0)             badge = `<span class="pill pill-orange">待回复 ${r.unread_admin}</span>`;
+        else if(r.status === 'resolved')   badge = '<span class="pill pill-green">已完结</span>';
+        else if(r.last_sender === 'admin') badge = '<span class="pill pill-blue">已回复</span>';
+        else                               badge = '<span class="pill pill-purple">进行中</span>';
+        const safeTitle = (r.title || '用户咨询').replace(/'/g,"\\'").replace(/"/g,'&quot;');
+        const lastMsg = (r.last_message || '').replace(/</g,'&lt;');
+        const who = r.last_sender === 'admin' ? '我' : '用户';
+        return `<tr>
+          <td>${i+1}</td>
+          <td><strong>${(r.title||'用户咨询').replace(/</g,'&lt;')}</strong><br>
+              <span style="font-size:11px;color:#94a3b8">${who}: ${lastMsg.substring(0,80)}</span></td>
+          <td>${appleCell}</td>
+          <td>${deviceCell}</td>
+          <td><span class="pill pill-blue">${r.msg_count||0}</span></td>
+          <td style="font-size:11px;color:#94a3b8">${r.app_version ? 'v'+r.app_version : '-'}</td>
+          <td style="color:#94a3b8;font-size:12px;white-space:nowrap">${(r.updated_at||'').replace('T',' ').substring(0,16)}</td>
+          <td>${badge}</td>
+          <td>
+            <span class="clickable" onclick="openSupportChat('${encodeURIComponent(r.thread_key)}','${safeTitle}')">💬 对话</span>
+            ${r.status!=='resolved' ? `<br><span class="clickable" style="color:#86efac" onclick="resolveSupportThread('${encodeURIComponent(r.thread_key)}')">✓ 完结</span>` : ''}
+          </td>
+        </tr>`;
+      }).join('');
+}
+
+async function resolveSupportThread(keyEnc){
+  await api('/admin/api/support/resolve','POST',{ thread_key: decodeURIComponent(keyEnc) });
+  loadCurrentModule();
+}
+
+// 统一的"聊天历史 + 回复"弹窗（寻片 / 举报 / 客服 都用它）
+async function openSupportChat(keyEnc, title){
+  const key = decodeURIComponent(keyEnc);
+  pendingSupportThread = key;
+  const data = await api('/admin/api/support/messages?thread_key=' + encodeURIComponent(key));
+  const msgs = (data && data.messages) || [];
+  const bubbles = msgs.length === 0
+    ? '<div style="color:#64748b;text-align:center;padding:20px">暂无历史消息</div>'
+    : msgs.map(m=>{
+        const t = (m.created_at||'').replace('T',' ').substring(5,16);
+        const c = (m.content||'').replace(/</g,'&lt;');
+        return m.sender === 'admin'
+          ? `<div class="msg admin"><div class="time">${t}</div><div class="bubble">${c}</div></div>`
+          : `<div class="msg user"><div class="bubble">${c}</div><div class="time">${t}</div></div>`;
+      }).join('');
+
+  const meta = data && data.thread
+    ? `<div style="font-size:11px;color:#94a3b8;margin-bottom:8px">
+         类型: ${data.thread.thread_type} · 用户: <span style="font-family:monospace">${data.thread.user_id}</span>
+         ${data.thread.subtitle ? ' · ' + data.thread.subtitle : ''}
+       </div>` : '';
+
+  document.getElementById('modalTitle').innerText = '💬 ' + (title || '对话记录');
+  document.getElementById('modalMsg').innerHTML = `
+    <div style="text-align:left">
+      ${meta}
+      <div class="chat-wrap" id="chatWrap">${bubbles}</div>
+      <p style="font-size:12px;color:#94a3b8;margin-bottom:6px">
+        输入回复内容（用户下次打开 App 会在客服窗收到）。提示：<b style="color:#86efac">Shift + Enter</b> 直接发送。</p>
+      <textarea id="supportReplyInput" rows="3"
+        style="width:100%;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:10px;font-size:14px;"
+        placeholder="输入回复…"></textarea>
+    </div>`;
+  const btn = document.getElementById('modalConfirmBtn');
+  btn.innerText = '发送回复';
+  btn.onclick = submitSupportReply;
+  document.getElementById('confirmModal').style.display = 'flex';
+
+  setTimeout(()=>{
+    const wrap = document.getElementById('chatWrap');
+    if(wrap) wrap.scrollTop = wrap.scrollHeight;
+    const ta = document.getElementById('supportReplyInput');
+    if(ta){
+      ta.focus();
+      ta.addEventListener('keydown', function(e){
+        if(e.key === 'Enter' && e.shiftKey){ e.preventDefault(); submitSupportReply(); }
+      });
+    }
+  }, 60);
+}
+
+async function submitSupportReply(){
+  const el = document.getElementById('supportReplyInput');
+  const reply = el ? el.value.trim() : '';
+  if(!reply || !pendingSupportThread){ closeModal(); return; }
+  const r = await api('/admin/api/support/reply','POST',
+                      { thread_key: pendingSupportThread, reply: reply });
+  closeModal();
+  if(r && r.status === 'success') loadCurrentModule();
+  else setTimeout(()=>showInfoModal('❌ 发送失败', (r && r.error) || '未知错误'), 200);
+}
 
 async function loadOnewsInvites(){
   const o = await api('/admin/api/onews/invite_overview');
@@ -4420,9 +5099,11 @@ async function loadVideoWishes(){
         else                               stateBadge = '<span class="pill pill-purple">待处理</span>';
 
         const safeContent = (r.wish_content||'').replace(/'/g,"\\'").replace(/"/g,'&quot;');
-        const actionBtn = r.status==='pending'
-          ? `<span class="clickable" onclick="openWishReply(${r.id}, '${safeContent}')">✓ 处理/回复</span>`
-          : '<span style="color:#64748b">-</span>';
+        const actionBtn = `
+          ${r.status==='pending'
+            ? `<span class="clickable" onclick="openWishReply(${r.id}, '${safeContent}')">✓ 处理/回复</span><br>` : ''}
+          <span class="clickable" style="color:#a78bfa"
+                onclick="openSupportChat('${encodeURIComponent('ONews|wish|'+r.id)}','${safeContent}')">🕘 历史对话</span>`;
         const replyLine = r.admin_reply
           ? `<br><span style="font-size:11px;color:#86efac">↳ 回复: ${r.admin_reply}</span>` : '';
 
@@ -4496,21 +5177,26 @@ async function loadVideoReports(){
         const typeName = REPORT_TYPE_MAP[r.report_type] || r.report_type;
         const channel = r.channel_name ? `<span class="pill pill-blue">${r.channel_name}</span>` : '<span style="color:#64748b">-</span>';
         const episode = r.episode_name ? `<span class="pill pill-purple">${r.episode_name}</span>` : '<span style="color:#64748b">-</span>';
-        const realLink = r.real_url
-          ? `<a href="${r.real_url}" target="_blank" style="color:#60a5fa">打开</a>` : '-';
-
-        // 【优化2】补充说明(note)显眼展示
-        const noteLine = r.notes
-          ? `<br><span style="font-size:11px;color:#fdba74">📝 ${r.notes}</span>` : '';
-        // 回复内容回显
-        const replyLine = r.admin_reply
-          ? `<br><span style="font-size:11px;color:#86efac">↳ 回复: ${r.admin_reply}</span>` : '';
-        // 回复状态徽标
+        const realLink = r.real_url ? `<a href="${r.real_url}" target="_blank" style="color:#60a5fa">打开</a>` : '-';
+        const noteLine = r.notes ? `<br><span style="font-size:11px;color:#fdba74">📝 ${r.notes}</span>` : '';
+        const replyLine = r.admin_reply ? `<br><span style="font-size:11px;color:#86efac">↳ 回复: ${r.admin_reply}</span>` : '';
         let stateBadge = '';
         if(r.reply_status==='unread')    stateBadge = ' <span class="pill pill-orange">已回复·待读</span>';
         else if(r.reply_status==='read') stateBadge = ' <span class="pill pill-green">已读</span>';
-
         const safeTitle = (r.video_title||'').replace(/'/g,"\\'").replace(/"/g,'&quot;');
+
+        // 【需求 c】真实 apple / device ID + 点开该用户的完整对话历史
+        const ids = (r.user_ids || '').split(',').filter(Boolean);
+        const idChips = ids.map(u=>{
+          const isDev = u.startsWith('dev_');
+          const tk = `ONews|report|${u}|${r.episode_url}`;
+          return `<div style="margin-bottom:4px">
+            <span class="pill ${isDev?'pill-purple':'pill-blue'}" style="font-size:10px">${isDev?'device':'apple'}</span>
+            <span class="clickable" style="font-family:monospace;font-size:10px"
+                  onclick="openSupportChat('${encodeURIComponent(tk)}','${safeTitle}')">${u.substring(0,18)}…</span>
+          </div>`;
+        }).join('') || '<span style="color:#64748b">-</span>';
+
         return `<tr>
           <td>${i+1}</td>
           <td><strong>${r.video_title||'(未知)'}</strong>${noteLine}${replyLine}<br>
@@ -4518,7 +5204,7 @@ async function loadVideoReports(){
           <td>${channel}</td>
           <td>${episode}</td>
           <td><span class="pill pill-orange">${typeName}</span>${stateBadge}</td>
-          <td><span class="pill pill-green">${r.unique_users}</span></td>
+          <td>${idChips}<span class="pill pill-green">共 ${r.unique_users} 人</span></td>
           <td>${r.total_count}</td>
           <td>${realLink}</td>
           <td><span class="clickable" onclick="openReportReply('${encodeURIComponent(r.episode_url)}', '${safeTitle}')">✓ 处理/回复</span></td>
@@ -4629,8 +5315,9 @@ async function loadVideoModule(){
   loadTopVideos('play', playPeriod);
   loadTopVideos('download_complete', dlPeriod);
   loadTopUsers();
+  loadSupportThreads('ONews');
   loadVideoReports();
-  loadVideoWishes();          // 【新增】
+  loadVideoWishes();
   loadOnewsInvites();
 }
 
@@ -4686,83 +5373,67 @@ async function loadTopUsers(){
 }
 
 function renderVideoUsers(){
-  // 1. 更新排序箭头
   document.getElementById('vsort_total_actions').innerText =
     videoUserSortField === 'total_actions' ? (videoUserSortOrder === 'desc' ? '▼' : '▲') : '';
   document.getElementById('vsort_last_active').innerText =
     videoUserSortField === 'last_active' ? (videoUserSortOrder === 'desc' ? '▼' : '▲') : '';
 
-  // 2. 排序
   const sorted = [...cachedVideoUsers].sort((a, b) => {
-    let valA = a[videoUserSortField];
-    let valB = b[videoUserSortField];
-    if (videoUserSortField === 'last_active') {
-      valA = valA || ''; valB = valB || '';
-    } else {
-      valA = Number(valA) || 0; valB = Number(valB) || 0;
-    }
+    let valA = a[videoUserSortField], valB = b[videoUserSortField];
+    if (videoUserSortField === 'last_active'){ valA = valA||''; valB = valB||''; }
+    else { valA = Number(valA)||0; valB = Number(valB)||0; }
     if (valA < valB) return videoUserSortOrder === 'desc' ? 1 : -1;
     if (valA > valB) return videoUserSortOrder === 'desc' ? -1 : 1;
     return 0;
   });
 
-  // 3. 渲染（用 user_id 是否以 dev_ 开头区分 apple / device，老数据也兼容）
   document.getElementById('topUsersBody').innerHTML = sorted.length === 0
-    ? '<tr><td colspan="7" style="text-align:center;color:#64748b">暂无数据</td></tr>'
+    ? '<tr><td colspan="8" style="text-align:center;color:#64748b">暂无数据</td></tr>'
     : sorted.map((r, i) => {
         const isDevice = (r.user_id || '').startsWith('dev_');
+        const uid = encodeURIComponent(r.user_id);
         const appleCell = !isDevice
           ? `<span style="font-family:monospace;font-size:11px">${r.user_id.substring(0,24)}...</span>`
           : '<span style="color:#475569">-</span>';
         const deviceCell = isDevice
           ? `<span style="font-family:monospace;font-size:11px">${r.user_id.substring(0,24)}...</span>`
           : '<span style="color:#475569">-</span>';
+        const cell = (type, val) => `<td><span class="clickable" style="font-weight:bold;"
+            onclick="showUserVideoDetails('${uid}','${type}')"
+            ${hoverAttrs('v|'+uid+'|'+type, `videoDetailPayload('${uid}','${type}')`)}>${val||0}</span></td>`;
         return `<tr>
           <td>${i+1}</td>
           <td>${appleCell}</td>
           <td>${deviceCell}</td>
-          <td><span class="clickable" style="font-weight:bold;" onclick="showUserVideoDetails('${encodeURIComponent(r.user_id)}','online')">${r.online_play||0}</span></td>
-          <td><span class="clickable" style="font-weight:bold;" onclick="showUserVideoDetails('${encodeURIComponent(r.user_id)}','offline')">${r.offline_play||0}</span></td>
-          <td><span class="clickable" style="font-weight:bold;" onclick="showUserVideoDetails('${encodeURIComponent(r.user_id)}','download_complete')">${r.download_videos||0}</span></td>
+          ${cell('online',  r.online_play)}
+          ${cell('offline', r.offline_play)}
+          ${cell('download_complete', r.download_videos)}
           <td><strong>${r.total_actions||0}</strong></td>
           <td style="color:#94a3b8;font-size:12px">${(r.last_active||'').replace('T',' ').substring(0,19)}</td>
         </tr>`;
       }).join('');
 }
 
-function sortVideoUsers(field){
-  if (videoUserSortField === field) {
-    videoUserSortOrder = videoUserSortOrder === 'desc' ? 'asc' : 'desc';
-  } else {
-    videoUserSortField = field;
-    videoUserSortOrder = 'desc';
-  }
-  renderVideoUsers();
-}
-
-// 点击观看数/下载数 → 弹出该用户的视频历史
-async function showUserVideoDetails(userIdEnc, type){
+// 只负责"生成内容"，点击弹窗和悬浮卡共用
+async function videoDetailPayload(userIdEnc, type){
   const userId = decodeURIComponent(userIdEnc);
   let typeText='', sqlType='play', suffixFilter='', showSource=false;
-  if (type === 'online') { typeText='在线播放'; suffixFilter="AND video_url NOT LIKE '%.m3u8'"; showSource=true; }
-  else if (type === 'offline') { typeText='离线播放'; suffixFilter="AND video_url LIKE '%.m3u8'"; }
+  if (type === 'online'){ typeText='在线播放'; suffixFilter="AND video_url NOT LIKE '%.m3u8'"; showSource=true; }
+  else if (type === 'offline'){ typeText='离线播放'; suffixFilter="AND video_url LIKE '%.m3u8'"; }
   else { typeText = type==='play' ? '播放' : '下载'; sqlType = type; }
 
+  const title = `👤 用户 [${userId.substring(0,10)}...] 的${typeText}历史`;
   const data = await api(`/admin/api/video/user_details?user_id=${encodeURIComponent(userId)}&type=${sqlType}&suffix=${encodeURIComponent(suffixFilter)}`);
-  if(!data) return;
-  if(data.length === 0){ showInfoModal(`👤 用户${typeText}明细`, '暂无记录'); return; }
+  if(!data || data.length === 0) return { title, html:'<div style="color:#64748b">暂无记录</div>' };
 
   const groups = {};
   data.forEach(item => { const d = item.day || '未知日期'; (groups[d] = groups[d] || []).push(item); });
-
-  let html = `<div style="text-align:left;max-height:60vh;overflow-y:auto;font-size:13px;color:#cbd5e1;">`;
-  const days = Object.keys(groups).sort((a,b)=>b.localeCompare(a));
-  days.forEach(day => {
+  let html = `<div style="text-align:left;max-height:56vh;overflow-y:auto;font-size:13px;color:#cbd5e1;">`;
+  Object.keys(groups).sort((a,b)=>b.localeCompare(a)).forEach(day => {
     const dayVers = [...new Set(groups[day].flatMap(x => (x.versions||'').split(',')).filter(Boolean))];
     const verBadge = dayVers.length ? ` <span class="pill pill-purple" style="font-size:10px;">v${dayVers.join(' / v')}</span>` : '';
-    html += `<div style="margin-bottom:14px;border-bottom:1px solid #334155;padding-bottom:8px;">`;
-    html += `<div style="font-weight:bold;color:#60a5fa;font-size:14px;margin-bottom:6px;">📅 ${day}${verBadge}</div>`;
-    html += `<ul style="list-style:none;padding-left:4px;">`;
+    html += `<div style="margin-bottom:14px;border-bottom:1px solid #334155;padding-bottom:8px;">
+      <div style="font-weight:bold;color:#60a5fa;font-size:14px;margin-bottom:6px;">📅 ${day}${verBadge}</div><ul style="list-style:none;padding-left:4px;">`;
     groups[day].forEach(item => {
       const countBadge = item.click_count > 1 ? `<span class="pill pill-blue" style="margin-left:6px;font-size:10px;">${item.click_count}次</span>` : '';
       const timeStr = (item.last_time || '').replace('T',' ').substring(11,16);
@@ -4779,7 +5450,26 @@ async function showUserVideoDetails(userIdEnc, type){
     html += `</ul></div>`;
   });
   html += `</div>`;
-  showInfoModal(`👤 用户 [${userId.substring(0,10)}...] 的${typeText}历史`, html);
+  return { title, html };
+}
+
+function sortVideoUsers(field){
+  if (videoUserSortField === field) {
+    videoUserSortOrder = videoUserSortOrder === 'desc' ? 'asc' : 'desc';
+  } else {
+    videoUserSortField = field;
+    videoUserSortOrder = 'desc';
+  }
+  renderVideoUsers();
+}
+
+// 点击观看数/下载数 → 弹出该用户的视频历史
+async function showUserVideoDetails(userIdEnc, type){
+  const key = 'v|'+userIdEnc+'|'+type;
+  const p = detailCache[key] || await videoDetailPayload(userIdEnc, type);
+  detailCache[key] = p;
+  hideHoverCard();
+  showInfoModal(p.title, p.html);
 }
 
 async function showVideoUsers(urlEnc, type){
@@ -4877,48 +5567,68 @@ async function loadTopNewsUsers(){
 
 // 渲染活跃读者表格
 function renderNewsUsers(){
-  // 1. 更新表头排序箭头显示
   document.getElementById('sort_unique_articles').innerText = newsUserSortField === 'unique_articles' ? (newsUserSortOrder === 'desc' ? '▼' : '▲') : '';
   document.getElementById('sort_last_active').innerText = newsUserSortField === 'last_active' ? (newsUserSortOrder === 'desc' ? '▼' : '▲') : '';
 
-  // 2. 排序缓存数据
   const sortedData = [...cachedNewsUsers].sort((a, b) => {
-    let valA = a[newsUserSortField];
-    let valB = b[newsUserSortField];
-    
-    // 如果是日期字符串，直接进行字符串对比
-    if (newsUserSortField === 'last_active') {
-      valA = valA || '';
-      valB = valB || '';
-    } else {
-      valA = Number(valA) || 0;
-      valB = Number(valB) || 0;
-    }
-
+    let valA = a[newsUserSortField], valB = b[newsUserSortField];
+    if (newsUserSortField === 'last_active'){ valA = valA||''; valB = valB||''; }
+    else { valA = Number(valA)||0; valB = Number(valB)||0; }
     if (valA < valB) return newsUserSortOrder === 'desc' ? 1 : -1;
     if (valA > valB) return newsUserSortOrder === 'desc' ? -1 : 1;
     return 0;
   });
 
-  // 3. 渲染 HTML
   document.getElementById('topNewsUsersBody').innerHTML = sortedData.length===0
     ? '<tr><td colspan="7" style="text-align:center;color:#64748b">暂无数据</td></tr>'
     : sortedData.map((r,i)=>{
         const isApple = r.user_type === 'apple';
-        const isDevice = r.user_type === 'device';
-        const displayAppleId = isApple ? `<span style="font-family:monospace;font-size:11px">${r.user_id.substring(0,24)}...</span>` : '<span style="color:#475569">-</span>';
+        const isDevice = r.user_type === 'device' || (r.user_id||'').startsWith('dev_');
+        const uid = encodeURIComponent(r.user_id);
+        const displayAppleId = (isApple && !isDevice) ? `<span style="font-family:monospace;font-size:11px">${r.user_id.substring(0,24)}...</span>` : '<span style="color:#475569">-</span>';
         const displayDeviceId = isDevice ? `<span style="font-family:monospace;font-size:11px">${r.user_id.substring(0,24)}...</span>` : '<span style="color:#475569">-</span>';
-        
+        const cell = (type, val) => `<td><span class="clickable" style="font-weight:bold;"
+            onclick="showUserNewsDetails('${uid}','${type}')"
+            ${hoverAttrs('n|'+uid+'|'+type, `newsDetailPayload('${uid}','${type}')`)}>${val||0}</span></td>`;
         return `<tr>
           <td>${i+1}</td>
           <td>${displayAppleId}</td>
           <td>${displayDeviceId}</td>
           <td><strong>${r.unique_articles}</strong></td>
-          <td><span class="clickable" style="font-weight:bold;" onclick="showUserNewsDetails('${encodeURIComponent(r.user_id)}', 'listen')">${r.listen_count||0}</span></td>
-          <td><span class="clickable" style="font-weight:bold;" onclick="showUserNewsDetails('${encodeURIComponent(r.user_id)}', 'view')">${r.view_count||0}</span></td>
+          ${cell('listen', r.listen_count)}
+          ${cell('view',   r.view_count)}
           <td style="color:#94a3b8;font-size:12px">${(r.last_active||'').replace('T',' ').substring(0,19)}</td>
         </tr>`;
       }).join('');
+}
+
+async function newsDetailPayload(userIdEnc, type){
+  const userId = decodeURIComponent(userIdEnc);
+  const typeText = type === 'listen' ? '朗读' : '曝光';
+  const title = `👥 用户 [${userId.substring(0,10)}...] 的${typeText}历史`;
+  const data = await api(`/admin/api/news/user_details?user_id=${encodeURIComponent(userId)}&type=${type}`);
+  if(!data || data.length === 0) return { title, html:'<div style="color:#64748b">暂无记录</div>' };
+
+  const groups = {};
+  data.forEach(item => {
+    let dateStr = item.article_date || '未知日期';
+    if (dateStr.length === 6) dateStr = `20${dateStr.substring(0,2)}-${dateStr.substring(2,4)}-${dateStr.substring(4,6)}`;
+    (groups[dateStr] = groups[dateStr] || []).push(item);
+  });
+  let html = `<div style="text-align:left;max-height:56vh;overflow-y:auto;font-size:13px;color:#cbd5e1;">`;
+  Object.keys(groups).sort((a,b)=>b.localeCompare(a)).forEach(date=>{
+    html += `<div style="margin-bottom:16px;border-bottom:1px solid #334155;padding-bottom:8px;">
+      <div style="font-weight:bold;color:#60a5fa;font-size:14px;margin-bottom:6px;">📅 ${date}</div><ul style="list-style:none;padding-left:4px;">`;
+    groups[date].forEach(art=>{
+      const sourceBadge = art.source_id ? `<span class="pill pill-orange" style="margin-right:6px;font-size:10px;padding:1px 4px;">${art.source_id}</span>` : '';
+      const countBadge = art.click_count > 1 ? `<span class="pill pill-blue" style="margin-left:6px;font-size:10px;padding:1px 4px;">${art.click_count}次</span>` : '';
+      const verBadge = art.versions ? `<span class="pill pill-purple" style="margin-left:6px;font-size:10px;">v${art.versions.split(',').join(' / v')}</span>` : '';
+      html += `<li style="margin-bottom:6px;line-height:1.4;">${sourceBadge}<strong>${art.article_topic || '无标题'}</strong>${countBadge}${verBadge}</li>`;
+    });
+    html += `</ul></div>`;
+  });
+  html += `</div>`;
+  return { title, html };
 }
 
 // 切换排序字段
@@ -4948,57 +5658,11 @@ async function showArticleUsers(keyEnc, type){
 }
 
 async function showUserNewsDetails(userIdEnc, type){
-  const userId = decodeURIComponent(userIdEnc);
-  const typeText = type === 'listen' ? '朗读' : '曝光';
-  const data = await api(`/admin/api/news/user_details?user_id=${encodeURIComponent(userId)}&type=${type}`);
-  if(!data) return;
-  
-  if(data.length === 0) {
-    showInfoModal(`👥 用户 ${typeText} 明细`, '暂无记录');
-    return;
-  }
-  
-  // 1. 按新闻日期 (article_date, 格式如 yyMMdd) 进行前端分组
-  const groups = {};
-  data.forEach(item => {
-    // 格式化日期显示，如 "26-05-31" 或保持 "260531"
-    let dateStr = item.article_date || '未知日期';
-    if (dateStr.length === 6) {
-      dateStr = `20${dateStr.substring(0,2)}-${dateStr.substring(2,4)}-${dateStr.substring(4,6)}`;
-    }
-    if (!groups[dateStr]) {
-      groups[dateStr] = [];
-    }
-    groups[dateStr].push(item);
-  });
-  
-  // 2. 拼接 HTML 结构
-  let html = `<div style="text-align:left; max-height:60vh; overflow-y:auto; font-size:13px; color:#cbd5e1;">`;
-  
-  // 降序遍历日期组
-  const sortedDates = Object.keys(groups).sort((a,b) => b.localeCompare(a));
-  
-  sortedDates.forEach(date => {
-    html += `<div style="margin-bottom: 16px; border-bottom: 1px solid #334155; padding-bottom: 8px;">`;
-    html += `  <div style="font-weight: bold; color: #60a5fa; font-size: 14px; margin-bottom: 6px;">📅 ${date}</div>`;
-    html += `  <ul style="list-style-type: none; padding-left: 4px;">`;
-    
-    groups[date].forEach(art => {
-      const sourceBadge = art.source_id ? `<span class="pill pill-orange" style="margin-right:6px; font-size:10px; padding:1px 4px;">${art.source_id}</span>` : '';
-      const countBadge = art.click_count > 1 ? `<span class="pill pill-blue" style="margin-left:6px; font-size:10px; padding:1px 4px;">${art.click_count}次</span>` : '';
-      const verBadge = art.versions ? `<span class="pill pill-purple" style="margin-left:6px;font-size:10px;">v${art.versions.split(',').join(' / v')}</span>` : '';
-      html += `    <li style="margin-bottom: 6px; line-height: 1.4;">`;
-      html += `      ${sourceBadge}<strong>${art.article_topic || '无标题'}</strong>${countBadge}${verBadge}`;
-      html += `    </li>`;
-    });
-    
-    html += `  </ul>`;
-    html += `</div>`;
-  });
-  
-  html += `</div>`;
-  
-  showInfoModal(`👥 用户 [${userId.substring(0,10)}...] 的${typeText}历史`, html);
+  const key = 'n|'+userIdEnc+'|'+type;
+  const p = detailCache[key] || await newsDetailPayload(userIdEnc, type);
+  detailCache[key] = p;
+  hideHoverCard();
+  showInfoModal(p.title, p.html);
 }
 
 function switchSourcePeriod(el,p){
@@ -5023,6 +5687,7 @@ let financeUserSortOrder = 'desc';
 
 async function loadFinanceModule(){
   loadFinanceOverview();
+  loadSupportThreads('Finance');
   loadFinanceTrend();
   loadFinanceTopCards(financePeriod);
   await loadFinanceUsers();
@@ -5139,6 +5804,7 @@ function renderFinanceUsers(){
     ? '<tr><td colspan="5" style="text-align:center;color:#64748b">暂无数据</td></tr>'
     : sorted.map((r,i)=>{
         const isDevice = (r.user_type==='device') || (r.user_id||'').startsWith('dev_');
+        const uid = encodeURIComponent(r.user_id);
         const appleCell = !isDevice
           ? `<span style="font-family:monospace;font-size:11px">${r.user_id.substring(0,24)}...</span>`
           : '<span style="color:#475569">-</span>';
@@ -5149,10 +5815,39 @@ function renderFinanceUsers(){
           <td>${i+1}</td>
           <td>${appleCell}</td>
           <td>${deviceCell}</td>
-          <td><span class="clickable" style="font-weight:bold;" onclick="showFinanceUserDetails('${encodeURIComponent(r.user_id)}')">${r.total_clicks||0}</span></td>
+          <td><span class="clickable" style="font-weight:bold;"
+              onclick="showFinanceUserDetails('${uid}')"
+              ${hoverAttrs('f|'+uid, `financeDetailPayload('${uid}')`)}>${r.total_clicks||0}</span></td>
           <td style="color:#94a3b8;font-size:12px">${(r.last_active||'').replace('T',' ').substring(0,19)}</td>
         </tr>`;
       }).join('');
+}
+
+async function financeDetailPayload(userIdEnc){
+  const userId = decodeURIComponent(userIdEnc);
+  const data = await api(`/admin/api/finance/user_details?user_id=${encodeURIComponent(userId)}`);
+  const title = `👤 用户 [${userId.substring(0,10)}...] 的点击历史`;
+  if(!data || data.length===0) return { title, html:'<div style="color:#64748b">暂无记录</div>' };
+  let html = `<div style="text-align:left;max-height:56vh;overflow-y:auto;font-size:13px;color:#cbd5e1;"><ul style="list-style:none;padding-left:4px;">`;
+  data.forEach(item=>{
+    const countBadge = item.click_count>1 ? `<span class="pill pill-blue" style="margin-left:6px;font-size:10px;padding:1px 4px;">${item.click_count}次</span>`:'';
+    const timeStr = (item.last_time||'').replace('T',' ').substring(0,16);
+    const verBadge = item.versions ? `<span class="pill pill-purple" style="margin-left:6px;font-size:10px;">v${item.versions.split(',').join(' / v')}</span>` : '';
+    html += `<li style="margin-bottom:10px;line-height:1.4;border-bottom:1px solid #334155;padding-bottom:6px;">
+      <strong>${item.card_name||item.card_key}</strong>${countBadge}${verBadge}
+      <span style="font-size:11px;color:#64748b">(${item.card_key})</span><br>
+      <span style="font-size:11px;color:#94a3b8;">🕐 ${timeStr}</span></li>`;
+  });
+  html += `</ul></div>`;
+  return { title, html };
+}
+
+async function showFinanceUserDetails(userIdEnc){
+  const key = 'f|'+userIdEnc;
+  const p = detailCache[key] || await financeDetailPayload(userIdEnc);
+  detailCache[key] = p;
+  hideHoverCard();
+  showInfoModal(p.title, p.html);
 }
 
 function sortFinanceUsers(field){
@@ -5250,6 +5945,8 @@ if __name__ == '__main__':
     # 【新增】在启动时初始化数据库
     init_user_db()
     init_analytics_db()
+    init_support_db()
+    migrate_support_threads_once()
     ensure_video_db()        # ← 新增：启动时构建/检查 OVideo.db
     supported_apps_str = ", ".join(ALLOWED_APPS)
     print("多应用服务器正在启动...")

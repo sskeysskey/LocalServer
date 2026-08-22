@@ -2,6 +2,7 @@ import os
 import re
 import threading
 import json
+import time
 import sqlite3
 import traceback
 from difflib import SequenceMatcher
@@ -25,6 +26,25 @@ _last_unlock_cleanup_date = None
 Compress(app)
 
 # --- 配置 ---
+
+# 【新增】订阅到期时间：统一解析 / 归一化 / 比较（修复 Z / +08:00 / 无时区 混乱）
+# 客户端上报的到期时间允许的最大跨度（天）。超过就认为是伪造/后门时间，直接拒绝。
+MAX_SUBSCRIPTION_HORIZON_DAYS = 400
+# 永久 VIP 的对外哨兵值（只由服务器根据 is_permanent 生成，绝不接受客户端写入）
+PERMANENT_SENTINEL = "2099-12-31T23:59:59Z"
+# 兼容老客户端的 {"days": 30} 充值方式。等所有客户端都升级完，把它改成 False 关掉白嫖漏洞。
+ALLOW_LEGACY_DAYS_GRANT = True
+
+# ============ 【需求3】播放/阅读权限来源判定 ============
+ALLOWED_ACCESS_TYPES = {
+    'subscription', 'vip_permanent',
+    'points', 'points_bonus', 'points_daily',
+    'free', 'unknown'
+}
+
+_sub_kind_cache = {}          # user_id -> (kind, ts)
+_SUB_KIND_TTL = 60            # 秒；避免每条埋点都去查 user_data.db
+
 # 获取当前 app.py 所在的目录 (即 LocalServer)
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -91,6 +111,95 @@ US_MARKET_HOLIDAYS = {
     "2029-05-28", "2029-06-19", "2029-07-04", "2029-09-03",
     "2029-11-22", "2029-12-25",
 }
+
+def utcnow():
+    """带时区的当前 UTC 时间"""
+    return datetime.now(timezone.utc)
+
+
+# ============ 【修复】Python 3.6 兼容的时间解析 ============
+# 注意：datetime.fromisoformat() 是 Python 3.7+ 才有的；
+#      strptime 的 '%z' 在 3.6 也不支持 "+08:00" 这种带冒号的偏移。
+#      所以这里全部手写解析，任何 Python 3.4+ 都能跑。
+_TZ_SUFFIX_RE = re.compile(r'([+-])(\d{2}):?(\d{2})\s*$')
+_FRACTION_RE  = re.compile(r'\.(\d+)$')
+
+
+def parse_expiry(value):
+    """把任意常见格式的时间字符串解析成 aware UTC datetime；失败返回 None。
+       支持：2026-09-10T06:21:00Z / +00:00 / +0800 / 无时区(按 UTC 处理)
+             / 空格分隔 / 带微秒 / 仅日期 / datetime 对象
+       ⚠️ 绝不抛异常，任何解析不了的输入统一返回 None。"""
+    if value is None:
+        return None
+    try:
+        # 1) 已经是 datetime 对象
+        if isinstance(value, datetime):
+            dt = value
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+
+        s = str(value).strip()
+        if not s:
+            return None
+
+        # 2) 先剥离时区信息，得到 naive 部分 + tzinfo
+        tz = None
+        if s[-1] in ('Z', 'z'):
+            s = s[:-1].strip()
+            tz = timezone.utc
+        else:
+            m = _TZ_SUFFIX_RE.search(s)
+            # 防止把 "2026-09-22" 的 "-22" 误判成时区：必须前面还有 T 或空格分隔的时间部分
+            if m and ('T' in s or ' ' in s):
+                sign = 1 if m.group(1) == '+' else -1
+                offset = timedelta(hours=int(m.group(2)), minutes=int(m.group(3)))
+                tz = timezone(sign * offset)
+                s = s[:m.start()].strip()
+        if tz is None:
+            tz = timezone.utc          # 没写时区的一律按 UTC 解释（与客户端约定一致）
+
+        # 3) "2026-09-10 06:21:00" -> "2026-09-10T06:21:00"
+        if 'T' not in s and ' ' in s:
+            s = s.replace(' ', 'T', 1)
+
+        # 4) 小数秒最多 6 位（Python 的 %f 只吃 1~6 位）
+        fm = _FRACTION_RE.search(s)
+        if fm and len(fm.group(1)) > 6:
+            s = s[:fm.start()] + '.' + fm.group(1)[:6]
+
+        dt = None
+        for fmt in ('%Y-%m-%dT%H:%M:%S.%f',
+                    '%Y-%m-%dT%H:%M:%S',
+                    '%Y-%m-%dT%H:%M',
+                    '%Y-%m-%d'):
+            try:
+                dt = datetime.strptime(s, fmt)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            print("[parse_expiry][WARN] 无法解析时间: %r" % (value,))
+            return None
+
+        return dt.replace(tzinfo=tz).astimezone(timezone.utc)
+    except Exception as e:
+        print("[parse_expiry][ERROR] %r -> %s" % (value, e))
+        return None
+
+
+def iso_utc(dt):
+    """统一对外/入库格式：2026-09-10T06:21:00Z"""
+    return dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _row_get(row, key, default=None):
+    """sqlite3.Row 安全取值：列不存在时返回默认值（去掉 prediction 列后不会炸）"""
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
 
 def is_free_access_day():
     """服务器权威判断：北京时间今天是否为免点数日。
@@ -180,6 +289,71 @@ def is_real_login_user(user_id):
     """只有 Apple 登录用户(稳定 Apple ID)才享受免费次数。
        dev_ 开头是设备标识(可被重置)，guest_user 是兜底，都不给。"""
     return bool(user_id) and not user_id.startswith('dev_') and user_id != 'guest_user'
+
+def get_subscription_kind(user_id, app_name='ONews'):
+    """服务器权威判断用户当前付费身份：'vip_permanent' / 'subscription' / None"""
+    if not is_real_login_user(user_id):
+        return None
+    hit = _sub_kind_cache.get(user_id)
+    if hit and (time.time() - hit[1]) < _SUB_KIND_TTL:
+        return hit[0]
+    kind = None
+    try:
+        conn = sqlite3.connect(USER_DB_PATH, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM users WHERE apple_user_id=?", (user_id,)).fetchone()
+        conn.close()
+        if row:
+            for pfx in ('onews', 'finance', 'prediction'):
+                if _row_get(row, f'{pfx}_is_permanent', 0) in (1, '1', True):
+                    kind = 'vip_permanent'
+                    break
+            if kind is None:
+                dt = parse_expiry(_row_get(row, f'{app_name.lower()}_expire_at'))
+                if dt and dt > utcnow():
+                    kind = 'subscription'
+    except Exception as e:
+        print(f"[access] 查询订阅身份失败: {e}")
+    _sub_kind_cache[user_id] = (kind, time.time())
+    return kind
+
+
+def resolve_video_access_type(user_id, reported=None, episode_key=None):
+    """决定这次播放/下载记为"订阅"还是"点数"。
+       订阅身份以服务器为准；非订阅时优先看当天的解锁来源(bonus/daily)。"""
+    kind = get_subscription_kind(user_id, 'ONews')
+    if kind:
+        return kind
+    r = (reported or '').strip()
+    if r in ALLOWED_ACCESS_TYPES and r not in ('subscription', 'vip_permanent'):
+        # 客户端报了 points/free 之类，直接采信，但下面还会尝试细分
+        if r != 'points':
+            return r
+    if episode_key:
+        try:
+            conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("""SELECT source FROM video_free_unlocks
+                                  WHERE user_id=? AND episode_key=?
+                                  ORDER BY id DESC LIMIT 1""",
+                               (user_id, episode_key)).fetchone()
+            conn.close()
+            if row:
+                return 'points_bonus' if (row['source'] or 'daily') == 'bonus' else 'points_daily'
+        except Exception:
+            pass
+    if r == 'points':
+        return 'points'
+    return 'points' if is_real_login_user(user_id) else 'free'
+
+
+def resolve_news_access_type(user_id, reported=None):
+    """新闻：订阅 / 点数 / 免费(老新闻)"""
+    kind = get_subscription_kind(user_id, 'ONews')
+    if kind:
+        return kind
+    r = (reported or '').strip()
+    return r if r in ALLOWED_ACCESS_TYPES else 'unknown'
 
 def analytics_cutoff_iso(days=ANALYTICS_LOG_KEEP_DAYS):
     """返回北京时间 N 天前的 naive ISO 字符串，用于与 created_at 比较"""
@@ -745,10 +919,18 @@ def init_analytics_db():
         except sqlite3.OperationalError:
             pass
 
+    # 【需求3】播放/阅读的"权限来源"：subscription / vip_permanent / points_* / free
+    for tbl in ('event_logs', 'user_video_events', 'news_event_logs', 'user_news_events'):
+        try:
+            c.execute(f"ALTER TABLE {tbl} ADD COLUMN access_type TEXT")
+        except sqlite3.OperationalError:
+            pass
+    c.execute('CREATE INDEX IF NOT EXISTS idx_logs_access ON event_logs(access_type)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_news_logs_access ON news_event_logs(access_type)')
+
     # 【新增】活跃用户榜是按 user_id 全表分组，加索引避免临时排序、加快聚合
     c.execute('CREATE INDEX IF NOT EXISTS idx_logs_user ON event_logs(user_id)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_news_logs_user ON news_event_logs(user_id)')
-    # finance_event_logs 已有 idx_fin_logs_user
 
     conn.commit()
     conn.close()
@@ -2567,37 +2749,46 @@ def ack_report_reply():
 @app.route('/api/OVideo/track', methods=['POST'])
 def track_event():
     try:
-        data = request.get_json()
+        data = request.get_json() or {}
         user_id     = data.get('user_id')
         user_type   = data.get('user_type', 'apple')
         video_url   = data.get('video_url')
         video_title = data.get('video_title', '')
         event_type  = data.get('event_type')
-        source      = data.get('source')          # ⭐ 新增：播放来源(仅在线播放会带)
-        app_version = data.get('app_version', '')       # 【新增】
+        source      = data.get('source')
+        app_version = data.get('app_version', '')
+        episode_key = data.get('episode_key')          # 【新增】可选
         if not user_id or not video_url or event_type not in ALLOWED_EVENT_TYPES:
             return jsonify({"error": "Invalid params"}), 400
-        now = now_iso()        # ⭐ 北京时间(无时区后缀)
+
+        # 【需求3】权限来源：客户端上报 + 服务器兜底纠正
+        access_type = resolve_video_access_type(
+            user_id, data.get('access_type'), episode_key or video_url)
+
+        now = now_iso()
         conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
         c = conn.cursor()
         c.execute('''
             INSERT INTO user_video_events
-                (user_id, user_type, video_url, video_title, event_type, first_at, last_at, count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                (user_id, user_type, video_url, video_title, event_type,
+                 first_at, last_at, count, access_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
             ON CONFLICT(user_id, video_url, event_type)
-            DO UPDATE SET last_at = ?, count = count + 1
-        ''', (user_id, user_type, video_url, video_title, event_type, now, now, now))
+            DO UPDATE SET last_at = ?, count = count + 1, access_type = ?
+        ''', (user_id, user_type, video_url, video_title, event_type, now, now,
+              access_type, now, access_type))
 
-        # 流水表：每次都插，额外记录 source
         c.execute('''
             INSERT INTO event_logs
-                (user_id, user_type, video_url, video_title, event_type, created_at, source, app_version)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, user_type, video_url, video_title, event_type, now, source, app_version))
+                (user_id, user_type, video_url, video_title, event_type,
+                 created_at, source, app_version, access_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, user_type, video_url, video_title, event_type, now,
+              source, app_version, access_type))
 
         conn.commit()
         conn.close()
-        return jsonify({"status": "ok"}), 200
+        return jsonify({"status": "ok", "access_type": access_type}), 200
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
@@ -2618,7 +2809,8 @@ def admin_video_user_details():
                MAX(created_at) AS last_time,
                COUNT(*) AS click_count,
                GROUP_CONCAT(DISTINCT source) AS sources,
-               GROUP_CONCAT(DISTINCT NULLIF(app_version,'')) AS versions
+               GROUP_CONCAT(DISTINCT NULLIF(app_version,'')) AS versions,
+               GROUP_CONCAT(DISTINCT COALESCE(NULLIF(access_type,''),'unknown')) AS access_types
         FROM event_logs
         WHERE user_id = ? AND event_type = ? AND created_at >= ?
         {suffix}
@@ -2640,6 +2832,8 @@ def admin_overview():
         "today_play":           _query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='play' AND date(created_at)=?", (today,))[0]['c'],
         "today_download":       _query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='download_complete' AND date(created_at)=?", (today,))[0]['c'],
         "pending_reports":      _query_analytics("SELECT COUNT(DISTINCT episode_url) AS c FROM video_link_reports WHERE status='pending'")[0]['c'],
+        "today_play_vip":    _query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='play' AND access_type IN ('subscription','vip_permanent') AND date(created_at)=?", (today,))[0]['c'],
+        "today_play_points": _query_analytics("SELECT COUNT(*) AS c FROM event_logs WHERE event_type='play' AND access_type LIKE 'points%' AND date(created_at)=?", (today,))[0]['c'],
     })
 
 # 视频排行榜（区分唯一用户数 / 总次数）
@@ -2808,7 +3002,7 @@ def admin_resolve_wish():
     conn.close()
     return jsonify({"status": "success"})
 
-# 活跃用户排行
+# 活跃用户排行（增加 订阅播放 / 点数播放 两个维度）
 @app.route('/admin/api/top_users', methods=['GET'])
 @require_admin
 def admin_top_users():
@@ -2819,6 +3013,10 @@ def admin_top_users():
                COUNT(DISTINCT CASE WHEN event_type='download_complete' THEN video_url END) AS download_videos,
                COUNT(DISTINCT CASE WHEN event_type='play' AND video_url NOT LIKE '%.m3u8' THEN video_url END) AS online_play,
                COUNT(DISTINCT CASE WHEN event_type='play' AND video_url LIKE '%.m3u8' THEN video_url END) AS offline_play,
+               COUNT(DISTINCT CASE WHEN event_type='play'
+                     AND access_type IN ('subscription','vip_permanent') THEN video_url END) AS vip_play,
+               COUNT(DISTINCT CASE WHEN event_type='play'
+                     AND access_type LIKE 'points%' THEN video_url END) AS points_play,
                COUNT(*) AS total_actions,
                MAX(created_at) AS last_active
         FROM event_logs
@@ -3035,40 +3233,38 @@ def download_file(app_name):
 # --- 用户认证与权限核心逻辑 ---
 def check_user_subscription_status(user_row, app_name):
     """
-    检查用户权限。
-    逻辑：
-    1. 先检查该 App 的 is_permanent (亲友/后门)。如果是 1，直接返回 2099年。
-    2. 再检查该 App 的 expire_at (付费)。如果时间还没到，返回该时间。
-    3. 否则返回 False。
+    返回 (is_subscribed, expires_at_str)
+    优先级：is_permanent(后门/亲友) > expire_at(付费到期时间)
+    ⚠️ 本函数保证不抛异常。
     """
-    now = datetime.utcnow()
-    
-    # 根据传入的 app_name 决定查哪些字段
-    # 比如 app_name="Finance" -> prefix="finance"
-    prefix = app_name.lower() 
+    if user_row is None:
+        return False, None
+
+    prefix = app_name.lower()
     perm_col = f"{prefix}_is_permanent"
     expire_col = f"{prefix}_expire_at"
-    
-    # 1. 【优先】检查永久 VIP (亲友/后门)
-    # 数据库里取出来可能是 1 或 True，做个兼容
-    if user_row[perm_col] == 1:
-        # 对于亲友，我们返回一个极远的未来时间，让前端显示“长期有效”或类似效果
-        return True, "2099-12-31T23:59:59"
-        
-    # 2. 检查付费订阅的过期时间
-    if user_row[expire_col]:
-        try:
-            # 数据库存的是字符串，转回 datetime
-            expires_at = datetime.fromisoformat(str(user_row[expire_col]))
-            if expires_at > now:
-                return True, user_row[expire_col]
-            else:
-                # 【优化】如果已经过期，虽然逻辑上返回 False，
-                # 但可以在这里记录一下，或者由 App 端下次登录时更新
-                return False, user_row[expire_col]
-        except:
-            pass
-            
+
+    try:
+        # 1. 永久 VIP（亲友 / 邀请码后门）
+        if _row_get(user_row, perm_col, 0) in (1, '1', True):
+            return True, PERMANENT_SENTINEL
+
+        # 2. 付费到期时间（统一按 UTC 解析比较）
+        raw = _row_get(user_row, expire_col)
+        if raw:
+            dt = parse_expiry(raw)
+            if dt is None:
+                print(f"[subscription][WARN] 无法解析 {expire_col} = {raw!r}，视为未订阅")
+                return False, None
+            normalized = iso_utc(dt)
+            if dt > utcnow():
+                return True, normalized
+            return False, normalized
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[subscription][ERROR] 判定订阅状态异常: {e}")
+        return False, None
+
     return False, None
 
 # --- 用户认证相关 ---
@@ -3084,7 +3280,7 @@ def handle_auth(app_name):
         c = conn.cursor()
         c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
         user = c.fetchone()
-        now = datetime.utcnow()
+        now = utcnow().replace(tzinfo=None)   # 仍存 naive UTC，兼容老数据；同时避开 3.12 弃用告警
         is_subscribed = False
         expiration_date = None
         if user:
@@ -3117,26 +3313,66 @@ def handle_auth(app_name):
 
 def handle_status_check(app_name):
     user_id = request.args.get('user_id')
-    if not user_id: return jsonify({"error": "Missing user_id"}), 400
-    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+    if not user_id:
+        return jsonify({"error": "Missing user_id"}), 400
+    debug = request.args.get('debug') in ('1', 'true', 'yes')
+
+    conn = None
     try:
+        conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
         c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
         row = c.fetchone()
-        is_subscribed = False
-        expires_at_str = None
-        if row:
-            is_subscribed, expires_at_str = check_user_subscription_status(row, app_name)
-        return jsonify({
-            "is_subscribed": is_subscribed, 
+
+        is_subscribed, expires_at_str = check_user_subscription_status(row, app_name)
+
+        payload = {
+            "is_subscribed": is_subscribed,
             "subscription_expires_at": expires_at_str,
-            "video_module_blocked": user_id in VIDEO_MODULE_BLOCKED_USERS   # 【新增】
-        })
+            "video_module_blocked": user_id in VIDEO_MODULE_BLOCKED_USERS
+        }
+
+        if debug:
+            import sys
+            prefix = app_name.lower()
+            raw = _row_get(row, f"{prefix}_expire_at") if row else None
+            parsed = parse_expiry(raw)
+            payload["_debug"] = {
+                "db_path": USER_DB_PATH,
+                "row_found": bool(row),
+                "row_id": _row_get(row, 'id') if row else None,
+                "checked_columns": [f"{prefix}_expire_at", f"{prefix}_is_permanent"],
+                "raw_expire_at": str(raw),
+                "raw_type": type(raw).__name__,
+                "parsed_expire_at_utc": iso_utc(parsed) if parsed else None,
+                "is_permanent_raw": _row_get(row, f"{prefix}_is_permanent", None) if row else None,
+                "server_now_utc": iso_utc(utcnow()),
+                "python_version": sys.version,
+                "has_fromisoformat": hasattr(datetime, 'fromisoformat'),
+            }
+
+        print(f"[status] {app_name} user={user_id[:14]}... -> "
+              f"sub={is_subscribed} exp={expires_at_str}")
+
+        resp = jsonify(payload)
+        resp.headers['Cache-Control'] = 'no-store, no-cache, max-age=0'
+        return resp
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        # ⚠️ 关键：即使出错也要返回"结构合法"的 JSON，
+        #    否则客户端解码失败会误判成"服务器不可达"而保留旧状态。
+        traceback.print_exc()
+        resp = jsonify({
+            "is_subscribed": False,
+            "subscription_expires_at": None,
+            "video_module_blocked": user_id in VIDEO_MODULE_BLOCKED_USERS,
+            "_error": str(e)
+        })
+        resp.headers['Cache-Control'] = 'no-store, no-cache, max-age=0'
+        return resp
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 # 【新增】处理邀请码兑换
 def handle_redeem_invite(app_name):
@@ -3174,54 +3410,69 @@ def handle_redeem_invite(app_name):
         conn.close()
 
 def handle_payment(app_name):
-    data = request.get_json()
+    data = request.get_json() or {}
     user_id = data.get('user_id')
-    days = data.get('days', 30) # 保持默认值用于兼容旧版本或手动充值
-    # 【新增】接收客户端传来的真实过期时间字符串 (ISO 8601 格式)
-    explicit_expiry = data.get('explicit_expiry') 
-    if not user_id: return jsonify({"error": "Missing user_id"}), 400
+    explicit_expiry = data.get('explicit_expiry')
+    days = data.get('days')
+    if not user_id:
+        return jsonify({"error": "Missing user_id"}), 400
+
+    prefix = app_name.lower()
+    expire_col = f"{prefix}_expire_at"
+    perm_col = f"{prefix}_is_permanent"
+
+    # ---------- 1. 计算本次要写入的目标时间 ----------
+    new_dt = None
+    if explicit_expiry:
+        new_dt = parse_expiry(explicit_expiry)
+        if new_dt is None:
+            return jsonify({"error": f"invalid explicit_expiry: {explicit_expiry}"}), 400
+        # 【核心防护】客户端只允许上报"真实 Apple 订阅到期时间"。
+        # 任何超过 400 天的时间（例如后门缓存里的 2099）一律拒绝，
+        # 否则后门状态会被写回数据库，导致 is_permanent 改回 0 也降不了权。
+        if new_dt > utcnow() + timedelta(days=MAX_SUBSCRIPTION_HORIZON_DAYS):
+            print(f"[payment][REJECT] {user_id} 上报了超范围到期时间 {explicit_expiry}，已拒绝")
+            return jsonify({"error": "expiry out of allowed range"}), 400
+    elif days is not None:
+        if not ALLOW_LEGACY_DAYS_GRANT:
+            return jsonify({"error": "explicit_expiry required"}), 400
+        try:
+            d = max(1, min(int(days), MAX_SUBSCRIPTION_HORIZON_DAYS))
+        except Exception:
+            return jsonify({"error": "invalid days"}), 400
+        new_dt = utcnow() + timedelta(days=d)
+        print(f"[payment][LEGACY] {user_id} 走旧的 days={d} 充值路径（无票据校验，建议尽快下线）")
+    else:
+        return jsonify({"error": "missing explicit_expiry"}), 400
+
+    # ---------- 2. 写库（只允许延长，不允许缩短） ----------
     conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     try:
-        c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,))
-        row = c.fetchone()
-        if not row: return jsonify({"error": "User not found"}), 404
-        now = datetime.utcnow()
-        
-        # 确定要更新哪个字段
-        expire_col = f"{app_name.lower()}_expire_at"
-        new_expiry_str = ""
+        row = c.execute("SELECT * FROM users WHERE apple_user_id = ?", (user_id,)).fetchone()
+        if not row:
+            return jsonify({"error": "User not found"}), 404
 
-        # 【核心修改】逻辑分支
-        if explicit_expiry:
-            # 方案 A: 客户端传了真实的 Apple 过期时间，直接使用
-            # 这样就实现了"同步"，而不是"充值"
-            print(f"[{app_name}] 同步用户 {user_id} 订阅时间至: {explicit_expiry}")
-            new_expiry_str = explicit_expiry
-        else:
-            # 方案 B: 旧逻辑 (充值模式) - 依然保留以备不时之需
-            current_expiry_str = row[expire_col]
-            new_expiry = now + timedelta(days=days) 
-            
-            if current_expiry_str:
-                try:
-                    current_expiry = datetime.fromisoformat(current_expiry_str)
-                    if current_expiry > now:
-                        new_expiry = current_expiry + timedelta(days=days)
-                except: pass
-            new_expiry_str = new_expiry.isoformat()
-        
-        # 执行更新
-        query = f"UPDATE users SET {expire_col} = ? WHERE apple_user_id = ?"
-        c.execute(query, (new_expiry_str, user_id))
+        # 永久 VIP 不需要也不应该被付费时间覆盖
+        if _row_get(row, perm_col, 0) in (1, '1', True):
+            conn.commit()
+            return jsonify({"status": "success", "is_subscribed": True,
+                            "subscription_expires_at": PERMANENT_SENTINEL})
+
+        cur_dt = parse_expiry(_row_get(row, expire_col))
+        final_dt = new_dt if (cur_dt is None or new_dt > cur_dt) else cur_dt
+        final_str = iso_utc(final_dt)
+
+        c.execute(f"UPDATE users SET {expire_col} = ? WHERE apple_user_id = ?",
+                  (final_str, user_id))
         conn.commit()
-        return jsonify({
-            "status": "success", 
-            "is_subscribed": True, 
-            "subscription_expires_at": new_expiry_str
-        })
+        print(f"[payment] {app_name} 用户 {user_id} 到期时间 -> {final_str}")
+        return jsonify({"status": "success",
+                        "is_subscribed": final_dt > utcnow(),
+                        "subscription_expires_at": final_str})
     except Exception as e:
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
@@ -3230,7 +3481,7 @@ def handle_payment(app_name):
 @app.route('/api/ONews/track', methods=['POST'])
 def track_news_event():
     try:
-        data = request.get_json()
+        data = request.get_json() or {}
         user_id       = data.get('user_id')
         user_type     = data.get('user_type', 'apple')
         article_key   = data.get('article_key')
@@ -3238,31 +3489,34 @@ def track_news_event():
         source_id     = data.get('source_id', '')
         article_date  = data.get('article_date', '')
         event_type    = data.get('event_type')
-        app_version = data.get('app_version', '') 
+        app_version   = data.get('app_version', '')
         if not user_id or not article_key or event_type not in ALLOWED_NEWS_EVENT_TYPES:
             return jsonify({"error": "Invalid params"}), 400
-        now = now_iso()        # ⭐ 北京时间(无时区后缀)
+
+        access_type = resolve_news_access_type(user_id, data.get('access_type'))   # 【新增】
+        now = now_iso()
+
         conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
         c = conn.cursor()
         c.execute('''
             INSERT INTO user_news_events
                 (user_id, user_type, article_key, article_topic, source_id,
-                 article_date, event_type, first_at, last_at, count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                 article_date, event_type, first_at, last_at, count, access_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             ON CONFLICT(user_id, article_key, event_type)
-            DO UPDATE SET last_at = ?, count = count + 1
+            DO UPDATE SET last_at = ?, count = count + 1, access_type = ?
         ''', (user_id, user_type, article_key, article_topic, source_id,
-              article_date, event_type, now, now, now))
+              article_date, event_type, now, now, access_type, now, access_type))
         c.execute('''
             INSERT INTO news_event_logs
                 (user_id, user_type, article_key, article_topic, source_id,
-                 article_date, event_type, created_at, app_version)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 article_date, event_type, created_at, app_version, access_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (user_id, user_type, article_key, article_topic, source_id,
-              article_date, event_type, now, app_version))
+              article_date, event_type, now, app_version, access_type))
         conn.commit()
         conn.close()
-        return jsonify({"status": "ok"}), 200
+        return jsonify({"status": "ok", "access_type": access_type}), 200
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
@@ -4356,27 +4610,27 @@ def admin_news_article_users():
     ''', (article_key, event_type))
     return jsonify(rows)
 
-# 新闻 - 某个用户的详细阅读历史（按日期分组）
+# 新闻 - 某个用户的详细阅读历史
 @app.route('/admin/api/news/user_details', methods=['GET'])
 @require_admin
 def admin_news_user_details():
-    maybe_cleanup_old_unlocks()                      # 【新增】
+    maybe_cleanup_old_unlocks()
     user_id = request.args.get('user_id')
     event_type = request.args.get('type')
     if not user_id or not event_type:
         return jsonify({"error": "Missing parameters"}), 400
-    cutoff = analytics_cutoff_iso()                  # 【新增】
+    cutoff = analytics_cutoff_iso()
     sql = '''
         SELECT article_date, article_topic, source_id,
                MAX(created_at) as last_time, COUNT(*) as click_count,
-               GROUP_CONCAT(DISTINCT NULLIF(app_version,'')) AS versions
+               GROUP_CONCAT(DISTINCT NULLIF(app_version,'')) AS versions,
+               GROUP_CONCAT(DISTINCT COALESCE(NULLIF(access_type,''),'unknown')) AS access_types
         FROM news_event_logs
         WHERE user_id = ? AND event_type = ? AND created_at >= ?
         GROUP BY article_date, article_key
         ORDER BY article_date DESC, last_time DESC
     '''
-    rows = _query_analytics(sql, (user_id, event_type, cutoff))
-    return jsonify(rows)
+    return jsonify(_query_analytics(sql, (user_id, event_type, cutoff)))
 
 # 【新增】一键清除数据库 API
 @app.route('/admin/api/clear_db', methods=['POST'])
@@ -4563,6 +4817,8 @@ ADMIN_HTML = r'''
             <th>在线播放</th>
             <th>离线播放</th>
             <th>下载视频数</th>
+            <th>💎订阅播放</th>
+            <th>🎫点数播放</th>
             <th class="sortable" onclick="sortVideoUsers('total_actions')">总操作数 <span id="vsort_total_actions">▼</span></th>
             <th class="sortable" onclick="sortVideoUsers('last_active')">最后活跃 <span id="vsort_last_active"></span></th>
           </tr>
@@ -4862,6 +5118,26 @@ const PLAY_SOURCE_MAP = {
   history: '🕐 播放记录',
   unknown: '❓ 未知来源'
 };
+
+// ⭐【需求3】权限来源中文映射
+const ACCESS_TYPE_MAP = {
+  subscription:  '💎 付费订阅',
+  vip_permanent: '👑 永久VIP',
+  points:        '🎫 消耗点数',
+  points_bonus:  '🎁 赠送点数',
+  points_daily:  '🗓 每日免费点数',
+  free:          '🆓 免费内容',
+  unknown:       '❓ 未知(老数据)'
+};
+function accessBadges(str){
+  if(!str) return '';
+  return str.split(',').filter(Boolean).map(t=>{
+    const label = ACCESS_TYPE_MAP[t] || t;
+    const cls = (t==='subscription'||t==='vip_permanent') ? 'pill-green'
+              : (t.indexOf('points')===0 ? 'pill-orange' : 'pill-blue');
+    return `<span class="pill ${cls}" style="font-size:10px;margin-left:4px;">${label}</span>`;
+  }).join('');
+}
 
 // ================= 【新增】悬浮明细卡 =================
 const detailCache = {};
@@ -5388,7 +5664,7 @@ function renderVideoUsers(){
   });
 
   document.getElementById('topUsersBody').innerHTML = sorted.length === 0
-    ? '<tr><td colspan="8" style="text-align:center;color:#64748b">暂无数据</td></tr>'
+    ? '<tr><td colspan="10" style="text-align:center;color:#64748b">暂无数据</td></tr>'
     : sorted.map((r, i) => {
         const isDevice = (r.user_id || '').startsWith('dev_');
         const uid = encodeURIComponent(r.user_id);
@@ -5398,7 +5674,7 @@ function renderVideoUsers(){
         const deviceCell = isDevice
           ? `<span style="font-family:monospace;font-size:11px">${r.user_id.substring(0,24)}...</span>`
           : '<span style="color:#475569">-</span>';
-        const cell = (type, val) => `<td><span class="clickable" style="font-weight:bold;"
+        const cell = (type, val, color) => `<td><span class="clickable" style="font-weight:bold;${color||''}"
             onclick="showUserVideoDetails('${uid}','${type}')"
             ${hoverAttrs('v|'+uid+'|'+type, `videoDetailPayload('${uid}','${type}')`)}>${val||0}</span></td>`;
         return `<tr>
@@ -5408,6 +5684,8 @@ function renderVideoUsers(){
           ${cell('online',  r.online_play)}
           ${cell('offline', r.offline_play)}
           ${cell('download_complete', r.download_videos)}
+          ${cell('vip',    r.vip_play,    'color:#86efac;')}
+          ${cell('points', r.points_play, 'color:#fdba74;')}
           <td><strong>${r.total_actions||0}</strong></td>
           <td style="color:#94a3b8;font-size:12px">${(r.last_active||'').replace('T',' ').substring(0,19)}</td>
         </tr>`;
@@ -5420,6 +5698,8 @@ async function videoDetailPayload(userIdEnc, type){
   let typeText='', sqlType='play', suffixFilter='', showSource=false;
   if (type === 'online'){ typeText='在线播放'; suffixFilter="AND video_url NOT LIKE '%.m3u8'"; showSource=true; }
   else if (type === 'offline'){ typeText='离线播放'; suffixFilter="AND video_url LIKE '%.m3u8'"; }
+  else if (type === 'vip'){ typeText='💎订阅权限播放'; suffixFilter="AND access_type IN ('subscription','vip_permanent')"; showSource=true; }
+  else if (type === 'points'){ typeText='🎫消耗点数播放'; suffixFilter="AND access_type LIKE 'points%'"; showSource=true; }
   else { typeText = type==='play' ? '播放' : '下载'; sqlType = type; }
 
   const title = `👤 用户 [${userId.substring(0,10)}...] 的${typeText}历史`;
@@ -5443,7 +5723,7 @@ async function videoDetailPayload(userIdEnc, type){
         sourceLine = `<br><span class="pill pill-purple" style="font-size:10px;">📍 ${labels}</span>`;
       }
       html += `<li style="margin-bottom:8px;line-height:1.4;">
-        <strong>${item.video_title || '无标题'}</strong>${countBadge}<br>
+        <strong>${item.video_title || '无标题'}</strong>${countBadge}${accessBadges(item.access_types)}<br>
         <span style="font-size:11px;color:#64748b;word-break:break-all;">${item.video_url || ''}</span>${sourceLine}<br>
         <span style="font-size:11px;color:#94a3b8;">🕐 ${timeStr}</span></li>`;
     });
@@ -5623,7 +5903,7 @@ async function newsDetailPayload(userIdEnc, type){
       const sourceBadge = art.source_id ? `<span class="pill pill-orange" style="margin-right:6px;font-size:10px;padding:1px 4px;">${art.source_id}</span>` : '';
       const countBadge = art.click_count > 1 ? `<span class="pill pill-blue" style="margin-left:6px;font-size:10px;padding:1px 4px;">${art.click_count}次</span>` : '';
       const verBadge = art.versions ? `<span class="pill pill-purple" style="margin-left:6px;font-size:10px;">v${art.versions.split(',').join(' / v')}</span>` : '';
-      html += `<li style="margin-bottom:6px;line-height:1.4;">${sourceBadge}<strong>${art.article_topic || '无标题'}</strong>${countBadge}${verBadge}</li>`;
+      html += `<li style="margin-bottom:6px;line-height:1.4;">${sourceBadge}<strong>${art.article_topic || '无标题'}</strong>${countBadge}${verBadge}${accessBadges(art.access_types)}</li>`;
     });
     html += `</ul></div>`;
   });

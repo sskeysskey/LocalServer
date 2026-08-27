@@ -2134,7 +2134,8 @@ def ovideo_list():
     where, params = [], []
 
     if category == 'Featured':
-        where.append("category != ?"); params.append('Show')
+        # where.append("category != ?"); params.append('Show')
+        pass  # 不加任何 category 条件，所有分类（包括 Show）都会正常查出
     elif category == 'Documentary':
         where.append("has_documentary=1")
     else:

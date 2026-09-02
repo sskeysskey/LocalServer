@@ -524,6 +524,34 @@ def init_user_db():
     conn.close()
     print("用户数据库已准备就绪。")
 
+def init_anonymous_sub_db():
+    print("检查匿名（免登录）订阅表 ...")
+    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS anonymous_subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            app TEXT NOT NULL DEFAULT 'ONews',
+            original_transaction_id TEXT NOT NULL,
+            device_id TEXT,
+            transaction_id TEXT,
+            product_id TEXT,
+            environment TEXT,
+            purchase_date TIMESTAMP,
+            expire_at TIMESTAMP,
+            app_version TEXT,
+            report_count INTEGER DEFAULT 1,
+            created_at TIMESTAMP,
+            updated_at TIMESTAMP,
+            UNIQUE(app, original_transaction_id)
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_anon_dev ON anonymous_subscriptions(device_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_anon_exp ON anonymous_subscriptions(expire_at)')
+    conn.commit()
+    conn.close()
+    print("匿名订阅表已就绪。")
+
 def get_video_quota_config():
     """返回 (每日免费次数, 首次登录一次性赠送次数)。enabled=false 时都为 0。"""
     version_file_path = os.path.join(BASE_RESOURCES_DIR, 'ONews', 'version.json')
@@ -1324,6 +1352,112 @@ def admin_support_reply():
         except Exception: pass
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/<app_name>/payment/anonymous_subscribe', methods=['POST'])
+def anonymous_subscribe(app_name):
+    """【需求3】免登录订阅记录。真正可靠的唯一键是 original_transaction_id。"""
+    if app_name not in ALLOWED_APPS:
+        return jsonify({"error": "无效的应用名称"}), 404
+    data = request.get_json() or {}
+    otid = (data.get('original_transaction_id') or '').strip()
+    device_id = (data.get('device_id') or '').strip()
+    expiry_raw = data.get('expiry')
+
+    if not otid or not expiry_raw:
+        return jsonify({"error": "missing original_transaction_id / expiry"}), 400
+
+    exp = parse_expiry(expiry_raw)
+    if exp is None:
+        return jsonify({"error": "invalid expiry"}), 400
+    # 防伪造：不接受 2099 之类的后门时间
+    if exp > utcnow() + timedelta(days=MAX_SUBSCRIPTION_HORIZON_DAYS):
+        return jsonify({"error": "expiry out of allowed range"}), 400
+
+    purchase = parse_expiry(data.get('purchase_date'))
+    now = utcnow().replace(tzinfo=None)
+
+    conn = sqlite3.connect(USER_DB_PATH, timeout=60.0)
+    c = conn.cursor()
+    try:
+        c.execute('''
+            INSERT INTO anonymous_subscriptions
+                (app, original_transaction_id, device_id, transaction_id, product_id,
+                 environment, purchase_date, expire_at, app_version,
+                 report_count, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            ON CONFLICT(app, original_transaction_id) DO UPDATE SET
+                device_id = excluded.device_id,
+                transaction_id = excluded.transaction_id,
+                product_id = excluded.product_id,
+                environment = excluded.environment,
+                app_version = excluded.app_version,
+                expire_at = CASE
+                    WHEN excluded.expire_at > anonymous_subscriptions.expire_at
+                    THEN excluded.expire_at ELSE anonymous_subscriptions.expire_at END,
+                report_count = anonymous_subscriptions.report_count + 1,
+                updated_at = excluded.updated_at
+        ''', (app_name, otid, device_id, data.get('transaction_id'), data.get('product_id'),
+              data.get('environment'), iso_utc(purchase) if purchase else None,
+              iso_utc(exp), data.get('app_version'), now, now))
+        conn.commit()
+        print(f"[anon-sub] {app_name} otid={otid[-8:]} dev={device_id[-8:]} exp={iso_utc(exp)}")
+        return jsonify({"status": "success",
+                        "is_subscribed": exp > utcnow(),
+                        "expire_at": iso_utc(exp)}), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/<app_name>/payment/anonymous_status', methods=['GET'])
+def anonymous_status(app_name):
+    """辅助查询（客户端仅参考，最终以 Apple 本地凭证为准）"""
+    device_id = request.args.get('device_id', '')
+    otid = request.args.get('original_transaction_id', '')
+    if not device_id and not otid:
+        return jsonify({"error": "missing device_id"}), 400
+    conn = sqlite3.connect(USER_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        if otid:
+            row = conn.execute("""SELECT * FROM anonymous_subscriptions
+                                  WHERE app=? AND original_transaction_id=?""",
+                               (app_name, otid)).fetchone()
+        else:
+            row = conn.execute("""SELECT * FROM anonymous_subscriptions
+                                  WHERE app=? AND device_id=?
+                                  ORDER BY expire_at DESC LIMIT 1""",
+                               (app_name, device_id)).fetchone()
+        if not row:
+            return jsonify({"is_subscribed": False, "expire_at": None})
+        exp = parse_expiry(row['expire_at'])
+        return jsonify({"is_subscribed": bool(exp and exp > utcnow()),
+                        "expire_at": iso_utc(exp) if exp else None})
+    finally:
+        conn.close()
+
+
+@app.route('/admin/anonymous_subs', methods=['GET'])
+@require_admin
+def admin_anonymous_subs():
+    """后台统计：一共多少人免登录付费、当前多少有效"""
+    conn = sqlite3.connect(USER_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM anonymous_subscriptions ORDER BY updated_at DESC LIMIT 500")]
+        total = conn.execute(
+            "SELECT COUNT(DISTINCT original_transaction_id) FROM anonymous_subscriptions").fetchone()[0]
+        active = 0
+        for r in rows:
+            e = parse_expiry(r['expire_at'])
+            if e and e > utcnow():
+                active += 1
+        return jsonify({"total_paid_users": total, "active_in_page": active, "items": rows})
     finally:
         conn.close()
 
@@ -6225,6 +6359,7 @@ document.addEventListener('keydown', function(e) {
 if __name__ == '__main__':
     # 【新增】在启动时初始化数据库
     init_user_db()
+    init_anonymous_sub_db()
     init_analytics_db()
     init_support_db()
     migrate_support_threads_once()

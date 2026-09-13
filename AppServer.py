@@ -33,7 +33,7 @@ MAX_SUBSCRIPTION_HORIZON_DAYS = 400
 # 永久 VIP 的对外哨兵值（只由服务器根据 is_permanent 生成，绝不接受客户端写入）
 PERMANENT_SENTINEL = "2099-12-31T23:59:59Z"
 # 兼容老客户端的 {"days": 30} 充值方式。等所有客户端都升级完，把它改成 False 关掉白嫖漏洞。
-ALLOW_LEGACY_DAYS_GRANT = True
+ALLOW_LEGACY_DAYS_GRANT = False
 
 # ============ 【需求3】播放/阅读权限来源判定 ============
 ALLOWED_ACCESS_TYPES = {

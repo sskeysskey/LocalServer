@@ -38,8 +38,9 @@ ALLOW_LEGACY_DAYS_GRANT = False
 # ============ 【需求3】播放/阅读权限来源判定 ============
 ALLOWED_ACCESS_TYPES = {
     'subscription', 'vip_permanent',
-    'points', 'points_bonus', 'points_daily',
-    'free', 'unknown'
+    'points', 'points_bonus', 'points_daily', 'points_mixed',
+    'free', 'free_day', 'unlocked_today', 'guest',
+    'unknown'
 }
 
 _sub_kind_cache = {}          # user_id -> (kind, ts)
@@ -170,18 +171,21 @@ def parse_expiry(value):
             s = s[:fm.start()] + '.' + fm.group(1)[:6]
 
         dt = None
+        s2 = s.replace('/', '-')          # 【新增】兼容 2026/10/01
         for fmt in ('%Y-%m-%dT%H:%M:%S.%f',
                     '%Y-%m-%dT%H:%M:%S',
                     '%Y-%m-%dT%H:%M',
+                    '%Y-%m-%d %H:%M:%S',
+                    '%Y-%m-%d %H:%M',
                     '%Y-%m-%d'):
-            try:
-                dt = datetime.strptime(s, fmt)
+            for cand in (s, s2):
+                try:
+                    dt = datetime.strptime(cand, fmt)
+                    break
+                except ValueError:
+                    continue
+            if dt is not None:
                 break
-            except ValueError:
-                continue
-        if dt is None:
-            print("[parse_expiry][WARN] 无法解析时间: %r" % (value,))
-            return None
 
         return dt.replace(tzinfo=tz).astimezone(timezone.utc)
     except Exception as e:
@@ -960,6 +964,16 @@ def init_analytics_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_logs_user ON event_logs(user_id)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_news_logs_user ON news_event_logs(user_id)')
 
+    # 【需求1】美股埋点补充：权限来源 + 实际消耗点数
+    for tbl in ('user_finance_events', 'finance_event_logs'):
+        for ddl in (f"ALTER TABLE {tbl} ADD COLUMN access_type TEXT",
+                    f"ALTER TABLE {tbl} ADD COLUMN points_cost INTEGER DEFAULT 0"):
+            try:
+                c.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
+    c.execute('CREATE INDEX IF NOT EXISTS idx_fin_logs_access ON finance_event_logs(access_type)')
+
     conn.commit()
     conn.close()
     print("行为数据库已就绪。")
@@ -1480,7 +1494,132 @@ OVIDEO_COVER_DIR = os.path.join(OVIDEO_DIR, 'cover_image')
 
 #  OVideo SQLite 化 
 OVIDEO_DB_PATH = os.path.join(OVIDEO_DIR, 'OVideo.db')
-OVIDEO_SCHEMA_VERSION = "2"   # 【新增】表结构变更时 +1，触发自动重建
+OVIDEO_SCHEMA_VERSION = "3"   # 【修改】新增 blocked_channel_eps 表 -> +1，触发自动重建
+
+# ================== 【新增】播放渠道(channel)屏蔽 ==================
+# 配置文件（可热改，改完下一次请求自动重建 OVideo.db，无需重启）：
+#   Resources/OVideo/blocked_channels.json
+# {
+#   "enabled": true,
+#   "names": ["暴风", "shangxidq"],     # 精确匹配渠道名(忽略大小写/空格)
+#   "keywords": [],                     # 子串匹配，应对 shangxidq2 这类变体
+#   "block_resolve": true,              # 顺带拦截老客户端缓存的播放页 URL
+#   "hide_when_no_playable": false      # 进阶：剩余渠道一个能播的都没有时直接隐藏
+# }
+# 解封恢复：把 "enabled" 改成 false（或清空 names/keywords）即可。
+OVIDEO_CHANNEL_BLOCK_FILE = os.path.join(OVIDEO_DIR, 'blocked_channels.json')
+
+DEFAULT_CHANNEL_BLOCK = {
+    "enabled": True,
+    "names": ["暴风", "shangxidq"],
+    "keywords": [],
+    "block_resolve": True,
+    "hide_when_no_playable": False,
+}
+
+_channel_block_cache = {"mtime": None, "cfg": None}
+_channel_block_lock = threading.Lock()
+_blocked_eps_cache = {"mtime": None, "urls": set()}
+
+
+def _norm_channel_name(name):
+    """渠道名归一化：去首尾空格、去内部空格、小写。"""
+    return (name or "").strip().replace(" ", "").replace("　", "").lower()
+
+
+def load_channel_block_config(force=False):
+    """读取并缓存渠道屏蔽配置；文件 mtime 变化即自动重载。"""
+    try:
+        m = os.path.getmtime(OVIDEO_CHANNEL_BLOCK_FILE)
+    except OSError:
+        m = 0.0
+    if (not force and _channel_block_cache["cfg"] is not None
+            and _channel_block_cache["mtime"] == m):
+        return _channel_block_cache["cfg"]
+
+    with _channel_block_lock:
+        raw = dict(DEFAULT_CHANNEL_BLOCK)
+        if m:
+            try:
+                with open(OVIDEO_CHANNEL_BLOCK_FILE, 'r', encoding='utf-8') as f:
+                    user = json.load(f)
+                if isinstance(user, dict):
+                    raw.update(user)
+                elif isinstance(user, list):      # 兼容只写数组的偷懒格式
+                    raw["names"] = user
+            except Exception as e:
+                print(f"[OVideo] blocked_channels.json 读取失败，使用默认配置: {e}")
+
+        names = {_norm_channel_name(n) for n in (raw.get("names") or []) if str(n).strip()}
+        keywords = [k for k in (_norm_channel_name(x) for x in (raw.get("keywords") or [])) if k]
+        cfg = {
+            "enabled": bool(raw.get("enabled", True)) and bool(names or keywords),
+            "names": names,
+            "keywords": keywords,
+            "block_resolve": bool(raw.get("block_resolve", True)),
+            "hide_when_no_playable": bool(raw.get("hide_when_no_playable", False)),
+        }
+        _channel_block_cache["cfg"] = cfg
+        _channel_block_cache["mtime"] = m
+        return cfg
+
+
+def is_channel_blocked(channel_name, cfg=None):
+    cfg = cfg or load_channel_block_config()
+    if not cfg["enabled"]:
+        return False
+    n = _norm_channel_name(channel_name)
+    if not n:
+        return False
+    if n in cfg["names"]:
+        return True
+    return any(k in n for k in cfg["keywords"])
+
+
+def channel_block_signature(cfg):
+    """生效配置的指纹：配置变了 -> OVideo.db 自动重建"""
+    payload = json.dumps({
+        "e": cfg["enabled"],
+        "n": sorted(cfg["names"]),
+        "k": sorted(cfg["keywords"]),
+        "r": cfg["block_resolve"],
+        "h": cfg["hide_when_no_playable"],
+    }, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]
+
+
+def _get_blocked_episode_urls():
+    """被屏蔽渠道独占的 episode URL 集合（内存缓存，随 OVideo.db mtime 失效）"""
+    if not load_channel_block_config()["block_resolve"]:
+        return set()
+    try:
+        m = os.path.getmtime(OVIDEO_DB_PATH)
+    except OSError:
+        return set()
+    if _blocked_eps_cache["mtime"] == m:
+        return _blocked_eps_cache["urls"]
+    urls = set()
+    try:
+        conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=10.0)
+        try:
+            urls = {r[0] for r in conn.execute("SELECT url FROM blocked_channel_eps")}
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[OVideo] 读取 blocked_channel_eps 失败: {e}")
+        return set()
+    _blocked_eps_cache["urls"] = urls
+    _blocked_eps_cache["mtime"] = m
+    return urls
+
+
+def filter_blocked_channels(playlist, cfg=None):
+    """给直读 JSON 的老接口用：返回过滤后的 playlist"""
+    cfg = cfg or load_channel_block_config()
+    if not cfg["enabled"] or not playlist:
+        return playlist
+    return [ch for ch in playlist if not is_channel_blocked(ch.get('name'), cfg)]
+    
 _video_db_lock = threading.Lock()
 _url_mapping_cache = {"mtime": 0.0, "valid": set()}
 # —— 模糊搜索候选缓存:全表预处理，仅在 OVideo.db 变更时重建 ——
@@ -1695,6 +1834,15 @@ def build_video_db():
     video_file = os.path.join(OVIDEO_DIR, 'OVideos.json')
     if not os.path.exists(video_file):
         return
+
+    # ⭐ 渠道屏蔽配置（每次构建都强制重读，保证与指纹一致）
+    chan_cfg = load_channel_block_config(force=True)
+    if chan_cfg['enabled']:
+        print("[OVideo] 渠道屏蔽已启用 names=%s keywords=%s"
+              % (sorted(chan_cfg['names']), chan_cfg['keywords']))
+    else:
+        print("[OVideo] 渠道屏蔽未启用")
+
     print("[OVideo] 开始构建 SQLite ...")
     with open(video_file, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -1709,7 +1857,7 @@ def build_video_db():
         except Exception as e:
             print(f"[OVideo] 黑名单读取失败: {e}")
 
-    # ⭐ 新增：读取 url_mapping 的有效 key 集合（Drama/Anime 隐藏判定需要）
+    # ⭐ 读取 url_mapping 的有效 key 集合（Drama/Anime 隐藏判定需要）
     mapping_file = os.path.join(OVIDEO_DIR, 'url_mapping.json')
     valid_url_set = set()
     if os.path.exists(mapping_file):
@@ -1739,6 +1887,9 @@ def build_video_db():
         )
     ''')
     c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    # ⭐ 新增：被屏蔽渠道独占的播放页 URL（供 /resolve 拦截老客户端缓存）
+    c.execute("DROP TABLE IF EXISTS blocked_channel_eps")
+    c.execute("CREATE TABLE blocked_channel_eps (url TEXT PRIMARY KEY)")
 
     # ⭐ 一个 url 是否「可播放」：在 mapping 里 或 本身就是 m3u8 直链
     def _is_playable(u):
@@ -1746,6 +1897,11 @@ def build_video_db():
 
     rows = []
     cat_order = list(data.keys())
+    blocked_ep_urls = set()       # 只被屏蔽渠道使用的 URL
+    channel_stats = {}            # 屏蔽前的全量渠道名 -> 出现次数
+    stat_dropped_channels = 0
+    stat_hidden_by_channel = 0
+
     for category, items in data.items():
         for item in items:
             url = item.get('url')
@@ -1764,28 +1920,55 @@ def build_video_db():
             cleaned_dir  = _clean_name(director)
 
             item_nolist = dict(item)
-            playlist = item_nolist.pop('playlist', [])
+            playlist = item_nolist.pop('playlist', []) or []
+
+            # ---------- ⭐ 渠道屏蔽（必须在 hide / 集数计算之前） ----------
+            for ch in playlist:
+                cn = (ch.get('name') or '').strip() or '(未命名)'
+                channel_stats[cn] = channel_stats.get(cn, 0) + 1
+
+            raw_channels_with_eps = len([ch for ch in playlist if (ch.get('episodes') or {})])
+
+            if chan_cfg['enabled'] and playlist:
+                kept_channels, dropped_channels = [], []
+                for ch in playlist:
+                    (dropped_channels if is_channel_blocked(ch.get('name'), chan_cfg)
+                     else kept_channels).append(ch)
+                if dropped_channels:
+                    stat_dropped_channels += len(dropped_channels)
+                    # 同一条 URL 若也出现在保留渠道里，就不能拦截（防误伤）
+                    kept_urls_item = set()
+                    for ch in kept_channels:
+                        kept_urls_item.update(u for u in (ch.get('episodes') or {}).values() if u)
+                    for ch in dropped_channels:
+                        for u in (ch.get('episodes') or {}).values():
+                            if u and u not in kept_urls_item:
+                                blocked_ep_urls.add(u)
+                    playlist = kept_channels
+            # -----------------------------------------------------------
+
+            channels_with_eps = [ch for ch in playlist if (ch.get('episodes') or {})]
 
             hide_blacklisted = 0
-            if blacklist_set:
+            if raw_channels_with_eps > 0 and not channels_with_eps:
+                # 原本有源，但所有渠道都被屏蔽 -> 直接隐藏，避免"进详情页一个源都没有"
+                hide_blacklisted = 1
+                stat_hidden_by_channel += 1
+            elif blacklist_set:
                 if category == 'Movie':
                     # ── Movie 逻辑保持不变：所有 episode 全部命中黑名单才隐藏 ──
                     all_ep_urls = []
-                    for ch in playlist:
+                    for ch in channels_with_eps:
                         for ep_url in (ch.get('episodes') or {}).values():
                             all_ep_urls.append(ep_url)
                     if all_ep_urls and all(u in blacklist_set for u in all_ep_urls):
                         hide_blacklisted = 1
 
                 elif category in ('Drama', 'Anime', 'Show'):
-                    # ── 新增 Drama/Anime 逻辑 ──
                     # 对「每一个有剧集的渠道」都必须满足：
                     #   (1) 该渠道里所有 url 都不可播放（不在 mapping 且非 m3u8）
                     #   (2) 该渠道里至少有一个 url 在黑名单里
                     # 只有全部渠道都满足，才隐藏。
-                    channels_with_eps = [
-                        ch for ch in playlist if (ch.get('episodes') or {})
-                    ]
                     if channels_with_eps:
                         hide = True
                         for ch in channels_with_eps:
@@ -1798,11 +1981,22 @@ def build_video_db():
                         if hide:
                             hide_blacklisted = 1
 
-            # 【新增】追剧：计算该剧当前"有效集数"（只统计可播放且不在黑名单的 episode）
+            # ⭐ 进阶可选：剩余渠道里一个能播的都没有 -> 隐藏
+            if (not hide_blacklisted and chan_cfg['hide_when_no_playable']
+                    and channels_with_eps):
+                has_playable = any(
+                    _is_playable(u)
+                    for ch in channels_with_eps
+                    for u in (ch.get('episodes') or {}).values()
+                )
+                if not has_playable:
+                    hide_blacklisted = 1
+
+            # 追剧：计算该剧当前"有效集数"（只统计可播放且不在黑名单的 episode）
             latest_ep_count = 0
             if category != 'Movie':
                 per_channel = []
-                for ch in playlist:
+                for ch in channels_with_eps:
                     eps = ch.get('episodes') or {}
                     names = [n for n, u in eps.items()
                              if _is_playable(u) and u not in blacklist_set]
@@ -1825,13 +2019,15 @@ def build_video_db():
                 _norm_search(name), _norm_search(alias),
                 _norm_search(cleaned_dir), _norm_search('\x1f'.join(cleaned_cast)),
                 json.dumps(item_nolist, ensure_ascii=False),
-                json.dumps(playlist, ensure_ascii=False),
+                json.dumps(playlist, ensure_ascii=False),   # ⭐ 已过滤
                 hide_blacklisted,
-                latest_ep_count,      # ⭐ 新增（第 26 列）
+                latest_ep_count,
             ))
 
-    # ⭐ 列数从 25 改为 26
     c.executemany("INSERT OR REPLACE INTO videos VALUES (%s)" % ",".join("?"*26), rows)
+    if blocked_ep_urls:
+        c.executemany("INSERT OR IGNORE INTO blocked_channel_eps VALUES (?)",
+                      [(u,) for u in blocked_ep_urls])
     c.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)", (OVIDEO_SCHEMA_VERSION,))
     c.execute("CREATE INDEX idx_cat_update  ON videos(category, update_sort_key)")
     c.execute("CREATE INDEX idx_cat_release ON videos(category, release_sort_key)")
@@ -1842,17 +2038,29 @@ def build_video_db():
               (str(os.path.getmtime(video_file)),))
     c.execute("INSERT OR REPLACE INTO meta VALUES ('blacklist_mtime', ?)",
               (str(os.path.getmtime(blacklist_file)) if os.path.exists(blacklist_file) else "0",))
-    # ⭐ 新增：记录 url_mapping 文件 mtime，用于 mapping 变化时自动重建
     c.execute("INSERT OR REPLACE INTO meta VALUES ('mapping_mtime', ?)",
               (str(os.path.getmtime(mapping_file)) if os.path.exists(mapping_file) else "0",))
+    # ⭐ 新增：渠道屏蔽配置指纹 + 渠道名统计（管理后台用）
+    c.execute("INSERT OR REPLACE INTO meta VALUES ('channel_block_sig', ?)",
+              (channel_block_signature(chan_cfg),))
+    c.execute("INSERT OR REPLACE INTO meta VALUES ('channel_stats', ?)",
+              (json.dumps(channel_stats, ensure_ascii=False),))
     c.execute("INSERT OR REPLACE INTO meta VALUES ('categories', ?)",
               (json.dumps(cat_order, ensure_ascii=False),))
     conn.commit()
     conn.close()
-    print(f"[OVideo] 构建完成，共 {len(rows)} 条。")
+
+    # 重建后立刻让 resolve 的内存缓存失效
+    _blocked_eps_cache["mtime"] = None
+    _blocked_eps_cache["urls"] = set()
+
+    print(f"[OVideo] 构建完成，共 {len(rows)} 条；"
+          f"屏蔽渠道 {stat_dropped_channels} 个，"
+          f"因全渠道被屏蔽而隐藏 {stat_hidden_by_channel} 条，"
+          f"可拦截播放链接 {len(blocked_ep_urls)} 条。")
 
 def ensure_video_db():
-    """JSON / 黑名单 / url_mapping / 表结构 变更时自动重建"""
+    """JSON / 黑名单 / url_mapping / 渠道屏蔽配置 / 表结构 变更时自动重建"""
     video_file = os.path.join(OVIDEO_DIR, 'OVideos.json')
     if not os.path.exists(video_file):
         return
@@ -1861,9 +2069,11 @@ def ensure_video_db():
     blacklist_file = os.path.join(OVIDEO_DIR, 'blacklist_url.json')
     bl_m = str(os.path.getmtime(blacklist_file)) if os.path.exists(blacklist_file) else "0"
 
-    # ⭐ 新增：url_mapping mtime
     mapping_file = os.path.join(OVIDEO_DIR, 'url_mapping.json')
     map_m = str(os.path.getmtime(mapping_file)) if os.path.exists(mapping_file) else "0"
+
+    # ⭐ 新增：渠道屏蔽配置指纹
+    chan_sig = channel_block_signature(load_channel_block_config())
 
     def _read_meta():
         conn = sqlite3.connect(OVIDEO_DB_PATH, timeout=10.0)
@@ -1871,7 +2081,8 @@ def ensure_video_db():
             def g(k):
                 r = conn.execute("SELECT value FROM meta WHERE key=?", (k,)).fetchone()
                 return r[0] if r else None
-            return g('source_mtime'), g('blacklist_mtime'), g('mapping_mtime'), g('schema_version')
+            return (g('source_mtime'), g('blacklist_mtime'), g('mapping_mtime'),
+                    g('schema_version'), g('channel_block_sig'))
         finally:
             conn.close()
 
@@ -1880,8 +2091,9 @@ def ensure_video_db():
         need = True
     else:
         try:
-            a, b, cc, sv = _read_meta()
-            if a != src_m or b != bl_m or cc != map_m or sv != OVIDEO_SCHEMA_VERSION:
+            a, b, cc, sv, cs = _read_meta()
+            if (a != src_m or b != bl_m or cc != map_m
+                    or sv != OVIDEO_SCHEMA_VERSION or cs != chan_sig):
                 need = True
         except Exception:
             need = True
@@ -1890,9 +2102,9 @@ def ensure_video_db():
         with _video_db_lock:
             # 双重检查
             try:
-                a, b, cc, sv = _read_meta()
+                a, b, cc, sv, cs = _read_meta()
                 if (a == src_m and b == bl_m and cc == map_m
-                        and sv == OVIDEO_SCHEMA_VERSION):
+                        and sv == OVIDEO_SCHEMA_VERSION and cs == chan_sig):
                     return
             except Exception:
                 pass
@@ -2036,6 +2248,7 @@ def get_ovideos():
                     return True
             return False
 
+        chan_cfg = load_channel_block_config()      # 【新增】渠道屏蔽
         # 1. 读取原始视频数据
         with open(video_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -2064,6 +2277,9 @@ def get_ovideos():
                 filtered_playlist = []
                 if 'playlist' in item:
                     for channel in item['playlist']:
+                        # 【新增】被封锁的播放渠道直接跳过
+                        if is_channel_blocked(channel.get('name'), chan_cfg):
+                            continue
                         # 【修改】构建过滤后的剧集时，同时记录原始顺序
                         filtered_episodes = {}
                         episode_order = []
@@ -2201,6 +2417,12 @@ def resolve_ovideo_url():
     if not episode_url:
         return jsonify({"error": "Missing url"}), 400
 
+    # 【新增】被封锁渠道的播放页：老客户端可能有本地缓存/收藏，这里统一拦死
+    #        注意必须放在 .m3u8 直返之前
+    if episode_url in _get_blocked_episode_urls():
+        return jsonify({"error": "Blacklisted",
+                        "reason": "该播放源已下线，请切换其他播放源"}), 403
+
     # 【核心修改】：如果是直接写在 json 里的 m3u8 链接，直接返回它自己，跳过 mapping 检索
     if '.m3u8' in episode_url.lower():
         return jsonify({
@@ -2237,7 +2459,6 @@ def resolve_ovideo_url():
         return jsonify({"error": str(e)}), 500
 
 #  OVideo 分页 / 搜索 / 筛选 / 详情 新接口 
-
 @app.route('/api/OVideo/categories', methods=['GET'])
 def ovideo_categories():
     ensure_video_db()
@@ -4015,6 +4236,7 @@ def finance_quota_consume():
         use_bonus = min(bonus, remaining_cost)
         bonus -= use_bonus
         remaining_cost -= use_bonus
+        use_daily = remaining_cost                 # 【需求1】
         daily_used = row['daily_used'] + remaining_cost
 
         c.execute("UPDATE finance_points SET bonus_remaining=?, daily_used=?, last_date=? WHERE user_id=?",
@@ -4027,7 +4249,8 @@ def finance_quota_consume():
         total = bonus + daily_remaining
         return jsonify({"status": "success", "cost": cost, "remaining_total": total,
                         "bonus_remaining": bonus, "daily_used": daily_used,
-                        "daily_limit": cfg['daily_free_limit']})
+                        "daily_limit": cfg['daily_free_limit'],
+                        "used_bonus": use_bonus, "used_daily": use_daily})   # 【需求1】
     except Exception as e:
         try: c.execute("ROLLBACK")
         except Exception: pass
@@ -4113,37 +4336,59 @@ def finance_invite_redeem():
 @app.route('/api/Finance/track', methods=['POST'])
 def track_finance_event():
     try:
-        data = request.get_json()
-        user_id    = data.get('user_id')
-        user_type  = data.get('user_type', 'apple')
-        card_key   = data.get('card_key')
-        card_name  = data.get('card_name', '')
-        event_type = data.get('event_type', 'click')
-        app_version = data.get('app_version', '')       # 【新增】
+        data = request.get_json() or {}
+        user_id     = data.get('user_id')
+        user_type   = data.get('user_type', 'apple')
+        card_key    = data.get('card_key')
+        card_name   = data.get('card_name', '')
+        event_type  = data.get('event_type', 'click')
+        app_version = data.get('app_version', '')
+        access_type = (data.get('access_type') or 'unknown').strip()
+        try:
+            points_cost = max(0, int(data.get('points_cost') or 0))
+        except Exception:
+            points_cost = 0
+
         if not user_id or not card_key or event_type not in ALLOWED_FINANCE_EVENT_TYPES:
             return jsonify({"error": "Invalid params"}), 400
+        if access_type not in ALLOWED_ACCESS_TYPES:
+            access_type = 'unknown'
 
-        # 【新增】未登录用户的点击一律标记，方便后台识别绕过/拦截
         if not is_real_login_user(user_id):
-            user_type = 'device'
+            # 未登录用户的点击（理论上已被客户端拦截），统一标记以便排查
+            user_type   = 'device'
+            access_type = 'guest'
+            points_cost = 0
             if not card_key.startswith('GUEST_'):
                 card_key = 'GUEST_' + card_key
+        else:
+            # 【需求1】服务器权威：付费用户不可能扣点
+            kind = get_subscription_kind(user_id, 'Finance')
+            if kind:
+                access_type = kind          # subscription / vip_permanent
+                points_cost = 0
 
-        now = now_iso()   # 北京时间
+        now = now_iso()
         conn = sqlite3.connect(ANALYTICS_DB_PATH, timeout=30.0)
         c = conn.cursor()
         c.execute('''
             INSERT INTO user_finance_events
-                (user_id, user_type, card_key, card_name, event_type, first_at, last_at, count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                (user_id, user_type, card_key, card_name, event_type,
+                 first_at, last_at, count, access_type, points_cost)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
             ON CONFLICT(user_id, card_key, event_type)
-            DO UPDATE SET last_at = ?, count = count + 1
-        ''', (user_id, user_type, card_key, card_name, event_type, now, now, now))
+            DO UPDATE SET last_at = ?, count = count + 1,
+                          access_type = ?, points_cost = COALESCE(points_cost,0) + ?
+        ''', (user_id, user_type, card_key, card_name, event_type, now, now,
+              access_type, points_cost,
+              now, access_type, points_cost))
         c.execute('''
             INSERT INTO finance_event_logs
-                (user_id, user_type, card_key, card_name, event_type, created_at, app_version)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, user_type, card_key, card_name, event_type, now, app_version))
+                (user_id, user_type, card_key, card_name, event_type,
+                 created_at, app_version, access_type, points_cost)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, user_type, card_key, card_name, event_type,
+              now, app_version, access_type, points_cost))
         conn.commit()
         conn.close()
         return jsonify({"status": "ok"}), 200
@@ -4520,7 +4765,7 @@ def query_options_rank():
 
 # ============================================
 
-# 美股 - 总览
+# 美股 - 总览（替换）
 @app.route('/admin/api/finance/overview', methods=['GET'])
 @require_admin
 def admin_finance_overview():
@@ -4530,9 +4775,13 @@ def admin_finance_overview():
         "today_active": _query_analytics("SELECT COUNT(DISTINCT user_id) c FROM finance_event_logs WHERE date(created_at)=?", (today,))[0]['c'],
         "today_clicks": _query_analytics("SELECT COUNT(*) c FROM finance_event_logs WHERE date(created_at)=?", (today,))[0]['c'],
         "total_clicks": _query_analytics("SELECT COUNT(*) c FROM finance_event_logs")[0]['c'],
+        # 【需求1】
+        "today_vip_clicks":    _query_analytics("SELECT COUNT(*) c FROM finance_event_logs WHERE access_type IN ('subscription','vip_permanent') AND date(created_at)=?", (today,))[0]['c'],
+        "today_points_clicks": _query_analytics("SELECT COUNT(*) c FROM finance_event_logs WHERE access_type LIKE 'points%' AND date(created_at)=?", (today,))[0]['c'],
+        "today_points_spent":  _query_analytics("SELECT COALESCE(SUM(points_cost),0) c FROM finance_event_logs WHERE date(created_at)=?", (today,))[0]['c'],
     })
 
-# 美股 - 活跃用户榜
+# 美股 - 活跃用户榜（替换）
 @app.route('/admin/api/finance/top_users', methods=['GET'])
 @require_admin
 def admin_finance_top_users():
@@ -4541,6 +4790,10 @@ def admin_finance_top_users():
                MAX(user_type) AS user_type,
                COUNT(DISTINCT card_key) AS unique_cards,
                COUNT(*) AS total_clicks,
+               SUM(CASE WHEN access_type IN ('subscription','vip_permanent') THEN 1 ELSE 0 END) AS vip_clicks,
+               SUM(CASE WHEN access_type LIKE 'points%' THEN 1 ELSE 0 END) AS points_clicks,
+               SUM(CASE WHEN access_type IN ('free','free_day','unlocked_today') THEN 1 ELSE 0 END) AS free_clicks,
+               COALESCE(SUM(points_cost),0) AS points_spent,
                MAX(created_at) AS last_active
         FROM finance_event_logs
         GROUP BY user_id
@@ -4549,26 +4802,77 @@ def admin_finance_top_users():
     ''')
     return jsonify(rows)
 
-# 美股 - 某用户点击明细
+# 美股 - 某用户点击明细（替换 SQL）
 @app.route('/admin/api/finance/user_details', methods=['GET'])
 @require_admin
 def admin_finance_user_details():
-    maybe_cleanup_old_unlocks()                      # 【新增】
+    maybe_cleanup_old_unlocks()
     user_id = request.args.get('user_id')
     if not user_id:
         return jsonify({"error": "Missing user_id"}), 400
-    cutoff = analytics_cutoff_iso()                  # 【新增】
+    cutoff = analytics_cutoff_iso()
     sql = '''
         SELECT card_key, MAX(card_name) AS card_name,
                MAX(created_at) AS last_time,
                COUNT(*) AS click_count,
-               GROUP_CONCAT(DISTINCT NULLIF(app_version,'')) AS versions
+               GROUP_CONCAT(DISTINCT NULLIF(app_version,'')) AS versions,
+               GROUP_CONCAT(DISTINCT NULLIF(access_type,'')) AS access_types,
+               COALESCE(SUM(points_cost),0) AS points_cost
         FROM finance_event_logs
         WHERE user_id = ? AND created_at >= ?
         GROUP BY card_key
         ORDER BY last_time DESC
     '''
     return jsonify(_query_analytics(sql, (user_id, cutoff)))
+
+# 【需求4】后台直接授予 / 撤销某个 App 的订阅，避免手改 DB 格式出错
+@app.route('/admin/api/set_subscription', methods=['POST'])
+@require_admin
+def admin_set_subscription():
+    data = request.get_json() or {}
+    user_id  = (data.get('user_id') or '').strip()
+    app_name = (data.get('app') or 'Finance').strip()
+    days     = data.get('days')                     # 例如 30；负数/0 = 立即到期
+    permanent = data.get('permanent')               # True/False
+    if not user_id or app_name not in ALLOWED_APPS:
+        return jsonify({"error": "invalid params"}), 400
+
+    prefix = app_name.lower()
+    expire_col, perm_col = f"{prefix}_expire_at", f"{prefix}_is_permanent"
+
+    conn = sqlite3.connect(USER_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        if not c.execute("SELECT 1 FROM users WHERE apple_user_id=?", (user_id,)).fetchone():
+            return jsonify({"error": "user not found"}), 404
+
+        if permanent is not None:
+            c.execute(f"UPDATE users SET {perm_col}=? WHERE apple_user_id=?",
+                      (1 if permanent else 0, user_id))
+
+        if days is not None:
+            try:
+                d = int(days)
+            except Exception:
+                return jsonify({"error": "invalid days"}), 400
+            if d <= 0:
+                new_str = iso_utc(utcnow() - timedelta(minutes=1))   # 立即失效
+            else:
+                d = min(d, MAX_SUBSCRIPTION_HORIZON_DAYS)
+                new_str = iso_utc(utcnow() + timedelta(days=d))
+            c.execute(f"UPDATE users SET {expire_col}=? WHERE apple_user_id=?", (new_str, user_id))
+
+        conn.commit()
+        row = c.execute("SELECT * FROM users WHERE apple_user_id=?", (user_id,)).fetchone()
+        ok, exp = check_user_subscription_status(row, app_name)
+        _sub_kind_cache.pop(user_id, None)          # 清掉 60s 缓存，立刻生效
+        return jsonify({"status": "success", "is_subscribed": ok, "subscription_expires_at": exp})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
 
 # 美股 - 30天趋势
 @app.route('/admin/api/finance/daily_trend', methods=['GET'])
@@ -5145,6 +5449,10 @@ ADMIN_HTML = r'''
             <th>#</th>
             <th>user id_apple</th>
             <th>user id_device</th>
+            <th>身份</th>
+            <th>💎订阅点击</th>
+            <th>🎫扣点次数</th>
+            <th class="sortable" onclick="sortFinanceUsers('points_spent')">消耗点数 <span id="fsort_points_spent"></span></th>
             <th class="sortable" onclick="sortFinanceUsers('total_clicks')">点击 <span id="fsort_total_clicks">▼</span></th>
             <th class="sortable" onclick="sortFinanceUsers('last_active')">最后活跃 <span id="fsort_last_active"></span></th>
           </tr>
@@ -5256,13 +5564,17 @@ const PLAY_SOURCE_MAP = {
 
 // ⭐【需求3】权限来源中文映射
 const ACCESS_TYPE_MAP = {
-  subscription:  '💎 付费订阅',
-  vip_permanent: '👑 永久VIP',
-  points:        '🎫 消耗点数',
-  points_bonus:  '🎁 赠送点数',
-  points_daily:  '🗓 每日免费点数',
-  free:          '🆓 免费内容',
-  unknown:       '❓ 未知(老数据)'
+  subscription:   '💎 付费订阅',
+  vip_permanent:  '👑 永久VIP',
+  points:         '🎫 消耗点数',
+  points_bonus:   '🎁 赠送点数',
+  points_daily:   '🗓 每日免费点数',
+  points_mixed:   '🎫 混合扣点',
+  free:           '🆓 免费内容',
+  free_day:       '🎉 休市免费日',
+  unlocked_today: '🔓 当日已解锁',
+  guest:          '🚫 未登录',
+  unknown:        '❓ 未知(老数据)'
 };
 function accessBadges(str){
   if(!str) return '';
@@ -6201,10 +6513,10 @@ async function loadFinanceInvites(){
 }
 
 function renderFinanceUsers(){
-  document.getElementById('fsort_total_clicks').innerText =
-    financeUserSortField === 'total_clicks' ? (financeUserSortOrder === 'desc' ? '▼' : '▲') : '';
-  document.getElementById('fsort_last_active').innerText =
-    financeUserSortField === 'last_active' ? (financeUserSortOrder === 'desc' ? '▼' : '▲') : '';
+  ['total_clicks','last_active','points_spent'].forEach(f=>{
+    const el = document.getElementById('fsort_'+f);
+    if(el) el.innerText = (financeUserSortField===f) ? (financeUserSortOrder==='desc'?'▼':'▲') : '';
+  });
 
   const sorted = [...cachedFinanceUsers].sort((a,b)=>{
     let valA = a[financeUserSortField], valB = b[financeUserSortField];
@@ -6216,7 +6528,7 @@ function renderFinanceUsers(){
   });
 
   document.getElementById('financeUsersBody').innerHTML = sorted.length===0
-    ? '<tr><td colspan="5" style="text-align:center;color:#64748b">暂无数据</td></tr>'
+    ? '<tr><td colspan="9" style="text-align:center;color:#64748b">暂无数据</td></tr>'
     : sorted.map((r,i)=>{
         const isDevice = (r.user_type==='device') || (r.user_id||'').startsWith('dev_');
         const uid = encodeURIComponent(r.user_id);
@@ -6226,10 +6538,20 @@ function renderFinanceUsers(){
         const deviceCell = isDevice
           ? `<span style="font-family:monospace;font-size:11px">${r.user_id.substring(0,24)}...</span>`
           : '<span style="color:#475569">-</span>';
+        // 【需求1】身份判定：有订阅点击=付费；否则按是否扣点判定免费用户
+        let idBadge;
+        if((r.vip_clicks||0) > 0 && (r.points_clicks||0) === 0)      idBadge = '<span class="pill pill-green">💎 付费用户</span>';
+        else if((r.vip_clicks||0) > 0)                              idBadge = '<span class="pill pill-blue">🔄 曾付费/混合</span>';
+        else if((r.points_clicks||0) > 0)                           idBadge = '<span class="pill pill-orange">🎫 免费(扣点)</span>';
+        else                                                        idBadge = '<span class="pill pill-purple">🆓 免费</span>';
         return `<tr>
           <td>${i+1}</td>
           <td>${appleCell}</td>
           <td>${deviceCell}</td>
+          <td>${idBadge}</td>
+          <td>${r.vip_clicks||0}</td>
+          <td><span style="color:#fdba74;font-weight:bold">${r.points_clicks||0}</span></td>
+          <td><span style="color:#fdba74;font-weight:bold">${r.points_spent||0}</span> 点</td>
           <td><span class="clickable" style="font-weight:bold;"
               onclick="showFinanceUserDetails('${uid}')"
               ${hoverAttrs('f|'+uid, `financeDetailPayload('${uid}')`)}>${r.total_clicks||0}</span></td>
@@ -6245,11 +6567,14 @@ async function financeDetailPayload(userIdEnc){
   if(!data || data.length===0) return { title, html:'<div style="color:#64748b">暂无记录</div>' };
   let html = `<div style="text-align:left;max-height:56vh;overflow-y:auto;font-size:13px;color:#cbd5e1;"><ul style="list-style:none;padding-left:4px;">`;
   data.forEach(item=>{
-    const countBadge = item.click_count>1 ? `<span class="pill pill-blue" style="margin-left:6px;font-size:10px;padding:1px 4px;">${item.click_count}次</span>`:'';
+    const countBadge = item.click_count>1 ? `<span class="pill pill-blue" style="margin-left:6px;font-size:10px;">${item.click_count}次</span>`:'';
     const timeStr = (item.last_time||'').replace('T',' ').substring(0,16);
     const verBadge = item.versions ? `<span class="pill pill-purple" style="margin-left:6px;font-size:10px;">v${item.versions.split(',').join(' / v')}</span>` : '';
+    const costBadge = (item.points_cost||0) > 0
+      ? `<span class="pill pill-orange" style="margin-left:6px;font-size:10px;">-${item.points_cost}点</span>`
+      : `<span class="pill pill-green" style="margin-left:6px;font-size:10px;">0点</span>`;
     html += `<li style="margin-bottom:10px;line-height:1.4;border-bottom:1px solid #334155;padding-bottom:6px;">
-      <strong>${item.card_name||item.card_key}</strong>${countBadge}${verBadge}
+      <strong>${item.card_name||item.card_key}</strong>${countBadge}${costBadge}${verBadge}${accessBadges(item.access_types)}
       <span style="font-size:11px;color:#64748b">(${item.card_key})</span><br>
       <span style="font-size:11px;color:#94a3b8;">🕐 ${timeStr}</span></li>`;
   });

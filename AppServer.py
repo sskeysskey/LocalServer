@@ -556,23 +556,6 @@ def init_anonymous_sub_db():
     conn.close()
     print("匿名订阅表已就绪。")
 
-def get_video_quota_config():
-    """返回 (每日免费次数, 首次登录一次性赠送次数)。enabled=false 时都为 0。"""
-    version_file_path = os.path.join(BASE_RESOURCES_DIR, 'ONews', 'version.json')
-    try:
-        with open(version_file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            q = data.get('video_free_quota', {}) or {}
-            if not q.get('enabled', False):
-                return 0, 0
-            return int(q.get('daily_count', 0)), int(q.get('first_login_bonus', 0))
-    except Exception as e:
-        print(f"读取免费次数配置失败: {e}")
-        return 0, 0
-
-def get_video_free_quota():
-    return get_video_quota_config()[0]
-
 def get_video_points_config():
     version_file = os.path.join(BASE_RESOURCES_DIR, 'ONews', 'version.json')
     try:

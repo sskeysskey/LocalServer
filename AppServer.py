@@ -1980,6 +1980,47 @@ def _clean_name(raw):
 def _norm_search(text):
     return (text or "").lower().replace('·', '').replace(' ', '')
 
+# ---- 搜索：主名称提取（"火线 第五季" / "火线1" / "火线：突击" / "火线—营救" 的主名称都是"火线"）----
+_SERIES_CUT_RE = re.compile(r'\s+-\s+|[:：—–－~～|｜（(\[【《〈,，]')
+_SERIES_TAIL_RE = re.compile(
+    r'\s*(?:'
+    r'第\s*[0-9零一二三四五六七八九十百两]+\s*[季部集期篇章辑]'
+    r'|(?:season|series|part|vol|chapter)\.?\s*\d{1,3}'
+    r'|(?<![a-z])s\d{1,2}'
+    r'|(?<![a-z])[ivx]{1,5}'
+    r'|[ⅰ-ⅻⅠ-Ⅻ]{1,3}'
+    r'|(?<!\d)\d{1,3}'
+    r'|(?:国语|粤语|普通话|英语|双语|中字|未删减|导演剪辑)版?'
+    r'|(?:剧场|电影|真人)版'
+    r')\s*$', re.I)
+
+
+def _series_main_keys(text):
+    """返回片名可能的"主名称"(已 _norm_search 归一化)集合"""
+    t = (text or '').strip().lower()
+    if not t:
+        return set()
+    keys = set()
+
+    def add(s):
+        s = s.strip()
+        for _ in range(4):                       # 反复剥离尾部季号/版本标记
+            ns = _SERIES_TAIL_RE.sub('', s).strip()
+            if not ns or ns == s:
+                break
+            s = ns
+        n = _norm_search(s)
+        if n:
+            keys.add(n)
+
+    m = _SERIES_CUT_RE.search(t)
+    head = t[:m.start()] if (m and m.start() > 0) else t
+    add(head)
+    hs = head.strip()
+    if ' ' in hs and _CHINESE_RE.search(hs):     # 中文片名常用空格分隔副标题
+        add(hs.split()[0])
+    return keys
+
 
 def _release_sort_key(date):
     return date.split('(')[0] if date else ""
@@ -2949,10 +2990,16 @@ def ovideo_search2():
                         idx = min(idx, i); break
                 return idx
 
+            # 0 片名完全一致 / 0.5 主名称一致 / 1 又名完全一致 / 1.5 又名主名称一致
             if name == q or name_n == qn:
                 return 0, BIG
-            if alias == q or alias_n == qn:
+            if qn in _series_main_keys(name):
+                return 0.5, BIG
+            alias_parts = [a.strip() for a in re.split(r'[/、,，]', alias) if a.strip()]
+            if alias == q or alias_n == qn or any(_norm_search(a) == qn for a in alias_parts):
                 return 1, BIG
+            if any(qn in _series_main_keys(a) for a in alias_parts):
+                return 1.5, BIG
             if director == q or director_n == qn:
                 return 2, BIG
             cp = cast_exact_pos()
